@@ -8,6 +8,7 @@ export const DEFAULT_REPOSITORY = {
 
 const QUEUE_PATH = "data/queue.json";
 const APPROVED_PATH = "data/approved.json";
+const INPUT_PATH = "data/input.json";
 
 function makeClient(token) {
   if (!token) throw new Error("Add a GitHub token in Settings first.");
@@ -68,6 +69,73 @@ export async function fetchQueue(token, repository = DEFAULT_REPOSITORY) {
   );
 
   return result.data;
+}
+
+export async function addInputPart({ token, part, repository = DEFAULT_REPOSITORY }) {
+  const octokit = makeClient(token);
+  const repoParams = { owner: repository.owner, repo: repository.repo };
+  const refResponse = await octokit.git.getRef({
+    ...repoParams,
+    ref: `heads/${repository.branch}`,
+  });
+  const headSha = refResponse.data.object.sha;
+
+  const [inputFile, headCommit] = await Promise.all([
+    getJsonFileAtRef(octokit, repository, INPUT_PATH, headSha),
+    octokit.git.getCommit({ ...repoParams, commit_sha: headSha }),
+  ]);
+
+  const inputItem = {
+    id: crypto.randomUUID(),
+    base_part: [part.year, part.make, part.model, part.partName]
+      .map((value) => value?.trim())
+      .filter(Boolean)
+      .join(" "),
+    year: part.year.trim() || undefined,
+    make: part.make.trim() || undefined,
+    model: part.model.trim() || undefined,
+    part_name: part.partName.trim(),
+    source_part_number: part.partNumber.trim() || undefined,
+    submitted_at: new Date().toISOString(),
+  };
+
+  if (!inputItem.base_part || !inputItem.part_name) {
+    throw new Error("Enter a part name or description before submitting.");
+  }
+
+  const nextInput = [...inputFile.data, inputItem];
+  const blob = await octokit.git.createBlob({
+    ...repoParams,
+    content: encodeBase64(`${JSON.stringify(nextInput, null, 2)}\n`),
+    encoding: "base64",
+  });
+  const tree = await octokit.git.createTree({
+    ...repoParams,
+    base_tree: headCommit.data.tree.sha,
+    tree: [{ path: INPUT_PATH, mode: "100644", type: "blob", sha: blob.data.sha }],
+  });
+  const commit = await octokit.git.createCommit({
+    ...repoParams,
+    message: `Add part for enrichment: ${inputItem.base_part}`,
+    tree: tree.data.sha,
+    parents: [headSha],
+  });
+
+  try {
+    await octokit.git.updateRef({
+      ...repoParams,
+      ref: `heads/${repository.branch}`,
+      sha: commit.data.sha,
+      force: false,
+    });
+  } catch (error) {
+    if (error.status === 422) {
+      throw new Error("Another part was submitted at the same time. Please submit again.");
+    }
+    throw error;
+  }
+
+  return inputItem;
 }
 
 export async function approveQueueItem({

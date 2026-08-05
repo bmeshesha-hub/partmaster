@@ -1,8 +1,13 @@
 # Partmaster
 
-Partmaster is a static React dashboard for reviewing OEM part variants stored in
-the sibling `partmaster_data` GitHub repository. It reads and writes JSON using
-the authenticated GitHub API, so there is no conventional backend or database.
+Partmaster is a static React dashboard for submitting parts and reviewing OEM
+variants stored in the sibling `partmaster_data` GitHub repository. It reads and
+writes JSON using the authenticated GitHub API, so there is no conventional
+backend or database.
+
+Use **Add part** to commit a new enrichment request to `data/input.json`. The
+data repository workflow enriches it, moves it to `data/queue.json`, and the
+**Review** screen lets a user select and approve the matching variant.
 
 ## Local development
 

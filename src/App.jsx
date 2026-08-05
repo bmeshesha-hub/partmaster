@@ -1,8 +1,22 @@
-import { AlertCircle, Boxes, LoaderCircle, RefreshCw, Settings } from "lucide-react";
+import {
+  AlertCircle,
+  Boxes,
+  ClipboardCheck,
+  LoaderCircle,
+  PlusCircle,
+  RefreshCw,
+  Settings,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import GitHubAuth from "./components/GitHubAuth.jsx";
+import PartIntake from "./components/PartIntake.jsx";
 import ReviewTable from "./components/ReviewTable.jsx";
-import { approveQueueItem, DEFAULT_REPOSITORY, fetchQueue } from "./utils/githubApi.js";
+import {
+  addInputPart,
+  approveQueueItem,
+  DEFAULT_REPOSITORY,
+  fetchQueue,
+} from "./utils/githubApi.js";
 
 const TOKEN_STORAGE_KEY = "partmaster.githubToken";
 
@@ -11,7 +25,9 @@ export default function App() {
   const [queue, setQueue] = useState([]);
   const [loading, setLoading] = useState(false);
   const [approvingId, setApprovingId] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [view, setView] = useState("review");
   const [settingsOpen, setSettingsOpen] = useState(() => !localStorage.getItem(TOKEN_STORAGE_KEY));
 
   const loadQueue = useCallback(async () => {
@@ -56,6 +72,20 @@ export default function App() {
     }
   }
 
+  async function handlePartSubmit(part) {
+    setSubmitting(true);
+    setError("");
+
+    try {
+      return await addInputPart({ token, part });
+    } catch (requestError) {
+      setError(requestError.message || "Could not submit this part. Please try again.");
+      return null;
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   return (
     <div className="min-h-screen">
       <header className="border-b border-slate-200/80 bg-white/90 backdrop-blur">
@@ -69,27 +99,51 @@ export default function App() {
               <p className="text-xs text-slate-500">OEM variant review</p>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={() => setSettingsOpen(true)}
-            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"
-          >
-            <Settings size={17} aria-hidden="true" />
-            Settings
-          </button>
+          <div className="flex items-center gap-2">
+            <nav className="hidden rounded-xl bg-slate-100 p-1 sm:flex" aria-label="Primary navigation">
+              <button
+                type="button"
+                onClick={() => setView("review")}
+                className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium ${view === "review" ? "bg-white text-brand-700 shadow-sm" : "text-slate-600 hover:text-slate-900"}`}
+              >
+                <ClipboardCheck size={16} aria-hidden="true" /> Review
+              </button>
+              <button
+                type="button"
+                onClick={() => setView("add")}
+                className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium ${view === "add" ? "bg-white text-brand-700 shadow-sm" : "text-slate-600 hover:text-slate-900"}`}
+              >
+                <PlusCircle size={16} aria-hidden="true" /> Add part
+              </button>
+            </nav>
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"
+            >
+              <Settings size={17} aria-hidden="true" />
+              <span className="hidden sm:inline">Settings</span>
+            </button>
+          </div>
         </div>
       </header>
 
       <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+        <nav className="mb-6 grid grid-cols-2 rounded-xl bg-slate-200/70 p-1 sm:hidden" aria-label="Primary navigation">
+          <button type="button" onClick={() => setView("review")} className={`rounded-lg px-3 py-2 text-sm font-medium ${view === "review" ? "bg-white text-brand-700 shadow-sm" : "text-slate-600"}`}>Review</button>
+          <button type="button" onClick={() => setView("add")} className={`rounded-lg px-3 py-2 text-sm font-medium ${view === "add" ? "bg-white text-brand-700 shadow-sm" : "text-slate-600"}`}>Add part</button>
+        </nav>
         <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
           <div>
             <p className="text-sm font-semibold text-brand-700">Human-in-the-loop dashboard</p>
-            <h2 className="mt-1 text-2xl font-bold tracking-tight text-ink">Parts awaiting review</h2>
+            <h2 className="mt-1 text-2xl font-bold tracking-tight text-ink">
+              {view === "review" ? "Parts awaiting review" : "Add a part"}
+            </h2>
             <p className="mt-2 text-sm text-slate-500">
               {DEFAULT_REPOSITORY.owner}/{DEFAULT_REPOSITORY.repo} · {DEFAULT_REPOSITORY.branch}
             </p>
           </div>
-          <div className="flex items-center gap-3">
+          {view === "review" && <div className="flex items-center gap-3">
             <span className="rounded-full bg-white px-3 py-1.5 text-sm font-medium text-slate-600 shadow-sm ring-1 ring-slate-200">
               {queue.length} pending
             </span>
@@ -102,7 +156,7 @@ export default function App() {
               <RefreshCw className={loading ? "animate-spin" : ""} size={16} aria-hidden="true" />
               Refresh
             </button>
-          </div>
+          </div>}
         </div>
 
         {error && (
@@ -127,6 +181,8 @@ export default function App() {
               Open settings
             </button>
           </div>
+        ) : view === "add" ? (
+          <PartIntake submitting={submitting} onSubmit={handlePartSubmit} />
         ) : loading && queue.length === 0 ? (
           <div className="grid min-h-64 place-items-center rounded-2xl border border-slate-200 bg-white shadow-panel">
             <div className="text-center text-sm text-slate-500">
