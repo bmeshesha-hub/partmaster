@@ -72,6 +72,34 @@ export async function fetchQueue(token, repository = DEFAULT_REPOSITORY) {
   return result.data;
 }
 
+async function getOptionalJsonFileAtRef(octokit, repository, path, ref) {
+  try {
+    return (await getJsonFileAtRef(octokit, repository, path, ref)).data;
+  } catch (error) {
+    if (error.status === 404) return [];
+    throw error;
+  }
+}
+
+export async function fetchWorkspaceData(token, repository = DEFAULT_REPOSITORY) {
+  const octokit = makeClient(token);
+  const repoParams = { owner: repository.owner, repo: repository.repo };
+  const refResponse = await octokit.git.getRef({
+    ...repoParams,
+    ref: `heads/${repository.branch}`,
+  });
+  const headSha = refResponse.data.object.sha;
+
+  const [input, queue, approved, analyses] = await Promise.all([
+    getOptionalJsonFileAtRef(octokit, repository, INPUT_PATH, headSha),
+    getOptionalJsonFileAtRef(octokit, repository, QUEUE_PATH, headSha),
+    getOptionalJsonFileAtRef(octokit, repository, APPROVED_PATH, headSha),
+    getOptionalJsonFileAtRef(octokit, repository, ANALYSES_PATH, headSha),
+  ]);
+
+  return { input, queue, approved, analyses, headSha };
+}
+
 export async function addInputPart({ token, part, repository = DEFAULT_REPOSITORY }) {
   const octokit = makeClient(token);
   const repoParams = { owner: repository.owner, repo: repository.repo };

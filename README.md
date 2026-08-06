@@ -5,6 +5,12 @@ reviewing OEM parts data stored in the sibling `partmaster_data` GitHub
 repository. It reads and writes JSON using the authenticated GitHub API, so
 there is no conventional backend or database.
 
+The **Dashboard** combines `input.json`, `queue.json`, `approved.json`, and
+`analyses.json` into progress metrics for waiting, pending, and completed work.
+The **Library** combines approved variants and finalized analysis batches into
+one searchable table. Filters apply to the on-screen records and to the CSV
+export, making it possible to download only the current result set.
+
 The **Analyze parts** workflow has three stages:
 
 1. Import a CSV/text file or paste messy OCR data and select a catalog scope.
