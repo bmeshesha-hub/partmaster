@@ -4,3 +4,14 @@ dist/
 .env.local
 .DS_Store
 npm-debug.log*
+
+# Local-only large data. Raw CSVs, DuckDB files, and exports must never be
+# committed or uploaded to GitHub.
+local_data/*
+!local_data/README.md
+!local_data/inbox/
+local_data/inbox/*
+!local_data/inbox/.gitkeep
+!local_data/exports/
+local_data/exports/*
+!local_data/exports/.gitkeep
