@@ -129,7 +129,7 @@ async function importDataset(jobId, options) {
 
   try {
     await withConnection(async (connection) => {
-      await connection.run(
+      const createImportedTable = (parallel) => connection.run(
         `CREATE TABLE ${quoteIdentifier(tableName)} AS
          SELECT row_number() OVER ()::BIGINT AS _row_id, *
          FROM read_csv($sourcePath,
@@ -139,11 +139,21 @@ async function importDataset(jobId, options) {
            all_varchar = true,
            normalize_names = true,
            null_padding = true,
-           parallel = true,
+           parallel = ${parallel},
            strict_mode = false
          )`,
         { sourcePath },
       );
+      try {
+        await createImportedTable(true);
+        job.readerMode = "parallel";
+      } catch (error) {
+        const requiresSingleThread = /Parallel CSV Reader.*does not support a full read|parallel\s*=\s*false/i.test(error.message);
+        if (!requiresSingleThread) throw error;
+        await connection.run(`DROP TABLE IF EXISTS ${quoteIdentifier(tableName)}`);
+        job.readerMode = "single-threaded fallback";
+        await createImportedTable(false);
+      }
       // DuckDB prefixes SQL keywords such as Year and Source with an underscore
       // when normalizing headers. Restore the expected catalog field names so
       // filters and the UI remain consistent.
