@@ -9,6 +9,7 @@ export const DEFAULT_REPOSITORY = {
 const QUEUE_PATH = "data/queue.json";
 const APPROVED_PATH = "data/approved.json";
 const INPUT_PATH = "data/input.json";
+const ANALYSES_PATH = "data/analyses.json";
 
 function makeClient(token) {
   if (!token) throw new Error("Add a GitHub token in Settings first.");
@@ -136,6 +137,76 @@ export async function addInputPart({ token, part, repository = DEFAULT_REPOSITOR
   }
 
   return inputItem;
+}
+
+export async function saveAnalysisResults({ token, analysis, repository = DEFAULT_REPOSITORY }) {
+  const octokit = makeClient(token);
+  const repoParams = { owner: repository.owner, repo: repository.repo };
+  const refResponse = await octokit.git.getRef({
+    ...repoParams,
+    ref: `heads/${repository.branch}`,
+  });
+  const headSha = refResponse.data.object.sha;
+  const headCommitPromise = octokit.git.getCommit({ ...repoParams, commit_sha: headSha });
+  let existingAnalyses = [];
+
+  try {
+    existingAnalyses = (
+      await getJsonFileAtRef(octokit, repository, ANALYSES_PATH, headSha)
+    ).data;
+  } catch (error) {
+    // The first saved analysis creates data/analyses.json. Later saves append
+    // to the array while remaining protected by the non-forced ref update.
+    if (error.status !== 404) throw error;
+  }
+
+  const savedAnalysis = {
+    id: crypto.randomUUID(),
+    source_name: analysis.sourceName,
+    vin: analysis.vin || undefined,
+    scope: analysis.scope,
+    notes: analysis.notes,
+    parts: analysis.results.map((part) => ({
+      item_number: part.item_number,
+      oem_part_number: part.oem_part_number,
+      description: part.description,
+      side_position: part.side_position,
+    })),
+    saved_at: new Date().toISOString(),
+  };
+  const blob = await octokit.git.createBlob({
+    ...repoParams,
+    content: encodeBase64(`${JSON.stringify([...existingAnalyses, savedAnalysis], null, 2)}\n`),
+    encoding: "base64",
+  });
+  const headCommit = await headCommitPromise;
+  const tree = await octokit.git.createTree({
+    ...repoParams,
+    base_tree: headCommit.data.tree.sha,
+    tree: [{ path: ANALYSES_PATH, mode: "100644", type: "blob", sha: blob.data.sha }],
+  });
+  const commit = await octokit.git.createCommit({
+    ...repoParams,
+    message: `Save parts analysis: ${analysis.sourceName}`,
+    tree: tree.data.sha,
+    parents: [headSha],
+  });
+
+  try {
+    await octokit.git.updateRef({
+      ...repoParams,
+      ref: `heads/${repository.branch}`,
+      sha: commit.data.sha,
+      force: false,
+    });
+  } catch (error) {
+    if (error.status === 422) {
+      throw new Error("The data repository changed while saving. Please save again.");
+    }
+    throw error;
+  }
+
+  return savedAnalysis;
 }
 
 export async function approveQueueItem({

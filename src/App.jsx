@@ -8,14 +8,14 @@ import {
   Settings,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import AnalysisWorkflow from "./components/AnalysisWorkflow.jsx";
 import GitHubAuth from "./components/GitHubAuth.jsx";
-import PartIntake from "./components/PartIntake.jsx";
 import ReviewTable from "./components/ReviewTable.jsx";
 import {
-  addInputPart,
   approveQueueItem,
   DEFAULT_REPOSITORY,
   fetchQueue,
+  saveAnalysisResults,
 } from "./utils/githubApi.js";
 
 const TOKEN_STORAGE_KEY = "partmaster.githubToken";
@@ -25,7 +25,7 @@ export default function App() {
   const [queue, setQueue] = useState([]);
   const [loading, setLoading] = useState(false);
   const [approvingId, setApprovingId] = useState(null);
-  const [submitting, setSubmitting] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [view, setView] = useState("review");
   const [settingsOpen, setSettingsOpen] = useState(() => !localStorage.getItem(TOKEN_STORAGE_KEY));
@@ -72,17 +72,17 @@ export default function App() {
     }
   }
 
-  async function handlePartSubmit(part) {
-    setSubmitting(true);
+  async function handleAnalysisSave(analysis) {
+    setSaving(true);
     setError("");
 
     try {
-      return await addInputPart({ token, part });
+      return await saveAnalysisResults({ token, analysis });
     } catch (requestError) {
-      setError(requestError.message || "Could not submit this part. Please try again.");
+      setError(requestError.message || "Could not save this analysis. Please try again.");
       return null;
     } finally {
-      setSubmitting(false);
+      setSaving(false);
     }
   }
 
@@ -113,7 +113,7 @@ export default function App() {
                 onClick={() => setView("add")}
                 className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium ${view === "add" ? "bg-white text-brand-700 shadow-sm" : "text-slate-600 hover:text-slate-900"}`}
               >
-                <PlusCircle size={16} aria-hidden="true" /> Add part
+                <PlusCircle size={16} aria-hidden="true" /> Analyze parts
               </button>
             </nav>
             <button
@@ -131,13 +131,13 @@ export default function App() {
       <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <nav className="mb-6 grid grid-cols-2 rounded-xl bg-slate-200/70 p-1 sm:hidden" aria-label="Primary navigation">
           <button type="button" onClick={() => setView("review")} className={`rounded-lg px-3 py-2 text-sm font-medium ${view === "review" ? "bg-white text-brand-700 shadow-sm" : "text-slate-600"}`}>Review</button>
-          <button type="button" onClick={() => setView("add")} className={`rounded-lg px-3 py-2 text-sm font-medium ${view === "add" ? "bg-white text-brand-700 shadow-sm" : "text-slate-600"}`}>Add part</button>
+          <button type="button" onClick={() => setView("add")} className={`rounded-lg px-3 py-2 text-sm font-medium ${view === "add" ? "bg-white text-brand-700 shadow-sm" : "text-slate-600"}`}>Analyze</button>
         </nav>
         <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
           <div>
             <p className="text-sm font-semibold text-brand-700">Human-in-the-loop dashboard</p>
             <h2 className="mt-1 text-2xl font-bold tracking-tight text-ink">
-              {view === "review" ? "Parts awaiting review" : "Add a part"}
+              {view === "review" ? "Parts awaiting review" : "Import and analyze parts"}
             </h2>
             <p className="mt-2 text-sm text-slate-500">
               {DEFAULT_REPOSITORY.owner}/{DEFAULT_REPOSITORY.repo} · {DEFAULT_REPOSITORY.branch}
@@ -182,7 +182,7 @@ export default function App() {
             </button>
           </div>
         ) : view === "add" ? (
-          <PartIntake submitting={submitting} onSubmit={handlePartSubmit} />
+          <AnalysisWorkflow saving={saving} onSave={handleAnalysisSave} />
         ) : loading && queue.length === 0 ? (
           <div className="grid min-h-64 place-items-center rounded-2xl border border-slate-200 bg-white shadow-panel">
             <div className="text-center text-sm text-slate-500">
