@@ -51,6 +51,16 @@ export default function AnalysisWorkflow({ saving, onSave }) {
     setMessage("");
   }
 
+  function handleRawTextChange(event) {
+    const text = event.target.value;
+    const inspected = inspectSource(text);
+    setRawText(text);
+    setSourceName("");
+    setScopeKey(inspected.scopes[0]?.key || "");
+    setError("");
+    setMessage("");
+  }
+
   function continueToAnalysis() {
     if (!rawText.trim()) {
       setError("Upload a CSV/text file or paste raw data first.");
@@ -146,7 +156,7 @@ export default function AnalysisWorkflow({ saving, onSave }) {
             <FileText size={20} /> {sourceName || "Choose CSV or text file"}
           </button>
           <div className="my-4 flex items-center gap-3 text-xs font-medium uppercase tracking-wide text-slate-400"><span className="h-px flex-1 bg-slate-200" />or paste<span className="h-px flex-1 bg-slate-200" /></div>
-          <textarea value={rawText} onChange={(event) => { setRawText(event.target.value); setSourceName(""); setScopeKey(""); }} rows={10} placeholder="Paste raw CSV or messy catalog text here…" className="w-full rounded-xl border border-slate-300 p-3 font-mono text-xs leading-5 focus:border-brand-500" />
+          <textarea value={rawText} onChange={handleRawTextChange} rows={10} placeholder="Paste raw CSV or messy catalog text here…" className="w-full rounded-xl border border-slate-300 p-3 font-mono text-xs leading-5 focus:border-brand-500" />
 
           {rawText && (
             <div className="mt-5 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">
