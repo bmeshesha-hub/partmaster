@@ -162,12 +162,12 @@ export default function App() {
           <PartsIntelligence />
         ) : view === "about" ? (
           <AboutPage />
+        ) : view === "dashboard" ? (
+          <Dashboard data={data} onNavigate={setView} />
         ) : !token ? (
           <div className="rounded-2xl border border-slate-200 bg-white px-6 py-16 text-center shadow-panel"><Settings className="mx-auto text-brand-600" size={40} /><h2 className="mt-4 text-lg font-semibold">Connect the data repository</h2><p className="mx-auto mt-2 max-w-md text-sm text-slate-500">Add a GitHub personal access token to load your dashboard, analyses, and completed-parts library.</p><button type="button" onClick={() => setSettingsOpen(true)} className="mt-5 rounded-xl bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700">Open settings</button></div>
         ) : loading && !data.headSha ? (
           <div className="grid min-h-64 place-items-center rounded-2xl border border-slate-200 bg-white shadow-panel"><div className="text-center text-sm text-slate-500"><LoaderCircle className="mx-auto mb-3 animate-spin text-brand-600" size={28} />Loading Partmaster workspace…</div></div>
-        ) : view === "dashboard" ? (
-          <Dashboard data={data} onNavigate={setView} />
         ) : view === "analyze" ? (
           <AnalysisWorkflow saving={saving} onSave={handleAnalysisSave} />
         ) : view === "library" ? (
