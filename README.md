@@ -66,11 +66,16 @@ Approved records are stored at two levels:
   memory, blind-spot, camera, turn signal, connector pins, and component scope.
 - `partmaster_part_relationships`: explicit supersession and interchange rules,
   including conditional and not-interchangeable relationships.
+- `partmaster_part_compatibility`: the expanded year, model, model-code, and
+  assembly list from OEM “where used” pages. These rows reference one canonical
+  part instead of duplicating the part for every compatible vehicle.
 
-The evidence-review screen compares a candidate with existing variants in its
-family before approval and makes unknown features visible instead of assuming
-two similar part numbers are interchangeable. Use **Export master CSVs** to
-create part-master, application, and relationship files in
+The evidence-review screen supports checkbox-based bulk approval, compares a
+candidate with existing variants in its family, and makes unknown features
+visible instead of assuming two similar part numbers are interchangeable. It
+can fetch a supported compatibility page or import a pasted linked “Assemblies
+where used” list when the supplier blocks automated access. Use **Export master
+CSVs** to create part-master, application, compatibility, and relationship files in
 `local_data/exports/`. The original imported rows are never overwritten.
 
 Start with 1,000 candidates. The worker is deliberately conservative and

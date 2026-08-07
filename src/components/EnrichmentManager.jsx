@@ -2,12 +2,15 @@ import {
   AlertTriangle,
   BadgeCheck,
   Check,
+  ChevronDown,
+  ChevronUp,
   Database,
   Download,
   ExternalLink,
   FileSpreadsheet,
   Globe2,
   LoaderCircle,
+  ListChecks,
   Pause,
   Play,
   RefreshCw,
@@ -27,6 +30,14 @@ function formatBytes(bytes) {
   const units = ["B", "KB", "MB", "GB"];
   const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   return `${(value / (1024 ** index)).toFixed(index > 1 ? 2 : 1)} ${units[index]}`;
+}
+
+function normalizeCandidateNumber(candidate) {
+  return String(candidate.enriched_part_number || candidate.part_number_raw || "").trim();
+}
+
+function isBulkApprovable(candidate) {
+  return ["needs_review", "conflict"].includes(candidate.status) && Boolean(normalizeCandidateNumber(candidate));
 }
 
 function statusTone(status) {
@@ -85,7 +96,7 @@ function EnrichmentJourney({ job, stats }) {
       <div><p className="font-bold">{running ? `Actively checking record ${Math.min(processed + 1, total).toLocaleString()}` : completed ? "This batch has completed its journey" : "Ready when you are"}</p><p className="mt-1 text-sm text-slate-400">{job ? `${processed.toLocaleString()} of ${total.toLocaleString()} candidates processed. Online checks use the source URL already stored in each CSV row.` : "Start a small batch below to see records move through every stage."}</p><div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-cyan-400 via-blue-400 to-violet-400 transition-all duration-700" style={{ width: `${percent}%` }} /></div></div>
       <div className="grid grid-cols-3 gap-2 text-center"><div className="rounded-xl bg-emerald-400/10 px-3 py-2"><p className="text-lg font-black text-emerald-300">{accepted.toLocaleString()}</p><p className="text-[10px] font-bold uppercase tracking-wide text-emerald-200/70">Accepted</p></div><div className="rounded-xl bg-amber-400/10 px-3 py-2"><p className="text-lg font-black text-amber-300">{review.toLocaleString()}</p><p className="text-[10px] font-bold uppercase tracking-wide text-amber-200/70">Review</p></div><div className="rounded-xl bg-rose-400/10 px-3 py-2"><p className="text-lg font-black text-rose-300">{unresolved.toLocaleString()}</p><p className="text-[10px] font-bold uppercase tracking-wide text-rose-200/70">Unresolved</p></div></div>
     </div>
-    <p className="relative z-10 mt-4 text-center text-xs text-slate-500">Master database now contains {Number(stats.parts || 0).toLocaleString()} unique parts across {Number(stats.families || 0).toLocaleString()} variant families, with {Number(stats.applications || 0).toLocaleString()} verified applications and {Number(stats.cached_pages || 0).toLocaleString()} reusable source pages.</p>
+    <p className="relative z-10 mt-4 text-center text-xs text-slate-500">Master database now contains {Number(stats.parts || 0).toLocaleString()} unique parts across {Number(stats.families || 0).toLocaleString()} variant families, with {Number(stats.applications || 0).toLocaleString()} source applications, {Number(stats.compatibility_fitments || 0).toLocaleString()} compatibility fitments, and {Number(stats.cached_pages || 0).toLocaleString()} reusable source pages.</p>
   </section>;
 }
 
@@ -100,13 +111,15 @@ function FeedbackDialog({ type, message, onClose }) {
   </div>;
 }
 
-function FeatureSelect({ label, value, onChange }) {
-  const tone = value === "yes" ? "border-emerald-300 bg-emerald-50 text-emerald-800" : value === "no" ? "border-red-200 bg-red-50 text-red-800" : "border-slate-300 bg-white text-slate-700";
-  return <label className="text-xs font-bold uppercase tracking-wide text-slate-500">{label}<select value={value || "unknown"} onChange={(event) => onChange(event.target.value)} className={`mt-1.5 w-full rounded-xl border px-3 py-2.5 text-sm font-semibold normal-case tracking-normal ${tone}`}><option value="unknown">Unknown</option><option value="yes">Yes</option><option value="no">No</option></select></label>;
+function ConfirmDialog({ count, busy, onCancel, onConfirm }) {
+  if (!count) return null;
+  return <div className="fixed inset-0 z-[75] grid place-items-center bg-slate-950/60 p-4 backdrop-blur-sm" role="alertdialog" aria-modal="true">
+    <div className="w-full max-w-lg overflow-hidden rounded-3xl border border-emerald-200 bg-white shadow-2xl"><div className="grid place-items-center bg-emerald-50 px-6 pb-5 pt-8 text-center"><span className="grid h-16 w-16 place-items-center rounded-2xl bg-emerald-600 text-white shadow-lg"><ListChecks size={30} /></span><h3 className="mt-4 text-xl font-bold text-emerald-950">Approve {count.toLocaleString()} selected records?</h3><p className="mt-2 max-w-md text-sm leading-6 text-emerald-800">Each record will be promoted using its current evidence and variant fields. Compatibility discovery will continue in the background where the source supports it.</p></div><div className="flex justify-center gap-3 px-6 py-5"><button type="button" disabled={busy} onClick={onCancel} className="rounded-xl border border-slate-300 px-5 py-2.5 text-sm font-bold text-slate-700 disabled:opacity-50">Cancel</button><button type="button" disabled={busy} onClick={onConfirm} autoFocus className="inline-flex min-w-40 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-bold text-white disabled:opacity-50">{busy ? <LoaderCircle className="animate-spin" size={17} /> : <Check size={17} />}Approve selected</button></div></div>
+  </div>;
 }
 
-function ReviewModal({ candidate, onClose, onDecision }) {
-  const [values, setValues] = useState({
+function candidateReviewValues(candidate) {
+  return {
     partNumber: candidate.enriched_part_number || candidate.part_number_raw || "",
     description: candidate.enriched_description || candidate.description_raw || "",
     side: candidate.side || "Unknown",
@@ -127,19 +140,34 @@ function ReviewModal({ candidate, onClose, onDecision }) {
     variantSummary: candidate.variant_summary || "",
     fitmentExplanation: candidate.fitment_explanation || "",
     notes: candidate.decision_notes || "",
-  });
+  };
+}
+
+function FeatureSelect({ label, value, onChange }) {
+  const tone = value === "yes" ? "border-emerald-300 bg-emerald-50 text-emerald-800" : value === "no" ? "border-red-200 bg-red-50 text-red-800" : "border-slate-300 bg-white text-slate-700";
+  return <label className="text-xs font-bold uppercase tracking-wide text-slate-500">{label}<select value={value || "unknown"} onChange={(event) => onChange(event.target.value)} className={`mt-1.5 w-full rounded-xl border px-3 py-2.5 text-sm font-semibold normal-case tracking-normal ${tone}`}><option value="unknown">Unknown</option><option value="yes">Yes</option><option value="no">No</option></select></label>;
+}
+
+function ReviewModal({ candidate, onClose, onDecision }) {
+  const [values, setValues] = useState(() => candidateReviewValues(candidate));
   const [saving, setSaving] = useState(false);
   const [reviewError, setReviewError] = useState("");
-  const [comparison, setComparison] = useState({ familyName: "", variants: [] });
+  const [comparison, setComparison] = useState({ familyName: "", variants: [], compatibility: [], compatibilitySourceUrl: "" });
   const [comparisonLoading, setComparisonLoading] = useState(true);
+  const [compatibilityLoading, setCompatibilityLoading] = useState(false);
+  const [compatibilityUrl, setCompatibilityUrl] = useState("");
+  const [compatibilityText, setCompatibilityText] = useState("");
 
   useEffect(() => {
     let active = true;
     setComparisonLoading(true);
     localDataApi.candidateVariants(candidate.id).then((result) => {
-      if (active) setComparison(result);
+      if (active) {
+        setComparison(result);
+        setCompatibilityUrl(result.compatibilitySourceUrl || "");
+      }
     }).catch(() => {
-      if (active) setComparison({ familyName: candidate.family_name || "", variants: [] });
+      if (active) setComparison({ familyName: candidate.family_name || "", variants: [], compatibility: [], compatibilitySourceUrl: "" });
     }).finally(() => { if (active) setComparisonLoading(false); });
     return () => { active = false; };
   }, [candidate.family_name, candidate.id]);
@@ -153,6 +181,20 @@ function ReviewModal({ candidate, onClose, onDecision }) {
       setReviewError(requestError.message || "The review decision could not be saved.");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function fetchCompatibility() {
+    setCompatibilityLoading(true);
+    setReviewError("");
+    try {
+      const result = await localDataApi.fetchCandidateCompatibility(candidate.id, { force: true, sourceUrl: compatibilityUrl, compatibilityText });
+      setComparison((current) => ({ ...current, compatibility: result.compatibility || [], compatibilitySourceUrl: result.sourceUrl || current.compatibilitySourceUrl }));
+      setCompatibilityText("");
+    } catch (requestError) {
+      setReviewError(requestError.message || "Compatibility could not be retrieved.");
+    } finally {
+      setCompatibilityLoading(false);
     }
   }
 
@@ -196,6 +238,11 @@ function ReviewModal({ candidate, onClose, onDecision }) {
           <header className="flex items-center justify-between bg-slate-50 px-4 py-3"><div><h4 className="text-sm font-bold text-slate-800">Compare related variants</h4><p className="mt-0.5 text-xs text-slate-500">Existing {comparison.familyName || values.familyName || "part family"} records</p></div>{comparisonLoading && <LoaderCircle className="animate-spin text-brand-600" size={17} />}</header>
           {!comparisonLoading && comparison.variants?.length ? <div className="overflow-x-auto"><table className="min-w-full text-xs"><thead className="border-y border-slate-200 bg-white text-left uppercase tracking-wide text-slate-500"><tr>{["Part number", "Side", "Heated", "Auto dim", "Folding", "Memory", "Blind spot", "Camera", "Pins"].map((heading) => <th key={heading} className="whitespace-nowrap px-3 py-2">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{comparison.variants.map((variant) => <tr key={variant.id} className="text-slate-700"><td className="whitespace-nowrap px-3 py-2 font-mono font-bold text-brand-700">{variant.part_number}</td><td className="whitespace-nowrap px-3 py-2">{variant.side || "—"}</td>{["heated", "auto_dimming", "power_folding", "memory", "blind_spot", "camera"].map((key) => <td key={key} className="px-3 py-2 capitalize">{variant[key] || "—"}</td>)}<td className="px-3 py-2">{variant.connector_pins || "—"}</td></tr>)}</tbody></table></div> : !comparisonLoading && <p className="px-4 py-5 text-sm text-slate-500">No related master variants yet. Approving this record will begin the family.</p>}
         </section>
+        <section className="overflow-hidden rounded-2xl border border-cyan-200 bg-cyan-50/40 sm:col-span-2">
+          <header className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"><div><h4 className="text-sm font-bold text-cyan-950">Vehicle and assembly compatibility</h4><p className="mt-0.5 text-xs text-cyan-700">{Number(comparison.compatibility?.length || 0).toLocaleString()} verified “where used” fitments for this exact OEM number</p></div><button type="button" disabled={compatibilityLoading || (!compatibilityUrl && !compatibilityText.trim())} onClick={fetchCompatibility} className="inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-40">{compatibilityLoading ? <LoaderCircle className="animate-spin" size={15} /> : <Globe2 size={15} />}{compatibilityText.trim() ? "Import pasted list" : comparison.compatibility?.length ? "Refresh compatibility" : "Fetch compatibility"}</button></header>
+          <div className="grid gap-3 border-t border-cyan-200 px-4 py-4"><label className="text-xs font-bold uppercase tracking-wide text-cyan-900">Compatibility-list URL<input value={compatibilityUrl} onChange={(event) => setCompatibilityUrl(event.target.value)} className="mt-1.5 w-full rounded-xl border border-cyan-200 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label><label className="text-xs font-bold uppercase tracking-wide text-cyan-900">Or paste the “Assemblies where used” list<textarea value={compatibilityText} onChange={(event) => setCompatibilityText(event.target.value)} rows="3" placeholder="Paste the linked compatibility list here when the supplier blocks automatic access." className="mt-1.5 w-full rounded-xl border border-cyan-200 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label></div>
+          {comparison.compatibility?.length ? <div className="max-h-56 overflow-auto border-t border-cyan-200"><table className="min-w-full bg-white text-xs"><thead className="sticky top-0 bg-cyan-50 text-left uppercase tracking-wide text-cyan-800"><tr>{["Year", "Model", "Model code", "Assembly", "Evidence"].map((heading) => <th key={heading} className="whitespace-nowrap px-3 py-2">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{comparison.compatibility.map((fitment) => <tr key={fitment.id}><td className="px-3 py-2 font-bold">{fitment.year || "—"}</td><td className="whitespace-nowrap px-3 py-2">{fitment.model || "—"}</td><td className="whitespace-nowrap px-3 py-2 font-mono">{fitment.model_code || "—"}</td><td className="whitespace-nowrap px-3 py-2">{fitment.assembly || "—"}</td><td className="px-3 py-2">{fitment.evidence_url && <a href={fitment.evidence_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-semibold text-brand-700">Open <ExternalLink size={12} /></a>}</td></tr>)}</tbody></table></div> : <p className="border-t border-cyan-200 px-4 py-4 text-sm text-cyan-800">No compatibility rows saved yet. Fetching uses the OEM catalog’s part-specific “where used” list and stores each fitment separately.</p>}
+        </section>
         <label className="text-sm font-medium text-slate-700 sm:col-span-2">Review notes<textarea value={values.notes} onChange={(event) => setValues((current) => ({ ...current, notes: event.target.value }))} rows="3" className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
         <div className="rounded-xl bg-slate-50 p-4 text-sm sm:col-span-2"><p className="font-semibold text-slate-700">Raw source</p><p className="mt-1 text-slate-600">{candidate.description_raw || "No description"}</p><p className="mt-2 text-xs text-slate-500">{[candidate.year, candidate.manufacturer_raw, candidate.model, candidate.assembly].filter(Boolean).join(" · ")}</p>{candidate.evidence_url && <a href={candidate.evidence_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-sm font-semibold text-brand-700">Open evidence <ExternalLink size={14} /></a>}</div>
       </div>
@@ -211,12 +258,16 @@ export default function EnrichmentManager() {
   const [connected, setConnected] = useState(null);
   const [datasets, setDatasets] = useState([]);
   const [jobs, setJobs] = useState([]);
-  const [stats, setStats] = useState({ parts: 0, families: 0, applications: 0, attributed_variants: 0, cached_pages: 0, awaiting_review: 0, enriched_candidates: 0 });
+  const [stats, setStats] = useState({ parts: 0, families: 0, applications: 0, attributed_variants: 0, compatibility_fitments: 0, compatibility_parts: 0, cached_pages: 0, awaiting_review: 0, enriched_candidates: 0 });
   const [selectedJobId, setSelectedJobId] = useState("");
   const [statusFilter, setStatusFilter] = useState("needs_review");
   const [candidates, setCandidates] = useState([]);
   const [candidateTotal, setCandidateTotal] = useState(0);
   const [reviewing, setReviewing] = useState(null);
+  const [jobsExpanded, setJobsExpanded] = useState(false);
+  const [selectedCandidateIds, setSelectedCandidateIds] = useState([]);
+  const [bulkConfirmCount, setBulkConfirmCount] = useState(0);
+  const [bulkApproving, setBulkApproving] = useState(false);
   const [form, setForm] = useState({ datasetId: "", name: "", requestedCandidates: 1000, startRowId: 0, batchSize: 10, autoAcceptThreshold: 0.94 });
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
@@ -250,6 +301,9 @@ export default function EnrichmentManager() {
 
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { loadCandidates(); }, [loadCandidates]);
+  useEffect(() => {
+    setSelectedCandidateIds((current) => current.filter((id) => candidates.some((candidate) => candidate.id === id)));
+  }, [candidates]);
 
   const hasActiveJob = useMemo(() => jobs.some((job) => ["queued", "running"].includes(job.status)), [jobs]);
   useEffect(() => {
@@ -311,6 +365,38 @@ export default function EnrichmentManager() {
     }
   }
 
+  function toggleCandidate(candidateId) {
+    setSelectedCandidateIds((current) => current.includes(candidateId) ? current.filter((id) => id !== candidateId) : [...current, candidateId]);
+  }
+
+  function toggleAllCandidates() {
+    const eligibleIds = candidates.filter(isBulkApprovable).map((candidate) => candidate.id);
+    const allSelected = eligibleIds.length && eligibleIds.every((id) => selectedCandidateIds.includes(id));
+    setSelectedCandidateIds(allSelected ? [] : eligibleIds);
+  }
+
+  async function approveSelected() {
+    const selected = candidates.filter((candidate) => selectedCandidateIds.includes(candidate.id));
+    setBulkApproving(true);
+    let approved = 0;
+    try {
+      for (const candidate of selected) {
+        await localDataApi.reviewEnrichmentCandidate(candidate.id, { decision: "approve", ...candidateReviewValues(candidate) });
+        approved += 1;
+      }
+      setSelectedCandidateIds([]);
+      setBulkConfirmCount(0);
+      setMessage(`${approved.toLocaleString()} selected candidates were approved and promoted. Compatibility discovery is continuing in the background.`);
+      await refresh(); await loadCandidates();
+    } catch (requestError) {
+      setBulkConfirmCount(0);
+      setError(`${approved.toLocaleString()} records were approved before the process stopped. ${requestError.message}`);
+      await refresh(); await loadCandidates();
+    } finally {
+      setBulkApproving(false);
+    }
+  }
+
   async function exportMaster() {
     try {
       const result = await localDataApi.exportMaster();
@@ -319,6 +405,8 @@ export default function EnrichmentManager() {
   }
 
   const featuredJob = jobs.find((job) => ["queued", "running"].includes(job.status)) || jobs[0];
+  const eligibleCandidateIds = candidates.filter(isBulkApprovable).map((candidate) => candidate.id);
+  const allVisibleSelected = Boolean(eligibleCandidateIds.length) && eligibleCandidateIds.every((id) => selectedCandidateIds.includes(id));
 
   if (connected === null) return <div className="grid min-h-64 place-items-center rounded-2xl border border-slate-200 bg-white"><LoaderCircle className="animate-spin text-brand-600" size={28} /></div>;
   if (!connected) return <section className="rounded-2xl border border-amber-200 bg-amber-50 p-6"><AlertTriangle className="text-amber-600" size={32} /><h3 className="mt-4 font-semibold text-amber-950">Local data service is not running</h3><p className="mt-2 text-sm text-amber-800">Start the local worker and web UI together:</p><pre className="mt-4 rounded-xl bg-slate-950 p-4 text-sm text-slate-100">npm run dev:local</pre><button type="button" onClick={refresh} className="mt-4 inline-flex items-center gap-2 rounded-xl bg-amber-700 px-4 py-2 text-sm font-semibold text-white"><RefreshCw size={16} />Check again</button></section>;
@@ -327,7 +415,7 @@ export default function EnrichmentManager() {
     <EnrichmentJourney job={featuredJob} stats={stats} />
 
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-      {[{ label: "Canonical parts", value: stats.parts }, { label: "Variant families", value: stats.families }, { label: "Attributed variants", value: stats.attributed_variants }, { label: "Part applications", value: stats.applications }].map((metric) => <article key={metric.label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel"><p className="text-sm font-medium text-slate-500">{metric.label}</p><p className="mt-2 text-3xl font-bold">{Number(metric.value || 0).toLocaleString()}</p></article>)}
+      {[{ label: "Canonical parts", value: stats.parts }, { label: "Variant families", value: stats.families }, { label: "Compatibility fitments", value: stats.compatibility_fitments }, { label: "Part applications", value: stats.applications }].map((metric) => <article key={metric.label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel"><p className="text-sm font-medium text-slate-500">{metric.label}</p><p className="mt-2 text-3xl font-bold">{Number(metric.value || 0).toLocaleString()}</p></article>)}
     </section>
 
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel sm:p-6">
@@ -343,18 +431,19 @@ export default function EnrichmentManager() {
     </section>
 
     <section className="rounded-2xl border border-slate-200 bg-white shadow-panel">
-      <header className="flex items-center justify-between border-b border-slate-200 px-5 py-4"><div><h3 className="font-semibold">Background jobs</h3><p className="mt-1 text-sm text-slate-500">Jobs persist in DuckDB and resume safely after restarting the local service.</p></div><button type="button" onClick={refresh} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"><RefreshCw size={17} /></button></header>
-      {jobs.length ? <div className="divide-y divide-slate-100">{jobs.map((job) => {
+      <header className={`flex items-center justify-between px-5 py-4 ${jobsExpanded ? "border-b border-slate-200" : ""}`}><button type="button" onClick={() => setJobsExpanded((current) => !current)} className="flex min-w-0 flex-1 items-center gap-3 text-left"><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-slate-100 text-slate-600">{jobsExpanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}</span><div><h3 className="font-semibold">Background jobs <span className="ml-1 text-sm font-medium text-slate-400">({jobs.length})</span></h3><p className="mt-1 text-sm text-slate-500">{jobsExpanded ? "Jobs persist in DuckDB and resume safely after restarting the local service." : featuredJob ? `${featuredJob.name} · ${featuredJob.status.replaceAll("_", " ")}` : "No enrichment jobs yet."}</p></div></button><button type="button" onClick={refresh} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100" aria-label="Refresh background jobs"><RefreshCw size={17} /></button></header>
+      {jobsExpanded && (jobs.length ? <div className="divide-y divide-slate-100">{jobs.map((job) => {
         const processed = Number(job.processed_count || 0); const total = Number(job.queued_count || 0); const percent = total ? Math.round((processed / total) * 100) : 100;
         return <div key={job.id} onClick={() => setSelectedJobId(job.id)} className={`grid w-full cursor-pointer gap-4 px-5 py-4 text-left lg:grid-cols-[1fr_1fr_auto] lg:items-center ${selectedJobId === job.id ? "bg-brand-50/50" : "hover:bg-slate-50"}`}><div><div className="flex flex-wrap items-center gap-2"><p className="font-semibold text-slate-800">{job.name}</p><span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusTone(job.status)}`}>{job.status.replaceAll("_", " ")}</span></div><p className="mt-1 text-xs text-slate-500">{job.dataset_name || "Removed dataset"} · Rows {Number(job.start_row_id || 0).toLocaleString()}–{Number(job.last_source_row_id || 0).toLocaleString()}</p></div><div><div className="flex justify-between text-xs text-slate-500"><span>{processed.toLocaleString()} / {total.toLocaleString()}</span><span>{percent}%</span></div><div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-brand-500" style={{ width: `${percent}%` }} /></div><p className="mt-2 text-xs text-slate-500">{Number(job.enriched_count).toLocaleString()} accepted · {Number(job.review_count).toLocaleString()} review · {Number(job.conflict_count).toLocaleString()} conflicts</p></div><span onClick={(event) => event.stopPropagation()}>{["running", "queued"].includes(job.status) ? <button type="button" onClick={() => controlJob(job, "pause")} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 px-3 py-2 text-sm font-semibold"><Pause size={15} />Pause</button> : ["paused", "failed"].includes(job.status) ? <button type="button" onClick={() => controlJob(job, "resume")} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 px-3 py-2 text-sm font-semibold"><Play size={15} />Resume</button> : <span className="flex flex-wrap justify-end gap-2"><button type="button" onClick={() => reprocessReview(job)} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 px-3 py-2 text-sm font-semibold"><RefreshCw size={15} />Recheck review</button><button type="button" onClick={() => prepareNextBatch(job)} className="inline-flex items-center gap-2 rounded-xl bg-brand-600 px-3 py-2 text-sm font-semibold text-white"><Play size={15} />Next rows</button></span>}</span></div>;
-      })}</div> : <div className="px-6 py-12 text-center text-sm text-slate-500">No enrichment jobs yet.</div>}
+      })}</div> : <div className="px-6 py-12 text-center text-sm text-slate-500">No enrichment jobs yet.</div>)}
     </section>
 
     <section className="rounded-2xl border border-slate-200 bg-white shadow-panel">
-      <header className="flex flex-wrap items-end justify-between gap-3 border-b border-slate-200 px-5 py-4"><div><h3 className="font-semibold">Evidence review</h3><p className="mt-1 text-sm text-slate-500">{Number(candidateTotal).toLocaleString()} matching candidates; showing up to 200.</p></div><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"><option value="">All statuses</option>{REVIEW_STATUSES.map((status) => <option key={status} value={status}>{status.replaceAll("_", " ")}</option>)}</select></header>
-      <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-200 text-sm"><thead className="bg-slate-50"><tr>{["Status", "OEM Part Number", "Description / Variant", "Side / Position", "Vehicle / Assembly", "Confidence", ""].map((heading) => <th key={heading} className="whitespace-nowrap px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{candidates.map((candidate) => <tr key={candidate.id} className="hover:bg-slate-50"><td className="px-4 py-3"><span className={`whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-semibold ${statusTone(candidate.status)}`}>{candidate.status.replaceAll("_", " ")}</span></td><td className="whitespace-nowrap px-4 py-3 font-mono font-semibold text-brand-700">{candidate.enriched_part_number || candidate.part_number_raw || "Missing"}</td><td className="max-w-96 px-4 py-3 text-slate-600"><p className="truncate" title={candidate.enriched_description || candidate.description_raw || ""}>{candidate.enriched_description || candidate.description_raw || "—"}</p>{(candidate.family_name || candidate.variant_summary) && <p className="mt-1 truncate text-xs font-semibold text-violet-700" title={[candidate.family_name, candidate.variant_summary].filter(Boolean).join(" · ")}>{[candidate.family_name, candidate.variant_summary].filter(Boolean).join(" · ")}</p>}</td><td className="whitespace-nowrap px-4 py-3 text-slate-600">{[candidate.side, candidate.position].filter(Boolean).join(" · ") || "—"}</td><td className="max-w-72 truncate px-4 py-3 text-slate-500" title={[candidate.year, candidate.model, candidate.assembly].filter(Boolean).join(" · ")}>{[candidate.year, candidate.model, candidate.assembly].filter(Boolean).join(" · ") || "—"}</td><td className="px-4 py-3 font-semibold">{Math.round(Number(candidate.confidence || 0) * 100)}%</td><td className="px-4 py-3"><button type="button" onClick={() => setReviewing(candidate)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold">Review</button></td></tr>)}</tbody></table>{!candidates.length && <div className="px-6 py-12 text-center text-sm text-slate-500">No candidates match this job and status.</div>}</div>
+      <header className="flex flex-wrap items-end justify-between gap-3 border-b border-slate-200 px-5 py-4"><div><h3 className="font-semibold">Evidence review</h3><p className="mt-1 text-sm text-slate-500">{Number(candidateTotal).toLocaleString()} matching candidates; showing up to 200.</p></div><div className="flex flex-wrap items-center gap-2">{selectedCandidateIds.length > 0 && <button type="button" onClick={() => setBulkConfirmCount(selectedCandidateIds.length)} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-3 py-2 text-sm font-bold text-white"><ListChecks size={16} />Approve selected ({selectedCandidateIds.length})</button>}<select value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); setSelectedCandidateIds([]); }} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"><option value="">All statuses</option>{REVIEW_STATUSES.map((status) => <option key={status} value={status}>{status.replaceAll("_", " ")}</option>)}</select></div></header>
+      <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-200 text-sm"><thead className="bg-slate-50"><tr><th className="px-4 py-3 text-left"><input type="checkbox" checked={allVisibleSelected} onChange={toggleAllCandidates} disabled={!eligibleCandidateIds.length} aria-label="Select all visible candidates" className="h-4 w-4 rounded border-slate-300 text-emerald-600" /></th>{["Status", "OEM Part Number", "Description / Variant", "Side / Position", "Vehicle / Assembly", "Confidence", ""].map((heading) => <th key={heading} className="whitespace-nowrap px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{candidates.map((candidate) => <tr key={candidate.id} className={selectedCandidateIds.includes(candidate.id) ? "bg-emerald-50/70" : "hover:bg-slate-50"}><td className="px-4 py-3"><input type="checkbox" checked={selectedCandidateIds.includes(candidate.id)} onChange={() => toggleCandidate(candidate.id)} disabled={!isBulkApprovable(candidate)} aria-label={`Select ${normalizeCandidateNumber(candidate) || "candidate"}`} className="h-4 w-4 rounded border-slate-300 text-emerald-600" /></td><td className="px-4 py-3"><span className={`whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-semibold ${statusTone(candidate.status)}`}>{candidate.status.replaceAll("_", " ")}</span></td><td className="whitespace-nowrap px-4 py-3 font-mono font-semibold text-brand-700">{candidate.enriched_part_number || candidate.part_number_raw || "Missing"}</td><td className="max-w-96 px-4 py-3 text-slate-600"><p className="truncate" title={candidate.enriched_description || candidate.description_raw || ""}>{candidate.enriched_description || candidate.description_raw || "—"}</p>{(candidate.family_name || candidate.variant_summary) && <p className="mt-1 truncate text-xs font-semibold text-violet-700" title={[candidate.family_name, candidate.variant_summary].filter(Boolean).join(" · ")}>{[candidate.family_name, candidate.variant_summary].filter(Boolean).join(" · ")}</p>}</td><td className="whitespace-nowrap px-4 py-3 text-slate-600">{[candidate.side, candidate.position].filter(Boolean).join(" · ") || "—"}</td><td className="max-w-72 truncate px-4 py-3 text-slate-500" title={[candidate.year, candidate.model, candidate.assembly].filter(Boolean).join(" · ")}>{[candidate.year, candidate.model, candidate.assembly].filter(Boolean).join(" · ") || "—"}</td><td className="px-4 py-3 font-semibold">{Math.round(Number(candidate.confidence || 0) * 100)}%</td><td className="px-4 py-3"><button type="button" onClick={() => setReviewing(candidate)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold">Review</button></td></tr>)}</tbody></table>{!candidates.length && <div className="px-6 py-12 text-center text-sm text-slate-500">No candidates match this job and status.</div>}</div>
     </section>
     {reviewing && <ReviewModal candidate={reviewing} onClose={() => setReviewing(null)} onDecision={decideCandidate} />}
+    <ConfirmDialog count={bulkConfirmCount} busy={bulkApproving} onCancel={() => setBulkConfirmCount(0)} onConfirm={approveSelected} />
     <FeedbackDialog type="error" message={error} onClose={() => setError("")} />
     {!error && <FeedbackDialog type="success" message={message} onClose={() => setMessage("")} />}
   </div>;

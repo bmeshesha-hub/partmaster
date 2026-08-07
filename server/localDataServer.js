@@ -13,6 +13,9 @@ const DATABASE_PATH = resolve(process.env.PARTMASTER_DATABASE_PATH || join(DATA_
 const PORT = Number(process.env.PARTMASTER_DATA_PORT || 8787);
 const importJobs = new Map();
 const activeEnrichmentJobs = new Set();
+const compatibilityQueue = [];
+const queuedCompatibilityKeys = new Set();
+let compatibilityWorkerRunning = false;
 let shuttingDown = false;
 const ENRICHMENT_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.PARTMASTER_FETCH_TIMEOUT_MS) || 15000);
 const ENRICHMENT_MAX_PAGE_BYTES = Math.max(100000, Number(process.env.PARTMASTER_MAX_PAGE_BYTES) || 2_000_000);
@@ -207,6 +210,21 @@ await withConnection((connection) => connection.run(`
     fetched_at TIMESTAMP NOT NULL DEFAULT current_timestamp
   );
 
+  CREATE TABLE IF NOT EXISTS partmaster_part_compatibility (
+    id VARCHAR PRIMARY KEY,
+    compatibility_key VARCHAR NOT NULL UNIQUE,
+    part_id VARCHAR NOT NULL,
+    year VARCHAR,
+    model VARCHAR,
+    model_code VARCHAR,
+    assembly VARCHAR,
+    source_url VARCHAR,
+    evidence_url VARCHAR,
+    confidence DOUBLE,
+    verified_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+  );
+
   CREATE INDEX IF NOT EXISTS enrichment_candidates_job_status_idx
     ON partmaster_enrichment_candidates (job_id, status);
   CREATE INDEX IF NOT EXISTS canonical_parts_lookup_idx
@@ -214,7 +232,9 @@ await withConnection((connection) => connection.run(`
   CREATE INDEX IF NOT EXISTS part_applications_part_idx
     ON partmaster_part_applications (part_id);
   CREATE INDEX IF NOT EXISTS variant_attributes_part_idx
-    ON partmaster_variant_attributes (part_id)
+    ON partmaster_variant_attributes (part_id);
+  CREATE INDEX IF NOT EXISTS part_compatibility_part_idx
+    ON partmaster_part_compatibility (part_id)
 `));
 
 await withConnection((connection) => connection.run(`
@@ -595,8 +615,8 @@ async function fetchEvidence(url) {
   }
 }
 
-async function getEvidencePage(url) {
-  const cached = await withConnection(async (connection) => {
+async function getEvidencePage(url, { force = false } = {}) {
+  const cached = force ? null : await withConnection(async (connection) => {
     const reader = await connection.runAndReadAll(
       `SELECT final_url, page_title, content_html, success, error_message
        FROM partmaster_page_cache
@@ -657,6 +677,148 @@ async function getEvidencePage(url) {
     }).catch(() => {});
     throw error;
   }
+}
+
+function compatibilityListUrl(candidate) {
+  const source = String(candidate.source_url || candidate.evidence_url || "");
+  const partNumber = String(candidate.enriched_part_number || candidate.part_number_raw || "").trim();
+  if (!partNumber) return "";
+  try {
+    const url = new URL(source);
+    if (!url.hostname.toLowerCase().endsWith("hondapartshouse.com")) return "";
+    const manufacturer = normalizeApplicationValue(candidate.manufacturer_norm || candidate.manufacturer_raw).toLowerCase().replace(/\s+/g, "-");
+    if (!manufacturer) return "";
+    return `${url.protocol}//${url.host}/oemparts/unitlist?id=${encodeURIComponent(manufacturer)}&assemid=${encodeURIComponent(partNumber)}`;
+  } catch {
+    return "";
+  }
+}
+
+function parseCompatibilityList(html, baseUrl) {
+  const results = [];
+  const seen = new Set();
+  for (const match of String(html || "").matchAll(/<a\b[^>]*href=["']([^"']*\/oemparts\/a\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    const label = cleanText(match[2]);
+    const parsed = label.match(/^((?:19|20)\d{2})\s+(.+?)\s+-\s+(.+)$/i);
+    if (!parsed) continue;
+    let evidenceUrl;
+    try { evidenceUrl = new URL(match[1], baseUrl).toString(); } catch { continue; }
+    if (seen.has(evidenceUrl)) continue;
+    seen.add(evidenceUrl);
+    const modelText = parsed[2].trim();
+    const modelCode = modelText.match(/\(([^()]+)\)\s*$/)?.[1]?.trim() || "";
+    const model = modelCode ? modelText.replace(/\s*\([^()]+\)\s*$/, "").trim() : modelText;
+    results.push({ year: parsed[1], model, modelCode, assembly: parsed[3].trim(), evidenceUrl });
+  }
+  return results;
+}
+
+function parseCompatibilityText(text) {
+  const results = [];
+  const seen = new Set();
+  for (const match of String(text || "").matchAll(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g)) {
+    const parsed = cleanText(match[1]).match(/^((?:19|20)\d{2})\s+(.+?)\s+-\s+(.+)$/i);
+    if (!parsed || seen.has(match[2])) continue;
+    seen.add(match[2]);
+    const modelText = parsed[2].trim();
+    const modelCode = modelText.match(/\(([^()]+)\)\s*$/)?.[1]?.trim() || "";
+    const model = modelCode ? modelText.replace(/\s*\([^()]+\)\s*$/, "").trim() : modelText;
+    results.push({ year: parsed[1], model, modelCode, assembly: parsed[3].trim(), evidenceUrl: match[2] });
+  }
+  return results;
+}
+
+async function enrichCandidateCompatibility(candidate, { force = false, sourceUrl = "", compatibilityText = "" } = {}) {
+  const generatedUrl = compatibilityListUrl(candidate);
+  let unitListUrl = String(sourceUrl || generatedUrl).trim();
+  if (unitListUrl) {
+    try {
+      const parsedUrl = new URL(unitListUrl);
+      if (!parsedUrl.hostname.toLowerCase().endsWith("hondapartshouse.com") || !parsedUrl.pathname.startsWith("/oemparts/unitlist")) {
+        throw new Error("Use a Honda Parts House compatibility-list URL.");
+      }
+    } catch (error) {
+      if (error.message === "Use a Honda Parts House compatibility-list URL.") throw error;
+      throw new Error("The compatibility-list URL is invalid.");
+    }
+  }
+  if (!unitListUrl || !candidate.manufacturer_norm) return { sourceUrl: unitListUrl, added: 0, total: 0, compatibility: [] };
+  const partNumberNorm = normalizePartNumber(candidate.enriched_part_number || candidate.part_number_raw);
+  const current = await withConnection(async (connection) => {
+    const partReader = await connection.runAndReadAll(
+      `SELECT id FROM partmaster_canonical_parts
+       WHERE manufacturer_norm = $manufacturer AND part_number_norm = $partNumber`,
+      { manufacturer: candidate.manufacturer_norm, partNumber: partNumberNorm },
+    );
+    const partId = partReader.getRowObjectsJson()[0]?.id;
+    if (!partId) return { partId: null, rows: [] };
+    const rowsReader = await connection.runAndReadAll(
+      `SELECT id, year, model, model_code, assembly, evidence_url, confidence
+       FROM partmaster_part_compatibility WHERE part_id = $partId
+       ORDER BY year, model, model_code, assembly`,
+      { partId },
+    );
+    return { partId, rows: rowsReader.getRowObjectsJson() };
+  });
+  if (!current.partId) return { sourceUrl: unitListUrl, added: 0, total: 0, compatibility: [] };
+  if (current.rows.length && !force) return { sourceUrl: unitListUrl, added: 0, total: current.rows.length, compatibility: current.rows };
+
+  let parsed = parseCompatibilityText(compatibilityText);
+  if (!parsed.length) {
+    const page = await getEvidencePage(unitListUrl, { force });
+    parsed = parseCompatibilityList(page.html, page.finalUrl || unitListUrl);
+  }
+  if (!parsed.length) throw new Error("The compatibility page did not expose a readable vehicle list. It may be temporarily protected or unavailable.");
+  let added = 0;
+  await withConnection(async (connection) => {
+    for (const item of parsed) {
+      const compatibilityKey = [current.partId, item.year, item.model, item.modelCode, item.assembly, item.evidenceUrl]
+        .map(normalizeApplicationValue).join(":");
+      const reader = await connection.runAndReadAll(
+        "SELECT id FROM partmaster_part_compatibility WHERE compatibility_key = $compatibilityKey",
+        { compatibilityKey },
+      );
+      if (reader.getRowObjectsJson().length) continue;
+      await connection.run(
+        `INSERT INTO partmaster_part_compatibility
+         (id, compatibility_key, part_id, year, model, model_code, assembly, source_url, evidence_url, confidence)
+         VALUES ($id, $compatibilityKey, $partId, $year, $model, $modelCode, $assembly, $sourceUrl, $evidenceUrl, 0.95)`,
+        {
+          id: randomUUID(), compatibilityKey, partId: current.partId, year: item.year, model: item.model,
+          modelCode: item.modelCode || null, assembly: item.assembly, sourceUrl: unitListUrl, evidenceUrl: item.evidenceUrl,
+        },
+      );
+      added += 1;
+    }
+  });
+  const compatibility = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT id, year, model, model_code, assembly, evidence_url, confidence
+       FROM partmaster_part_compatibility WHERE part_id = $partId
+       ORDER BY year, model, model_code, assembly`,
+      { partId: current.partId },
+    );
+    return reader.getRowObjectsJson();
+  });
+  return { sourceUrl: unitListUrl, added, total: compatibility.length, compatibility };
+}
+
+function scheduleCompatibilityEnrichment(candidate) {
+  const key = `${candidate.manufacturer_norm || ""}:${normalizePartNumber(candidate.enriched_part_number || candidate.part_number_raw)}`;
+  if (!key.endsWith(":") && !queuedCompatibilityKeys.has(key)) {
+    queuedCompatibilityKeys.add(key);
+    compatibilityQueue.push({ key, candidate });
+  }
+  if (compatibilityWorkerRunning || !compatibilityQueue.length) return;
+  compatibilityWorkerRunning = true;
+  setImmediate(async () => {
+    while (compatibilityQueue.length && !shuttingDown) {
+      const item = compatibilityQueue.shift();
+      try { await enrichCandidateCompatibility(item.candidate); } catch { /* Main enrichment remains valid if a catalog blocks this optional lookup. */ }
+      queuedCompatibilityKeys.delete(item.key);
+    }
+    compatibilityWorkerRunning = false;
+  });
 }
 
 async function ensurePartFamily(connection, candidate) {
@@ -1338,6 +1500,13 @@ async function runEnrichmentJob(jobId) {
               } }, "online_verified");
             }
           });
+          if (result.status === "enriched") {
+            await enrichCandidateCompatibility({
+              ...candidate,
+              enriched_part_number: result.enrichedPartNumber,
+              evidence_url: result.evidenceUrl,
+            }).catch(() => null);
+          }
         } catch (error) {
           const status = candidate.attempts >= 2 ? "failed" : "needs_review";
           await withConnection((connection) => connection.run(
@@ -1759,7 +1928,43 @@ app.get("/api/local/enrichment/candidates/:id/variants", asyncRoute(async (reque
        ORDER BY parts.part_number LIMIT 20`,
       { manufacturer: candidate.manufacturer_norm, familyKey },
     );
-    return { familyName, variants: reader.getRowObjectsJson() };
+    const partNumberNorm = normalizePartNumber(candidate.enriched_part_number || candidate.part_number_raw);
+    const compatibilityReader = await connection.runAndReadAll(
+      `SELECT compatibility.id, compatibility.year, compatibility.model, compatibility.model_code,
+       compatibility.assembly, compatibility.evidence_url, compatibility.confidence
+       FROM partmaster_part_compatibility compatibility
+       JOIN partmaster_canonical_parts parts ON parts.id = compatibility.part_id
+       WHERE parts.manufacturer_norm = $manufacturer AND parts.part_number_norm = $partNumber
+       ORDER BY compatibility.year, compatibility.model, compatibility.model_code, compatibility.assembly
+       LIMIT 250`,
+      { manufacturer: candidate.manufacturer_norm, partNumber: partNumberNorm },
+    );
+    return {
+      familyName,
+      variants: reader.getRowObjectsJson(),
+      compatibility: compatibilityReader.getRowObjectsJson(),
+      compatibilitySourceUrl: compatibilityListUrl(candidate),
+    };
+  });
+  response.json(result);
+}));
+
+app.post("/api/local/enrichment/candidates/:id/compatibility", asyncRoute(async (request, response) => {
+  const candidate = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      "SELECT * FROM partmaster_enrichment_candidates WHERE id = $id",
+      { id: request.params.id },
+    );
+    return reader.getRowObjectsJson()[0];
+  });
+  if (!candidate) return response.status(404).json({ error: "Enrichment candidate not found." });
+  if (!compatibilityListUrl(candidate)) {
+    return response.status(400).json({ error: "This source does not provide a supported compatibility-list URL." });
+  }
+  const result = await enrichCandidateCompatibility(candidate, {
+    force: Boolean(request.body.force),
+    sourceUrl: String(request.body.sourceUrl || ""),
+    compatibilityText: String(request.body.compatibilityText || ""),
   });
   response.json(result);
 }));
@@ -1817,7 +2022,7 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
   if (!["approve", "reject"].includes(decision)) {
     return response.status(400).json({ error: "Decision must be approve or reject." });
   }
-  await withConnection(async (connection) => {
+  const reviewedCandidate = await withConnection(async (connection) => {
     const reader = await connection.runAndReadAll(
       "SELECT * FROM partmaster_enrichment_candidates WHERE id = $id",
       { id: request.params.id },
@@ -1896,8 +2101,12 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
       },
     );
     await refreshEnrichmentJobStats(connection, candidate.job_id);
+    return edited;
   });
   response.json({ ok: true });
+  if (decision === "approve") {
+    scheduleCompatibilityEnrichment(reviewedCandidate);
+  }
 }));
 
 app.get("/api/local/master/stats", asyncRoute(async (_request, response) => {
@@ -1908,6 +2117,8 @@ app.get("/api/local/master/stats", asyncRoute(async (_request, response) => {
        (SELECT count(*) FROM partmaster_part_applications) AS applications,
        (SELECT count(*) FROM partmaster_part_families) AS families,
        (SELECT count(DISTINCT part_id) FROM partmaster_variant_attributes) AS attributed_variants,
+       (SELECT count(*) FROM partmaster_part_compatibility) AS compatibility_fitments,
+       (SELECT count(DISTINCT part_id) FROM partmaster_part_compatibility) AS compatibility_parts,
        (SELECT count(*) FROM partmaster_page_cache WHERE success) AS cached_pages,
        (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status IN ('needs_review', 'conflict')) AS awaiting_review,
        (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status = 'enriched') AS enriched_candidates`,
@@ -1923,9 +2134,11 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const partsFilename = `parts-master-${stamp}.csv`;
     const applicationsFilename = `part-applications-${stamp}.csv`;
     const relationshipsFilename = `part-relationships-${stamp}.csv`;
+    const compatibilityFilename = `part-compatibility-${stamp}.csv`;
     const partsPath = join(EXPORT_ROOT, partsFilename);
     const applicationsPath = join(EXPORT_ROOT, applicationsFilename);
     const relationshipsPath = join(EXPORT_ROOT, relationshipsFilename);
+    const compatibilityPath = join(EXPORT_ROOT, compatibilityFilename);
     await connection.run(
       `COPY (SELECT parts.manufacturer AS "Manufacturer", families.family_name AS "Part Family",
        parts.part_number AS "OEM Part Number", parts.description AS "Description",
@@ -1976,10 +2189,23 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
        ORDER BY source.manufacturer_norm, source.part_number_norm)
        TO ${quoteString(relationshipsPath)} (FORMAT CSV, HEADER true)`,
     );
+    await connection.run(
+      `COPY (SELECT parts.manufacturer AS "Manufacturer", parts.part_number AS "OEM Part Number",
+       compatibility.year AS "Year", compatibility.model AS "Model",
+       compatibility.model_code AS "Model Code", compatibility.assembly AS "Assembly",
+       compatibility.confidence AS "Confidence", compatibility.evidence_url AS "Evidence URL",
+       compatibility.source_url AS "Compatibility Source URL", compatibility.verified_at AS "Verified At"
+       FROM partmaster_part_compatibility compatibility
+       JOIN partmaster_canonical_parts parts ON parts.id = compatibility.part_id
+       ORDER BY parts.manufacturer_norm, parts.part_number_norm, compatibility.year,
+        compatibility.model, compatibility.model_code, compatibility.assembly)
+       TO ${quoteString(compatibilityPath)} (FORMAT CSV, HEADER true)`,
+    );
     return [
       { filename: partsFilename, path: partsPath, bytes: (await stat(partsPath)).size },
       { filename: applicationsFilename, path: applicationsPath, bytes: (await stat(applicationsPath)).size },
       { filename: relationshipsFilename, path: relationshipsPath, bytes: (await stat(relationshipsPath)).size },
+      { filename: compatibilityFilename, path: compatibilityPath, bytes: (await stat(compatibilityPath)).size },
     ];
   });
   response.json({ exports });
