@@ -2410,6 +2410,10 @@ async function runEnrichmentJob(jobId) {
         try {
           const result = await processEnrichmentCandidate(candidate, Number(state.job.auto_accept_threshold));
           await withConnection(async (connection) => {
+            // DuckDB cannot infer a parameter type from JavaScript `undefined`.
+            // Optional enrichment fields are intentionally nullable, so bind them
+            // as SQL NULL when an inference or vehicle mapping is unavailable.
+            const nullableResult = (key) => result[key] ?? null;
             await connection.run(
               `UPDATE partmaster_enrichment_candidates SET
                enriched_part_number = $partNumber, enriched_description = $description,
@@ -2431,38 +2435,38 @@ async function runEnrichmentJob(jobId) {
                WHERE id = $id`,
               {
                 id: candidate.id,
-                partNumber: result.enrichedPartNumber,
-                description: result.enrichedDescription,
-                side: result.side,
-                position: result.position,
-                locationNotes: result.locationNotes,
-                evidenceUrl: result.evidenceUrl,
-                evidenceTitle: result.evidenceTitle,
-                familyName: result.familyName,
-                componentScope: result.componentScope,
-                heatedState: result.heatedState,
-                autoDimmingState: result.autoDimmingState,
-                powerFoldingState: result.powerFoldingState,
-                memoryState: result.memoryState,
-                blindSpotState: result.blindSpotState,
-                cameraState: result.cameraState,
-                turnSignalState: result.turnSignalState,
-                connectorPins: result.connectorPins,
-                requiredOptions: result.requiredOptions,
-                excludedOptions: result.excludedOptions,
-                variantSummary: result.variantSummary,
-                fitmentExplanation: result.fitmentExplanation,
-                epid: result.epid,
-                vehicleYear: result.vehicleYear,
-                vehicleMake: result.vehicleMake,
-                vehicleModel: result.vehicleModel,
-                vehicleTrim: result.vehicleTrim,
-                vehicleType: result.vehicleType,
-                vehicleMappingMethod: result.vehicleMappingMethod,
-                vehicleMappingConfidence: result.vehicleMappingConfidence,
-                confidence: result.confidence,
-                status: result.status,
-                decision: result.decision,
+                partNumber: nullableResult("enrichedPartNumber"),
+                description: nullableResult("enrichedDescription"),
+                side: nullableResult("side"),
+                position: nullableResult("position"),
+                locationNotes: nullableResult("locationNotes"),
+                evidenceUrl: nullableResult("evidenceUrl"),
+                evidenceTitle: nullableResult("evidenceTitle"),
+                familyName: nullableResult("familyName"),
+                componentScope: nullableResult("componentScope"),
+                heatedState: nullableResult("heatedState"),
+                autoDimmingState: nullableResult("autoDimmingState"),
+                powerFoldingState: nullableResult("powerFoldingState"),
+                memoryState: nullableResult("memoryState"),
+                blindSpotState: nullableResult("blindSpotState"),
+                cameraState: nullableResult("cameraState"),
+                turnSignalState: nullableResult("turnSignalState"),
+                connectorPins: nullableResult("connectorPins"),
+                requiredOptions: nullableResult("requiredOptions"),
+                excludedOptions: nullableResult("excludedOptions"),
+                variantSummary: nullableResult("variantSummary"),
+                fitmentExplanation: nullableResult("fitmentExplanation"),
+                epid: nullableResult("epid"),
+                vehicleYear: nullableResult("vehicleYear"),
+                vehicleMake: nullableResult("vehicleMake"),
+                vehicleModel: nullableResult("vehicleModel"),
+                vehicleTrim: nullableResult("vehicleTrim"),
+                vehicleType: nullableResult("vehicleType"),
+                vehicleMappingMethod: nullableResult("vehicleMappingMethod"),
+                vehicleMappingConfidence: nullableResult("vehicleMappingConfidence"),
+                confidence: nullableResult("confidence"),
+                status: nullableResult("status"),
+                decision: nullableResult("decision"),
               },
             );
             if (result.status === "enriched") {
@@ -3230,6 +3234,49 @@ app.get("/api/local/enrichment/jobs/:id", asyncRoute(async (request, response) =
     return job;
   });
   response.json({ job: result });
+}));
+
+app.get("/api/local/enrichment/jobs/:id/transformation", asyncRoute(async (request, response) => {
+  const result = await withConnection(async (connection) => {
+    const jobReader = await connection.runAndReadAll(
+      `SELECT jobs.*, datasets.name AS dataset_name, datasets.table_name
+       FROM partmaster_enrichment_jobs jobs
+       JOIN partmaster_datasets datasets ON datasets.id = jobs.dataset_id
+       WHERE jobs.id = $id`,
+      { id: request.params.id },
+    );
+    const job = jobReader.getRowObjectsJson()[0];
+    if (!job) {
+      const error = new Error("Enrichment job not found.");
+      error.status = 404;
+      throw error;
+    }
+    const examplesReader = await connection.runAndReadAll(
+      `SELECT id, source_row_id, part_number_raw, part_number_norm, description_raw,
+       enriched_part_number, enriched_description, family_name, status, confidence
+       FROM partmaster_enrichment_candidates WHERE job_id = $jobId
+       ORDER BY CASE status WHEN 'enriched' THEN 0 WHEN 'needs_review' THEN 1 WHEN 'conflict' THEN 2 ELSE 3 END,
+        confidence DESC NULLS LAST, source_row_id LIMIT 50`,
+      { jobId: request.params.id },
+    );
+    const examples = examplesReader.getRowObjectsJson();
+    const requestedCandidateId = String(request.query.candidateId || "");
+    const selectedId = examples.some((example) => example.id === requestedCandidateId)
+      ? requestedCandidateId
+      : examples[0]?.id;
+    if (!selectedId) return { job, examples, candidate: null, raw: null };
+    const candidateReader = await connection.runAndReadAll(
+      "SELECT * FROM partmaster_enrichment_candidates WHERE id = $candidateId AND job_id = $jobId",
+      { candidateId: selectedId, jobId: request.params.id },
+    );
+    const candidate = candidateReader.getRowObjectsJson()[0];
+    const rawReader = await connection.runAndReadAll(
+      `SELECT * FROM ${quoteIdentifier(job.table_name)} WHERE _row_id = $rowId`,
+      { rowId: candidate.source_row_id },
+    );
+    return { job, examples, candidate, raw: rawReader.getRowObjectsJson()[0] || null };
+  });
+  response.json(result);
 }));
 
 app.post("/api/local/enrichment/jobs/:id/pause", asyncRoute(async (request, response) => {

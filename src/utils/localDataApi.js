@@ -32,6 +32,7 @@ export const localDataApi = {
   deleteDataset: (datasetId) => request(`/datasets/${encodeURIComponent(datasetId)}`, { method: "DELETE" }),
   enrichmentJobs: () => request("/enrichment/jobs"),
   enrichmentJob: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}`),
+  enrichmentTransformation: (jobId, candidateId = "") => request(`/enrichment/jobs/${encodeURIComponent(jobId)}/transformation${candidateId ? `?candidateId=${encodeURIComponent(candidateId)}` : ""}`),
   startEnrichment: (options) => request("/enrichment/jobs", { method: "POST", body: JSON.stringify(options) }),
   pauseEnrichment: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}/pause`, { method: "POST", body: "{}" }),
   resumeEnrichment: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST", body: "{}" }),

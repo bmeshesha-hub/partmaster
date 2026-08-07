@@ -101,6 +101,69 @@ function EnrichmentJourney({ job, stats }) {
   </section>;
 }
 
+const RAW_FIELD_LABELS = {
+  diagram_title: "Diagram / assembly",
+  make: "Make",
+  source_url: "Source page",
+  pos: "Diagram position",
+  reference_number: "Reference",
+  part_number: "Part number",
+  description: "Description",
+  weight: "Weight",
+  quatity: "Quantity",
+  quantity: "Quantity",
+  price: "Price",
+  year: "Year",
+  model: "Model",
+};
+
+function displayValue(value) {
+  if (value == null || String(value).trim() === "") return "Missing";
+  return String(value);
+}
+
+function TransformationShowcase({ data, jobs, selectedJobId, loading, onSelectJob, onSelectExample }) {
+  if (loading) return <section className="grid min-h-64 place-items-center rounded-3xl border border-slate-200 bg-white shadow-panel"><div className="flex items-center gap-3 text-sm font-semibold text-slate-500"><LoaderCircle className="animate-spin text-brand-600" size={20} />Building a real before-and-after example…</div></section>;
+  if (!data?.candidate) return null;
+  const { candidate, raw, examples, job } = data;
+  const preferredRawKeys = Object.keys(RAW_FIELD_LABELS).filter((key) => raw && key in raw);
+  const fallbackRawKeys = Object.keys(raw || {}).filter((key) => key !== "_row_id" && !preferredRawKeys.includes(key)).slice(0, 5);
+  const rawKeys = [...preferredRawKeys, ...fallbackRawKeys].filter((key) => displayValue(raw?.[key]) !== "Missing").slice(0, 11);
+  const equipment = [
+    ["Heated", candidate.heated_state], ["Auto dimming", candidate.auto_dimming_state],
+    ["Power folding", candidate.power_folding_state], ["Memory", candidate.memory_state],
+    ["Blind spot", candidate.blind_spot_state], ["Camera", candidate.camera_state],
+    ["Turn signal", candidate.turn_signal_state], ["Connector pins", candidate.connector_pins],
+  ].filter(([, value]) => value && !["unknown", "none_known"].includes(String(value).toLowerCase()));
+  const statusLabel = candidate.status === "enriched" ? "Verified & saved" : candidate.status === "needs_review" ? "Enriched proposal · human review" : candidate.status.replaceAll("_", " ");
+  const afterFields = [
+    ["Normalized identity", candidate.part_number_norm || "Missing"],
+    ["OEM display number", candidate.enriched_part_number || candidate.part_number_raw || "Missing"],
+    ["Description", candidate.enriched_description || candidate.description_raw || "Missing"],
+    ["Part family", candidate.family_name || "Not determined"],
+    ["Component scope", candidate.component_scope || "Not determined"],
+    ["Side / position", [candidate.side, candidate.position].filter(Boolean).join(" · ") || "Not confirmed"],
+    ["Vehicle / assembly", [candidate.vehicle_year || candidate.year, candidate.vehicle_make || candidate.manufacturer_raw, candidate.vehicle_model || candidate.model, candidate.assembly].filter(Boolean).join(" · ") || "Not mapped"],
+  ];
+  return <section className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-panel">
+    <header className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 bg-gradient-to-r from-blue-50 via-white to-emerald-50 px-5 py-5 sm:px-7">
+      <div><p className="flex items-center gap-2 text-xs font-black uppercase tracking-[0.18em] text-brand-700"><Sparkles size={15} />Show what Partmaster does</p><h3 className="mt-2 text-2xl font-bold tracking-tight text-slate-900">One scraped row becomes usable part intelligence</h3><p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">This is a real row from <strong>{job.dataset_name}</strong>—not sample marketing data. Missing facts stay missing until evidence supports them.</p></div>
+      <div className="grid min-w-72 gap-2"><label className="text-xs font-bold uppercase tracking-wide text-slate-500">Dataset example<select value={selectedJobId} onChange={(event) => onSelectJob(event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-semibold normal-case tracking-normal text-slate-800">{jobs.map((availableJob) => <option key={availableJob.id} value={availableJob.id}>{availableJob.dataset_name} · {availableJob.status.replaceAll("_", " ")}</option>)}</select></label><label className="text-xs font-bold uppercase tracking-wide text-slate-500">Choose another real row<select value={candidate.id} onChange={(event) => onSelectExample(event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 font-mono text-sm font-semibold normal-case tracking-normal text-slate-800">{examples.map((example) => <option key={example.id} value={example.id}>Row {example.source_row_id} · {example.part_number_raw || "missing OEM"}</option>)}</select></label></div>
+    </header>
+    <div className="grid lg:grid-cols-[1fr_0.72fr_1fr]">
+      <article className="p-5 sm:p-7"><span className="rounded-full bg-slate-900 px-3 py-1 text-xs font-bold uppercase tracking-wide text-white">Before · raw scrape</span><h4 className="mt-4 text-lg font-bold">What the CSV supplied</h4><p className="mt-1 text-sm text-slate-500">Useful catalog text, but still just an isolated row.</p><dl className="mt-5 space-y-3">{rawKeys.map((key) => <div key={key} className="grid grid-cols-[8rem_1fr] gap-3 border-b border-slate-100 pb-3 text-sm"><dt className="font-semibold text-slate-500">{RAW_FIELD_LABELS[key] || key.replaceAll("_", " ")}</dt><dd className={`min-w-0 break-words font-medium text-slate-800 ${key.includes("part_number") ? "font-mono" : ""}`}>{displayValue(raw?.[key])}</dd></div>)}</dl></article>
+      <article className="border-y border-slate-200 bg-slate-950 p-5 text-white sm:p-7 lg:border-x lg:border-y-0"><span className="rounded-full bg-violet-500/20 px-3 py-1 text-xs font-bold uppercase tracking-wide text-violet-200">Partmaster enrichment</span><h4 className="mt-4 text-lg font-bold">What the worker adds</h4><div className="mt-5 space-y-3">{[
+        ["1", "Normalize identity", "Removes spacing and punctuation for safe matching."],
+        ["2", "Understand the part", "Classifies family, scope, side, position, and variant clues."],
+        ["3", "Check evidence", "Uses the saved supplier URL and vehicle mappings when available."],
+        ["4", "Protect quality", "Deduplicates, scores confidence, and flags uncertainty for a person."],
+        ["5", "Build the master", "Only approved or high-confidence records become trusted master data."],
+      ].map(([number, title, detail]) => <div key={number} className="flex gap-3 rounded-xl border border-white/10 bg-white/[0.06] p-3"><span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-violet-500 text-xs font-black">{number}</span><div><p className="text-sm font-bold">{title}</p><p className="mt-0.5 text-xs leading-5 text-slate-400">{detail}</p></div></div>)}</div></article>
+      <article className="bg-emerald-50/50 p-5 sm:p-7"><div className="flex flex-wrap items-center justify-between gap-2"><span className="rounded-full bg-emerald-600 px-3 py-1 text-xs font-bold uppercase tracking-wide text-white">After · structured record</span><span className={`rounded-full px-3 py-1 text-xs font-bold ${candidate.status === "enriched" ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-800"}`}>{statusLabel}</span></div><h4 className="mt-4 text-lg font-bold">What Partout Pro can use</h4><p className="mt-1 text-sm text-slate-500">Searchable identity, classification, fitment context, evidence, and a clear trust decision.</p><dl className="mt-5 space-y-3">{afterFields.map(([label, value]) => <div key={label} className="border-b border-emerald-100 pb-3 text-sm"><dt className="text-xs font-bold uppercase tracking-wide text-emerald-700">{label}</dt><dd className="mt-1 break-words font-semibold text-slate-900">{value}</dd></div>)}</dl>{equipment.length > 0 && <div className="mt-4"><p className="text-xs font-bold uppercase tracking-wide text-emerald-700">Confirmed equipment</p><div className="mt-2 flex flex-wrap gap-2">{equipment.map(([label, value]) => <span key={label} className="rounded-full border border-emerald-200 bg-white px-2.5 py-1 text-xs font-semibold text-emerald-800">{label}: {value}</span>)}</div></div>}<div className="mt-5 rounded-xl border border-emerald-200 bg-white p-4"><div className="flex items-center justify-between gap-3"><span className="text-sm font-bold text-slate-800">Evidence confidence</span><span className="text-lg font-black text-emerald-700">{Math.round(Number(candidate.confidence || 0) * 100)}%</span></div><div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-emerald-500" style={{ width: `${Math.round(Number(candidate.confidence || 0) * 100)}%` }} /></div><p className="mt-2 text-xs leading-5 text-slate-500">{candidate.decision_notes || candidate.fitment_explanation || "The record is ready for a transparent quality decision."}</p></div></article>
+    </div>
+  </section>;
+}
+
 function FeedbackDialog({ type, message, onClose }) {
   if (!message) return null;
   const isError = type === "error";
@@ -304,6 +367,8 @@ export default function EnrichmentManager() {
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [transformation, setTransformation] = useState(null);
+  const [transformationLoading, setTransformationLoading] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -335,6 +400,18 @@ export default function EnrichmentManager() {
 
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { loadCandidates(); }, [loadCandidates]);
+  const loadTransformation = useCallback(async (candidateId = "") => {
+    if (!connected || !selectedJobId) return;
+    setTransformationLoading(true);
+    try {
+      setTransformation(await localDataApi.enrichmentTransformation(selectedJobId, candidateId));
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setTransformationLoading(false);
+    }
+  }, [connected, selectedJobId]);
+  useEffect(() => { loadTransformation(); }, [loadTransformation]);
   useEffect(() => {
     setSelectedCandidateIds((current) => current.filter((id) => candidates.some((candidate) => candidate.id === id)));
   }, [candidates]);
@@ -470,6 +547,8 @@ export default function EnrichmentManager() {
 
   return <div className="space-y-6">
     <EnrichmentJourney job={featuredJob} stats={stats} />
+
+    <TransformationShowcase data={transformation} jobs={jobs} selectedJobId={selectedJobId} loading={transformationLoading} onSelectJob={setSelectedJobId} onSelectExample={loadTransformation} />
 
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
       {[{ label: "Canonical parts", value: stats.parts }, { label: "Variant families", value: stats.families }, { label: "Compatibility fitments", value: stats.compatibility_fitments }, { label: "Part applications", value: stats.applications }].map((metric) => <article key={metric.label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel"><p className="text-sm font-medium text-slate-500">{metric.label}</p><p className="mt-2 text-3xl font-bold">{Number(metric.value || 0).toLocaleString()}</p></article>)}
