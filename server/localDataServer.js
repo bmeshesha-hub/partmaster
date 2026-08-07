@@ -205,6 +205,71 @@ await withConnection((connection) => connection.run(`
     UNIQUE (source_part_id, target_part_id, relationship_type)
   );
 
+  CREATE TABLE IF NOT EXISTS partmaster_part_aliases (
+    id VARCHAR PRIMARY KEY,
+    part_id VARCHAR NOT NULL,
+    alias_number VARCHAR NOT NULL,
+    alias_norm VARCHAR NOT NULL,
+    alias_type VARCHAR NOT NULL,
+    status VARCHAR NOT NULL DEFAULT 'verified',
+    confidence DOUBLE,
+    evidence_url VARCHAR,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (part_id, alias_norm, alias_type)
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_field_evidence (
+    id VARCHAR PRIMARY KEY,
+    part_id VARCHAR NOT NULL,
+    field_name VARCHAR NOT NULL,
+    field_value VARCHAR NOT NULL,
+    source_url VARCHAR NOT NULL,
+    source_title VARCHAR,
+    source_method VARCHAR NOT NULL,
+    confidence DOUBLE,
+    accepted BOOLEAN NOT NULL DEFAULT false,
+    observed_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (part_id, field_name, field_value, source_url)
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_quality_scores (
+    part_id VARCHAR PRIMARY KEY,
+    identity_score DOUBLE NOT NULL,
+    description_score DOUBLE NOT NULL,
+    fitment_score DOUBLE NOT NULL,
+    variant_score DOUBLE NOT NULL,
+    evidence_score DOUBLE NOT NULL,
+    freshness_score DOUBLE NOT NULL,
+    conflict_risk DOUBLE NOT NULL,
+    overall_score DOUBLE NOT NULL,
+    missing_fields VARCHAR,
+    calculated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_data_conflicts (
+    id VARCHAR PRIMARY KEY,
+    conflict_key VARCHAR NOT NULL UNIQUE,
+    part_id VARCHAR NOT NULL,
+    field_name VARCHAR NOT NULL,
+    severity VARCHAR NOT NULL,
+    values_seen VARCHAR NOT NULL,
+    explanation VARCHAR NOT NULL,
+    status VARCHAR NOT NULL DEFAULT 'open',
+    detected_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    resolved_at TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_review_feedback (
+    id VARCHAR PRIMARY KEY,
+    candidate_id VARCHAR,
+    part_id VARCHAR,
+    decision VARCHAR NOT NULL,
+    changed_fields VARCHAR,
+    reason VARCHAR,
+    source_host VARCHAR,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+  );
+
   CREATE TABLE IF NOT EXISTS partmaster_page_cache (
     source_url VARCHAR PRIMARY KEY,
     final_url VARCHAR,
@@ -293,6 +358,12 @@ await withConnection((connection) => connection.run(`
     ON partmaster_part_applications (part_id);
   CREATE INDEX IF NOT EXISTS variant_attributes_part_idx
     ON partmaster_variant_attributes (part_id);
+  CREATE INDEX IF NOT EXISTS part_aliases_lookup_idx
+    ON partmaster_part_aliases (alias_norm);
+  CREATE INDEX IF NOT EXISTS field_evidence_part_idx
+    ON partmaster_field_evidence (part_id, field_name);
+  CREATE INDEX IF NOT EXISTS conflicts_part_status_idx
+    ON partmaster_data_conflicts (part_id, status);
   CREATE INDEX IF NOT EXISTS part_compatibility_part_idx
     ON partmaster_part_compatibility (part_id);
   CREATE INDEX IF NOT EXISTS row_enhancement_items_job_idx
@@ -452,6 +523,89 @@ function normalizePartNumber(value) {
 
 function normalizeApplicationValue(value) {
   return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+const CATEGORY_ATTRIBUTE_SCHEMAS = [
+  { key: "exterior_mirror", label: "Exterior Mirror", match: ["mirror", "rearview"], attributes: [
+    ["side", "Side", "enum"], ["heated", "Heated", "boolean"], ["auto_dimming", "Auto dimming", "boolean"],
+    ["power_folding", "Power folding", "boolean"], ["memory", "Memory", "boolean"], ["blind_spot", "Blind spot", "boolean"],
+    ["camera", "Camera", "boolean"], ["turn_signal", "Turn signal", "boolean"], ["connector_pins", "Connector pins", "number"],
+  ] },
+  { key: "clutch", label: "Clutch", match: ["clutch"], attributes: [
+    ["component_type", "Component type", "enum"], ["plate_type", "Plate type", "enum"], ["thickness_mm", "Thickness (mm)", "number"],
+    ["outer_diameter_mm", "Outer diameter (mm)", "number"], ["inner_diameter_mm", "Inner diameter (mm)", "number"], ["material", "Material", "text"], ["quantity_in_assembly", "Quantity in assembly", "number"],
+  ] },
+  { key: "brake_system", label: "Brake System", match: ["brake", "caliper", "rotor"], attributes: [
+    ["axle", "Front / rear", "enum"], ["side", "Side", "enum"], ["rotor_diameter_mm", "Rotor diameter (mm)", "number"],
+    ["caliper_type", "Caliper type", "text"], ["piston_count", "Piston count", "number"], ["wear_sensor", "Wear sensor", "boolean"],
+  ] },
+  { key: "lighting", label: "Lighting", match: ["headlight", "headlamp", "tail light", "taillight", "lamp"], attributes: [
+    ["side", "Side", "enum"], ["light_technology", "LED / HID / Halogen", "enum"], ["adaptive", "Adaptive", "boolean"],
+    ["housing_color", "Housing color", "text"], ["lens_color", "Lens color", "text"], ["connector_pins", "Connector pins", "number"],
+  ] },
+  { key: "engine", label: "Engine", match: ["engine", "cylinder", "piston", "crank"], attributes: [
+    ["engine_code", "Engine code", "text"], ["displacement", "Displacement", "text"], ["cylinder_position", "Cylinder position", "text"],
+    ["fuel_type", "Fuel type", "enum"], ["aspiration", "Aspiration", "enum"], ["emissions_standard", "Emissions standard", "text"],
+  ] },
+  { key: "body", label: "Body / Exterior", match: ["bumper", "door", "fender", "molding", "roof", "body"], attributes: [
+    ["side", "Side", "enum"], ["position", "Position", "text"], ["color_code", "Color code", "text"],
+    ["material", "Material", "text"], ["sensor_holes", "Sensor holes", "number"], ["finish", "Finish", "text"],
+  ] },
+  { key: "wheel", label: "Wheel / Tire", match: ["wheel", "rim", "tire"], attributes: [
+    ["diameter_in", "Diameter (in)", "number"], ["width_in", "Width (in)", "number"], ["bolt_pattern", "Bolt pattern", "text"],
+    ["offset_mm", "Offset (mm)", "number"], ["finish", "Finish", "text"], ["tpms", "TPMS", "boolean"],
+  ] },
+  { key: "general", label: "General Part", match: [], attributes: [
+    ["side", "Side", "enum"], ["position", "Position", "text"], ["material", "Material", "text"],
+    ["dimensions", "Dimensions", "text"], ["color", "Color", "text"], ["connector_pins", "Connector pins", "number"],
+  ] },
+].map((schema) => ({ ...schema, attributes: schema.attributes.map(([key, label, type]) => ({ key, label, type })) }));
+
+function categorySchemaFor(familyName, description = "") {
+  const text = `${familyName || ""} ${description || ""}`.toLowerCase();
+  return CATEGORY_ATTRIBUTE_SCHEMAS.find((schema) => schema.match.some((term) => text.includes(term)))
+    || CATEGORY_ATTRIBUTE_SCHEMAS.at(-1);
+}
+
+function inferCategoryAttributes(candidate, description = "") {
+  const text = `${description || candidate.enriched_description || candidate.description_raw || ""} ${candidate.assembly || ""}`.toUpperCase();
+  const schema = categorySchemaFor(candidate.family_name || candidate.familyName || candidate.assembly, text);
+  const attributes = {};
+  if (schema.key === "clutch") {
+    if (/FRICTION/.test(text)) attributes.plate_type = "friction";
+    else if (/\b(STEEL|SEPARATOR)\b/.test(text)) attributes.plate_type = "steel";
+    else if (/PLATE/.test(text)) attributes.plate_type = "clutch plate";
+    if (/\bHUB\b/.test(text)) attributes.component_type = "hub";
+    else if (/\bBUSH(?:ING)?\b/.test(text)) attributes.component_type = "bushing";
+    else if (/\bSPRING|\bSPG\b/.test(text)) attributes.component_type = "spring";
+    else if (/\bPLATE\b/.test(text)) attributes.component_type = "plate";
+    const thickness = text.match(/\bT\s*=\s*(\d+(?:\.\d+)?)\b/)?.[1];
+    if (thickness) attributes.thickness_mm = thickness;
+    const dimensions = text.match(/\b(\d+(?:\.\d+)?)X(\d+(?:\.\d+)?)X(\d+(?:\.\d+)?)\b/);
+    if (dimensions) { attributes.inner_diameter_mm = dimensions[1]; attributes.outer_diameter_mm = dimensions[2]; attributes.thickness_mm ||= dimensions[3]; }
+    if (candidate.quantity && Number(candidate.quantity) > 0) attributes.quantity_in_assembly = String(Number(candidate.quantity));
+  } else if (schema.key === "brake_system") {
+    if (/\bFRONT\b/.test(text)) attributes.axle = "front";
+    else if (/\bREAR\b/.test(text)) attributes.axle = "rear";
+    const diameter = text.match(/(?:DIA(?:METER)?|Ø)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*MM/)?.[1];
+    if (diameter) attributes.rotor_diameter_mm = diameter;
+    const pistons = text.match(/\b(\d+)[ -]?PISTON\b/)?.[1];
+    if (pistons) attributes.piston_count = pistons;
+    if (/WEAR SENSOR/.test(text)) attributes.wear_sensor = "yes";
+  } else if (schema.key === "lighting") {
+    if (/\bLED\b/.test(text)) attributes.light_technology = "LED";
+    else if (/\bHID|XENON\b/.test(text)) attributes.light_technology = "HID/Xenon";
+    else if (/\bHALOGEN\b/.test(text)) attributes.light_technology = "Halogen";
+    if (/\bADAPTIVE\b/.test(text)) attributes.adaptive = "yes";
+  } else if (schema.key === "engine") {
+    const displacement = text.match(/\b(\d+(?:\.\d+)?)\s*(CC|L)\b/)?.slice(1).join(" ");
+    if (displacement) attributes.displacement = displacement;
+  } else if (schema.key === "wheel") {
+    const size = text.match(/\b(\d+(?:\.\d+)?)\s*X\s*(\d+(?:\.\d+)?)\b/);
+    if (size) { attributes.width_in = size[1]; attributes.diameter_in = size[2]; }
+    if (/\bTPMS\b/.test(text)) attributes.tpms = "yes";
+  }
+  return attributes;
 }
 
 async function loadVehicleMappingReferences() {
@@ -1307,7 +1461,35 @@ async function ensurePartFamily(connection, candidate) {
   return { familyId, familyName };
 }
 
+async function recordFieldEvidence(connection, { partId, fieldName, fieldValue, sourceUrl, sourceTitle = null, sourceMethod = "source", confidence = 0, accepted = false }) {
+  const value = String(fieldValue || "").trim();
+  const url = String(sourceUrl || "").trim();
+  if (!partId || !fieldName || !value || !url) return;
+  const reader = await connection.runAndReadAll(
+    `SELECT id, confidence FROM partmaster_field_evidence
+     WHERE part_id = $partId AND field_name = $fieldName AND field_value = $fieldValue AND source_url = $sourceUrl`,
+    { partId, fieldName, fieldValue: value, sourceUrl: url },
+  );
+  const existing = reader.getRowObjectsJson()[0];
+  if (existing) {
+    await connection.run(
+      `UPDATE partmaster_field_evidence SET source_title = coalesce($sourceTitle, source_title),
+       source_method = $sourceMethod, confidence = greatest(coalesce(confidence, 0), $confidence),
+       accepted = accepted OR $accepted, observed_at = current_timestamp WHERE id = $id`,
+      { id: existing.id, sourceTitle, sourceMethod, confidence, accepted },
+    );
+  } else {
+    await connection.run(
+      `INSERT INTO partmaster_field_evidence
+       (id, part_id, field_name, field_value, source_url, source_title, source_method, confidence, accepted)
+       VALUES ($id, $partId, $fieldName, $fieldValue, $sourceUrl, $sourceTitle, $sourceMethod, $confidence, $accepted)`,
+      { id: randomUUID(), partId, fieldName, fieldValue: value, sourceUrl: url, sourceTitle, sourceMethod, confidence, accepted },
+    );
+  }
+}
+
 async function syncVariantAttributes(connection, partId, candidate) {
+  const categoryAttributes = inferCategoryAttributes(candidate, candidate.enriched_description || candidate.description_raw);
   const attributes = {
     side: candidate.side || "Unknown",
     heated: candidate.heated_state || "unknown",
@@ -1320,6 +1502,7 @@ async function syncVariantAttributes(connection, partId, candidate) {
     connector_pins: candidate.connector_pins || "unknown",
     required_options: candidate.required_options || "none_known",
     excluded_options: candidate.excluded_options || "none_known",
+    ...categoryAttributes,
   };
   for (const [name, value] of Object.entries(attributes)) {
     if (["", "unknown", "none_known"].includes(String(value || "").trim().toLowerCase())) continue;
@@ -1358,6 +1541,15 @@ async function syncVariantAttributes(connection, partId, candidate) {
         },
       );
     }
+    await recordFieldEvidence(connection, {
+      partId,
+      fieldName: name,
+      fieldValue: value,
+      sourceUrl: candidate.evidence_url || candidate.source_url,
+      sourceMethod: candidate.decision === "approve" ? "human_review" : "deterministic_and_online",
+      confidence: candidate.confidence || 0,
+      accepted: true,
+    });
   }
 }
 
@@ -1420,6 +1612,10 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
       },
     );
   }
+  const evidenceUrl = candidate.evidence_url || candidate.source_url;
+  const evidenceMethod = candidate.decision === "approve" ? "human_review" : "deterministic_and_online";
+  await recordFieldEvidence(connection, { partId, fieldName: "part_number", fieldValue: partNumber, sourceUrl: evidenceUrl, sourceTitle: candidate.evidence_title, sourceMethod: evidenceMethod, confidence: candidate.confidence || 0, accepted: true });
+  await recordFieldEvidence(connection, { partId, fieldName: "description", fieldValue: candidate.enriched_description || candidate.description_raw, sourceUrl: evidenceUrl, sourceTitle: candidate.evidence_title, sourceMethod: evidenceMethod, confidence: candidate.confidence || 0, accepted: true });
   await syncVariantAttributes(connection, partId, candidate);
 
   const applicationKey = [
@@ -1942,6 +2138,8 @@ async function checkCanonicalPart(partId) {
          WHERE id = $id`,
         { id: partId, description, confidence, evidenceUrl: page.finalUrl },
       );
+      await recordFieldEvidence(connection, { partId, fieldName: "part_number", fieldValue: context.part.part_number, sourceUrl: page.finalUrl, sourceTitle: evidence.title, sourceMethod: "online_exact_match", confidence, accepted: true });
+      await recordFieldEvidence(connection, { partId, fieldName: "description", fieldValue: description, sourceUrl: page.finalUrl, sourceTitle: evidence.title, sourceMethod: "online_exact_match", confidence, accepted: true });
       await syncVariantAttributes(connection, partId, {
         ...context.candidate,
         side: checked.side,
@@ -2339,6 +2537,240 @@ async function backfillVariantIntelligence() {
       );
     }
   });
+}
+
+function safeSourceHost(value) {
+  try { return new URL(value).hostname.toLowerCase(); } catch { return "unknown"; }
+}
+
+async function upsertConflict(connection, conflict) {
+  const reader = await connection.runAndReadAll(
+    "SELECT id FROM partmaster_data_conflicts WHERE conflict_key = $key",
+    { key: conflict.key },
+  );
+  const id = reader.getRowObjectsJson()[0]?.id;
+  if (id) {
+    await connection.run(
+      `UPDATE partmaster_data_conflicts SET field_name = $fieldName, severity = $severity,
+       values_seen = $valuesSeen, explanation = $explanation, status = 'open',
+       detected_at = current_timestamp, resolved_at = NULL WHERE id = $id`,
+      { id, fieldName: conflict.fieldName, severity: conflict.severity, valuesSeen: conflict.valuesSeen, explanation: conflict.explanation },
+    );
+  } else {
+    await connection.run(
+      `INSERT INTO partmaster_data_conflicts
+       (id, conflict_key, part_id, field_name, severity, values_seen, explanation)
+       VALUES ($id, $key, $partId, $fieldName, $severity, $valuesSeen, $explanation)`,
+      { id: randomUUID(), key: conflict.key, partId: conflict.partId, fieldName: conflict.fieldName, severity: conflict.severity, valuesSeen: conflict.valuesSeen, explanation: conflict.explanation },
+    );
+  }
+}
+
+async function refreshPartIntelligence() {
+  return withConnection(async (connection) => {
+    const canonicalEvidenceReader = await connection.runAndReadAll(
+      `SELECT parts.id, parts.part_number, parts.description, parts.confidence, parts.evidence_url,
+       families.family_name, applications.assembly, applications.quantity, applications.source_url
+       FROM partmaster_canonical_parts parts
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       LEFT JOIN partmaster_part_applications applications ON applications.part_id = parts.id
+       QUALIFY row_number() OVER (PARTITION BY parts.id ORDER BY applications.confidence DESC NULLS LAST) = 1`,
+    );
+    for (const part of canonicalEvidenceReader.getRowObjectsJson()) {
+      const sourceUrl = part.evidence_url || part.source_url;
+      await recordFieldEvidence(connection, { partId: part.id, fieldName: "part_number", fieldValue: part.part_number, sourceUrl, sourceMethod: "canonical_backfill", confidence: Number(part.confidence || 0), accepted: true });
+      await recordFieldEvidence(connection, { partId: part.id, fieldName: "description", fieldValue: part.description, sourceUrl, sourceMethod: "canonical_backfill", confidence: Number(part.confidence || 0), accepted: true });
+      await syncVariantAttributes(connection, part.id, { family_name: part.family_name, description_raw: part.description, assembly: part.assembly, quantity: part.quantity, evidence_url: sourceUrl, confidence: Number(part.confidence || 0) });
+    }
+    const candidateEvidenceReader = await connection.runAndReadAll(
+      `SELECT parts.id AS part_id, candidates.enriched_description, candidates.description_raw,
+       candidates.evidence_url, candidates.source_url, candidates.evidence_title, candidates.confidence,
+       candidates.decision
+       FROM partmaster_canonical_parts parts
+       JOIN partmaster_enrichment_candidates candidates
+        ON candidates.manufacturer_norm = parts.manufacturer_norm
+        AND candidates.part_number_norm = parts.part_number_norm
+       WHERE coalesce(candidates.evidence_url, candidates.source_url) IS NOT NULL
+        AND trim(coalesce(candidates.evidence_url, candidates.source_url)) != ''`,
+    );
+    for (const row of candidateEvidenceReader.getRowObjectsJson()) {
+      const sourceUrl = row.evidence_url || row.source_url;
+      await recordFieldEvidence(connection, { partId: row.part_id, fieldName: "description", fieldValue: row.enriched_description || row.description_raw, sourceUrl, sourceTitle: row.evidence_title, sourceMethod: row.decision ? "human_review" : "enrichment_candidate", confidence: Number(row.confidence || 0), accepted: row.decision === "approve" || Number(row.confidence || 0) >= 0.94 });
+    }
+
+    await connection.run(
+      "UPDATE partmaster_data_conflicts SET status = 'resolved', resolved_at = current_timestamp WHERE status = 'open'",
+    );
+    const sideConflictReader = await connection.runAndReadAll(
+      `SELECT part_id, string_agg(DISTINCT side, ', ' ORDER BY side) AS values_seen
+       FROM partmaster_part_applications
+       WHERE side IS NOT NULL AND lower(trim(side)) NOT IN ('', 'unknown', 'universal')
+       GROUP BY part_id HAVING count(DISTINCT lower(trim(side))) > 1`,
+    );
+    for (const row of sideConflictReader.getRowObjectsJson()) {
+      await upsertConflict(connection, { key: `${row.part_id}:application_side`, partId: row.part_id, fieldName: "side", severity: "warning", valuesSeen: row.values_seen, explanation: "The exact OEM number is assigned to more than one side. Confirm whether it is universal or whether two variants were merged." });
+    }
+    const descriptionConflictReader = await connection.runAndReadAll(
+      `SELECT parts.id AS part_id,
+       string_agg(DISTINCT coalesce(candidates.enriched_description, candidates.description_raw), ' | ' ORDER BY coalesce(candidates.enriched_description, candidates.description_raw)) AS values_seen
+       FROM partmaster_canonical_parts parts
+       JOIN partmaster_enrichment_candidates candidates
+        ON candidates.manufacturer_norm = parts.manufacturer_norm AND candidates.part_number_norm = parts.part_number_norm
+       WHERE trim(coalesce(candidates.enriched_description, candidates.description_raw, '')) != ''
+       GROUP BY parts.id
+       HAVING count(DISTINCT lower(trim(coalesce(candidates.enriched_description, candidates.description_raw)))) > 1`,
+    );
+    for (const row of descriptionConflictReader.getRowObjectsJson()) {
+      await upsertConflict(connection, { key: `${row.part_id}:description`, partId: row.part_id, fieldName: "description", severity: "review", valuesSeen: row.values_seen, explanation: "Sources use different descriptions for this exact OEM number. Review whether they describe the same component or a source error." });
+    }
+    const relationshipConflictReader = await connection.runAndReadAll(
+      `SELECT relationships.id, relationships.source_part_id AS part_id,
+       source.part_number AS source_number, target.part_number AS target_number,
+       string_agg(source_attributes.attribute_name || ': ' || source_attributes.attribute_value || ' vs ' || target_attributes.attribute_value, ', ' ORDER BY source_attributes.attribute_name) AS values_seen
+       FROM partmaster_part_relationships relationships
+       JOIN partmaster_canonical_parts source ON source.id = relationships.source_part_id
+       JOIN partmaster_canonical_parts target ON target.id = relationships.target_part_id
+       JOIN partmaster_variant_attributes source_attributes ON source_attributes.part_id = source.id
+       JOIN partmaster_variant_attributes target_attributes ON target_attributes.part_id = target.id
+        AND target_attributes.attribute_name = source_attributes.attribute_name
+       WHERE relationships.relationship_type IN ('interchangeable', 'supersedes', 'superseded_by')
+        AND lower(source_attributes.attribute_value) != lower(target_attributes.attribute_value)
+       GROUP BY relationships.id, relationships.source_part_id, source.part_number, target.part_number`,
+    );
+    for (const row of relationshipConflictReader.getRowObjectsJson()) {
+      await upsertConflict(connection, { key: `${row.part_id}:relationship:${row.id}`, partId: row.part_id, fieldName: "relationship", severity: "critical", valuesSeen: row.values_seen, explanation: `${row.source_number} and ${row.target_number} are marked interchangeable or superseding but have conflicting variant attributes.` });
+    }
+
+    const partsReader = await connection.runAndReadAll(
+      `SELECT parts.*, families.family_name,
+       (SELECT count(*) FROM partmaster_part_applications applications WHERE applications.part_id = parts.id) AS application_count,
+       (SELECT count(*) FROM partmaster_part_applications applications WHERE applications.part_id = parts.id AND applications.vehicle_mapping_method IS NOT NULL) AS mapped_count,
+       (SELECT count(*) FROM partmaster_part_compatibility compatibility WHERE compatibility.part_id = parts.id) AS compatibility_count,
+       (SELECT count(*) FROM partmaster_variant_attributes attributes WHERE attributes.part_id = parts.id) AS attribute_count,
+       (SELECT count(DISTINCT source_url) FROM partmaster_field_evidence evidence WHERE evidence.part_id = parts.id) AS evidence_sources,
+       (SELECT count(*) FROM partmaster_data_conflicts conflicts WHERE conflicts.part_id = parts.id AND conflicts.status = 'open') AS conflict_count,
+       date_diff('day', coalesce(parts.verified_at, parts.updated_at), current_timestamp) AS age_days
+       FROM partmaster_canonical_parts parts
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id`,
+    );
+    for (const part of partsReader.getRowObjectsJson()) {
+      const schema = categorySchemaFor(part.family_name, part.description);
+      const identity = [part.manufacturer, part.part_number].filter((value) => String(value || "").trim()).length * 40 + (part.family_id ? 10 : 0) + (part.component_scope ? 10 : 0);
+      const description = String(part.description || "").trim().length >= 6 ? 100 : part.description ? 60 : 0;
+      const applications = Number(part.application_count || 0);
+      const mapped = Number(part.mapped_count || 0);
+      const fitment = Math.min(100, (applications ? 20 : 0) + (applications ? Math.round((mapped / applications) * 40) : 0) + Math.min(40, Number(part.compatibility_count || 0) * 5));
+      const variant = Math.min(100, (schema.key === "general" ? 35 : 55) + Math.round((Math.min(Number(part.attribute_count || 0), schema.attributes.length) / Math.max(1, schema.attributes.length)) * 45));
+      const evidence = Math.min(100, (part.evidence_url ? 35 : 0) + Math.round(Number(part.confidence || 0) * 35) + Math.min(30, Number(part.evidence_sources || 0) * 15));
+      const ageDays = Number(part.age_days || 0);
+      const freshness = ageDays <= 180 ? 100 : ageDays <= 365 ? 75 : ageDays <= 730 ? 50 : 25;
+      const conflictRisk = Math.min(100, Number(part.conflict_count || 0) * 35);
+      const overall = Math.max(0, Math.round(identity * 0.2 + description * 0.15 + fitment * 0.2 + variant * 0.15 + evidence * 0.2 + freshness * 0.1 - conflictRisk * 0.2));
+      const missing = [];
+      if (!part.description) missing.push("description");
+      if (!part.evidence_url) missing.push("evidence");
+      if (!applications) missing.push("fitment");
+      if (!Number(part.attribute_count || 0)) missing.push("variant attributes");
+      if (!Number(part.compatibility_count || 0)) missing.push("compatibility");
+      const existingReader = await connection.runAndReadAll("SELECT part_id FROM partmaster_quality_scores WHERE part_id = $partId", { partId: part.id });
+      const values = { partId: part.id, identity, description, fitment, variant, evidence, freshness, conflictRisk, overall, missingFields: missing.join(", ") || null };
+      if (existingReader.getRowObjectsJson().length) {
+        await connection.run(
+          `UPDATE partmaster_quality_scores SET identity_score = $identity, description_score = $description,
+           fitment_score = $fitment, variant_score = $variant, evidence_score = $evidence,
+           freshness_score = $freshness, conflict_risk = $conflictRisk, overall_score = $overall,
+           missing_fields = $missingFields, calculated_at = current_timestamp WHERE part_id = $partId`, values,
+        );
+      } else {
+        await connection.run(
+          `INSERT INTO partmaster_quality_scores
+           (part_id, identity_score, description_score, fitment_score, variant_score, evidence_score,
+            freshness_score, conflict_risk, overall_score, missing_fields)
+           VALUES ($partId, $identity, $description, $fitment, $variant, $evidence, $freshness, $conflictRisk, $overall, $missingFields)`, values,
+        );
+      }
+    }
+    return { partsScored: partsReader.getRowObjectsJson().length, conflicts: sideConflictReader.getRowObjectsJson().length + descriptionConflictReader.getRowObjectsJson().length + relationshipConflictReader.getRowObjectsJson().length };
+  });
+}
+
+function parsePartSearchQuery(query) {
+  const raw = String(query || "").trim();
+  const lower = raw.toLowerCase();
+  const year = lower.match(/\b((?:19|20)\d{2})\b/)?.[1] || "";
+  const side = /\bright\b|\brh\b/.test(lower) ? "right" : /\bleft\b|\blh\b/.test(lower) ? "left" : "";
+  const manufacturers = ["BMW", "Honda", "Kawasaki", "KTM", "Harley-Davidson", "Toyota", "Ford", "Chevrolet", "Nissan", "Mercedes-Benz", "Audi", "Volkswagen"];
+  const manufacturer = manufacturers.find((name) => lower.includes(name.toLowerCase())) || "";
+  const featureMap = { heated: /\bheated\b/, blind_spot: /\bblind[ -]?spot\b|\bbsm\b/, camera: /\bcamera\b/, power_folding: /\bpower[ -]?fold/, memory: /\bmemory\b/, auto_dimming: /\bauto[ -]?dimm?ing\b/, turn_signal: /\bturn signal\b|\bindicator\b/ };
+  const requiredFeatures = [];
+  const excludedFeatures = [];
+  for (const [key, pattern] of Object.entries(featureMap)) {
+    if (!pattern.test(lower)) continue;
+    const exclusionPattern = new RegExp(`(?:without|exclude|no|non)[ -]{0,2}${key.replaceAll("_", "[ -]?")}`, "i");
+    (exclusionPattern.test(lower) ? excludedFeatures : requiredFeatures).push(key);
+  }
+  const importantTerms = lower.replace(/[^a-z0-9-]+/g, " ").split(/\s+/).filter((term) => term.length >= 3 && !["find", "part", "parts", "with", "without", "for", "the", "and", "but", "exclude", year, manufacturer.toLowerCase(), side].includes(term)).slice(0, 8);
+  return { raw, year, side, manufacturer, requiredFeatures, excludedFeatures, importantTerms };
+}
+
+async function intelligentPartSearch(query) {
+  const interpreted = parsePartSearchQuery(query);
+  const rows = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT parts.id, parts.manufacturer, parts.part_number, parts.description, parts.component_scope,
+       parts.variant_summary, parts.confidence, parts.evidence_url, families.family_name,
+       scores.overall_score, scores.identity_score, scores.fitment_score, scores.variant_score,
+       scores.evidence_score, scores.conflict_risk, scores.missing_fields,
+       string_agg(DISTINCT attributes.attribute_name || '=' || attributes.attribute_value, '|' ORDER BY attributes.attribute_name || '=' || attributes.attribute_value) AS attributes,
+       string_agg(DISTINCT coalesce(applications.year, '') || ' ' || coalesce(applications.vehicle_make, parts.manufacturer) || ' ' || coalesce(applications.vehicle_model, applications.model, '') || ' ' || coalesce(applications.assembly, ''), '|' ORDER BY coalesce(applications.year, '') || ' ' || coalesce(applications.vehicle_make, parts.manufacturer) || ' ' || coalesce(applications.vehicle_model, applications.model, '') || ' ' || coalesce(applications.assembly, '')) AS applications
+       FROM partmaster_canonical_parts parts
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       LEFT JOIN partmaster_quality_scores scores ON scores.part_id = parts.id
+       LEFT JOIN partmaster_variant_attributes attributes ON attributes.part_id = parts.id
+       LEFT JOIN partmaster_part_applications applications ON applications.part_id = parts.id
+       GROUP BY parts.id, parts.manufacturer, parts.part_number, parts.description, parts.component_scope,
+        parts.variant_summary, parts.confidence, parts.evidence_url, families.family_name,
+        scores.overall_score, scores.identity_score, scores.fitment_score, scores.variant_score,
+        scores.evidence_score, scores.conflict_risk, scores.missing_fields LIMIT 5000`,
+    );
+    return reader.getRowObjectsJson();
+  });
+  const results = [];
+  for (const row of rows) {
+    const searchable = `${row.manufacturer} ${row.part_number} ${row.description} ${row.family_name} ${row.variant_summary} ${row.attributes} ${row.applications}`.toLowerCase();
+    const attrs = Object.fromEntries(String(row.attributes || "").split("|").filter(Boolean).map((item) => item.split("=", 2)));
+    const reasons = [];
+    let score = Number(row.overall_score || 0) / 10;
+    if (interpreted.manufacturer) {
+      if (String(row.manufacturer).toLowerCase() !== interpreted.manufacturer.toLowerCase()) continue;
+      score += 20; reasons.push(`Manufacturer is ${row.manufacturer}`);
+    }
+    if (interpreted.year) {
+      if (!String(row.applications || "").includes(interpreted.year)) continue;
+      score += 15; reasons.push(`Fitment includes ${interpreted.year}`);
+    }
+    if (interpreted.side) {
+      if (String(attrs.side || "").toLowerCase() !== interpreted.side && !searchable.includes(interpreted.side)) continue;
+      score += 15; reasons.push(`${titleCase(interpreted.side)}-side evidence`);
+    }
+    let rejected = false;
+    for (const feature of interpreted.requiredFeatures) {
+      if (String(attrs[feature] || "").toLowerCase() !== "yes" && !searchable.includes(feature.replaceAll("_", " "))) { rejected = true; break; }
+      score += 10; reasons.push(`${titleCase(feature.replaceAll("_", " "))} confirmed`);
+    }
+    if (rejected) continue;
+    for (const feature of interpreted.excludedFeatures) {
+      if (String(attrs[feature] || "").toLowerCase() === "yes") { rejected = true; break; }
+      reasons.push(`${titleCase(feature.replaceAll("_", " "))} excluded`);
+    }
+    if (rejected) continue;
+    const termMatches = interpreted.importantTerms.filter((term) => searchable.includes(term));
+    if (interpreted.importantTerms.length && !termMatches.length && !normalizePartNumber(interpreted.raw).includes(row.part_number.replace(/[^A-Z0-9]/gi, ""))) continue;
+    score += termMatches.length * 5;
+    if (termMatches.length) reasons.push(`Matched ${termMatches.join(", ")}`);
+    results.push({ ...row, matchScore: Math.round(score), reasons: reasons.length ? reasons : ["Matched canonical part identity"] });
+  }
+  return { interpreted, results: results.sort((left, right) => right.matchScore - left.matchScore).slice(0, 100) };
 }
 
 const app = express();
@@ -2772,7 +3204,7 @@ app.post("/api/local/enrichment/candidates/:id/compatibility", asyncRoute(async 
 
 app.post("/api/local/master/relationships", asyncRoute(async (request, response) => {
   const relationshipType = String(request.body.relationshipType || "");
-  if (!["same_family", "supersedes", "superseded_by", "interchangeable", "interchangeable_if", "not_interchangeable", "component_of"].includes(relationshipType)) {
+  if (!["same_family", "left_right_counterpart", "supersedes", "superseded_by", "interchangeable", "interchangeable_if", "not_interchangeable", "component_of"].includes(relationshipType)) {
     return response.status(400).json({ error: "Choose a supported part relationship type." });
   }
   const relationship = await withConnection(async (connection) => {
@@ -2818,6 +3250,169 @@ app.post("/api/local/master/relationships", asyncRoute(async (request, response)
   response.json({ relationship });
 }));
 
+app.get("/api/local/intelligence/categories", (_request, response) => {
+  response.json({ categories: CATEGORY_ATTRIBUTE_SCHEMAS });
+});
+
+app.post("/api/local/intelligence/refresh", asyncRoute(async (_request, response) => {
+  response.json({ result: await refreshPartIntelligence() });
+}));
+
+app.get("/api/local/intelligence/overview", asyncRoute(async (_request, response) => {
+  const overview = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT
+       (SELECT count(*) FROM partmaster_canonical_parts) AS identities,
+       (SELECT count(*) FROM partmaster_part_aliases) AS aliases,
+       (SELECT count(*) FROM partmaster_field_evidence) AS evidence_observations,
+       (SELECT count(DISTINCT source_url) FROM partmaster_field_evidence) AS evidence_sources,
+       (SELECT count(*) FROM partmaster_part_relationships) AS relationships,
+       (SELECT count(*) FROM partmaster_part_compatibility) AS verified_fitments,
+       (SELECT count(*) FROM partmaster_part_applications WHERE vehicle_mapping_method IS NOT NULL) AS mapped_applications,
+       (SELECT count(*) FROM partmaster_data_conflicts WHERE status = 'open') AS open_conflicts,
+       (SELECT count(*) FROM partmaster_review_feedback) AS reviewer_decisions,
+       (SELECT round(avg(overall_score), 1) FROM partmaster_quality_scores) AS average_quality,
+       (SELECT count(*) FROM partmaster_quality_scores WHERE overall_score < 70) AS priority_parts,
+       (SELECT max(calculated_at) FROM partmaster_quality_scores) AS calculated_at`,
+    );
+    const sourceReader = await connection.runAndReadAll(
+      `SELECT regexp_extract(source_url, 'https?://([^/]+)', 1) AS source_host,
+       count(*) AS observations, round(avg(confidence) * 100, 1) AS average_confidence,
+       count(*) FILTER (WHERE accepted) AS accepted
+       FROM partmaster_field_evidence GROUP BY 1 ORDER BY observations DESC LIMIT 10`,
+    );
+    return { ...reader.getRowObjectsJson()[0], sources: sourceReader.getRowObjectsJson() };
+  });
+  response.json({ overview });
+}));
+
+app.get("/api/local/intelligence/priority", asyncRoute(async (_request, response) => {
+  const result = await withConnection(async (connection) => {
+    const partsReader = await connection.runAndReadAll(
+      `SELECT parts.id, parts.manufacturer, parts.part_number, parts.description, families.family_name,
+       scores.*, (100 - scores.overall_score) + scores.conflict_risk * .5
+        + CASE WHEN scores.missing_fields LIKE '%evidence%' THEN 15 ELSE 0 END AS priority_score,
+       (SELECT count(*) FROM partmaster_part_applications applications WHERE applications.part_id = parts.id) AS application_count,
+       (SELECT count(*) FROM partmaster_data_conflicts conflicts WHERE conflicts.part_id = parts.id AND conflicts.status = 'open') AS conflict_count
+       FROM partmaster_quality_scores scores
+       JOIN partmaster_canonical_parts parts ON parts.id = scores.part_id
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       ORDER BY priority_score DESC, application_count DESC, parts.manufacturer, parts.part_number LIMIT 100`,
+    );
+    const candidatesReader = await connection.runAndReadAll(
+      `SELECT id, source_row_id, manufacturer_raw, part_number_raw, description_raw, year, model, assembly,
+       status, confidence, source_url,
+       CASE status WHEN 'conflict' THEN 100 WHEN 'failed' THEN 90 WHEN 'not_found' THEN 80 ELSE 60 END
+        + CASE WHEN description_raw IS NULL OR trim(description_raw) = '' THEN 20 ELSE 0 END
+        + CASE WHEN part_number_raw IS NULL OR trim(part_number_raw) = '' THEN 25 ELSE 0 END AS priority_score
+       FROM partmaster_enrichment_candidates
+       WHERE status IN ('needs_review', 'conflict', 'not_found', 'failed') AND decision IS NULL
+       ORDER BY priority_score DESC, source_row_id LIMIT 100`,
+    );
+    return { parts: partsReader.getRowObjectsJson(), candidates: candidatesReader.getRowObjectsJson() };
+  });
+  response.json(result);
+}));
+
+app.get("/api/local/intelligence/conflicts", asyncRoute(async (_request, response) => {
+  const conflicts = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT conflicts.*, parts.manufacturer, parts.part_number, parts.description, families.family_name
+       FROM partmaster_data_conflicts conflicts
+       JOIN partmaster_canonical_parts parts ON parts.id = conflicts.part_id
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       WHERE conflicts.status = 'open'
+       ORDER BY CASE conflicts.severity WHEN 'critical' THEN 0 WHEN 'review' THEN 1 ELSE 2 END,
+        conflicts.detected_at DESC LIMIT 200`,
+    );
+    return reader.getRowObjectsJson();
+  });
+  response.json({ conflicts });
+}));
+
+app.get("/api/local/intelligence/search", asyncRoute(async (request, response) => {
+  response.json(await intelligentPartSearch(request.query.q));
+}));
+
+app.get("/api/local/intelligence/relationships", asyncRoute(async (_request, response) => {
+  const result = await withConnection(async (connection) => {
+    const relationshipsReader = await connection.runAndReadAll(
+      `SELECT relationships.*, source.part_number AS source_number, target.part_number AS target_number,
+       source.manufacturer, source.description AS source_description, target.description AS target_description
+       FROM partmaster_part_relationships relationships
+       JOIN partmaster_canonical_parts source ON source.id = relationships.source_part_id
+       JOIN partmaster_canonical_parts target ON target.id = relationships.target_part_id
+       ORDER BY relationships.created_at DESC LIMIT 200`,
+    );
+    const suggestionsReader = await connection.runAndReadAll(
+      `WITH sides AS (
+        SELECT parts.id, parts.manufacturer, parts.part_number, parts.description, parts.family_id,
+         max(CASE WHEN attributes.attribute_name = 'side' THEN lower(attributes.attribute_value) END) AS side
+        FROM partmaster_canonical_parts parts
+        LEFT JOIN partmaster_variant_attributes attributes ON attributes.part_id = parts.id
+        GROUP BY parts.id, parts.manufacturer, parts.part_number, parts.description, parts.family_id
+       )
+       SELECT left_part.id AS source_part_id, right_part.id AS target_part_id,
+        left_part.manufacturer, left_part.part_number AS source_number, right_part.part_number AS target_number,
+        'left_right_counterpart' AS suggested_type, .75 AS confidence
+       FROM sides left_part JOIN sides right_part
+        ON right_part.family_id = left_part.family_id AND right_part.manufacturer = left_part.manufacturer
+        AND right_part.side = 'right' AND left_part.side = 'left'
+       WHERE left_part.id != right_part.id
+        AND NOT EXISTS (SELECT 1 FROM partmaster_part_relationships relationships
+         WHERE relationships.source_part_id = left_part.id AND relationships.target_part_id = right_part.id)
+       ORDER BY left_part.manufacturer, left_part.part_number LIMIT 50`,
+    );
+    return { relationships: relationshipsReader.getRowObjectsJson(), suggestions: suggestionsReader.getRowObjectsJson() };
+  });
+  response.json(result);
+}));
+
+app.get("/api/local/intelligence/parts/:id", asyncRoute(async (request, response) => {
+  const result = await withConnection(async (connection) => {
+    const partReader = await connection.runAndReadAll(
+      `SELECT parts.*, families.family_name, scores.* EXCLUDE (part_id)
+       FROM partmaster_canonical_parts parts
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       LEFT JOIN partmaster_quality_scores scores ON scores.part_id = parts.id WHERE parts.id = $id`, { id: request.params.id },
+    );
+    const part = partReader.getRowObjectsJson()[0];
+    if (!part) { const error = new Error("Canonical part not found."); error.status = 404; throw error; }
+    const schema = categorySchemaFor(part.family_name, part.description);
+    const queries = await Promise.all([
+      connection.runAndReadAll("SELECT * FROM partmaster_variant_attributes WHERE part_id = $id ORDER BY attribute_name", { id: part.id }),
+      connection.runAndReadAll("SELECT * FROM partmaster_field_evidence WHERE part_id = $id ORDER BY field_name, confidence DESC", { id: part.id }),
+      connection.runAndReadAll("SELECT * FROM partmaster_part_aliases WHERE part_id = $id ORDER BY alias_type, alias_number", { id: part.id }),
+      connection.runAndReadAll("SELECT * FROM partmaster_part_applications WHERE part_id = $id ORDER BY year, model LIMIT 250", { id: part.id }),
+      connection.runAndReadAll("SELECT * FROM partmaster_part_compatibility WHERE part_id = $id ORDER BY year, model LIMIT 500", { id: part.id }),
+      connection.runAndReadAll("SELECT * FROM partmaster_data_conflicts WHERE part_id = $id AND status = 'open' ORDER BY severity", { id: part.id }),
+    ]);
+    return { part, schema, attributes: queries[0].getRowObjectsJson(), evidence: queries[1].getRowObjectsJson(), aliases: queries[2].getRowObjectsJson(), applications: queries[3].getRowObjectsJson(), compatibility: queries[4].getRowObjectsJson(), conflicts: queries[5].getRowObjectsJson() };
+  });
+  response.json(result);
+}));
+
+app.post("/api/local/intelligence/parts/:id/aliases", asyncRoute(async (request, response) => {
+  const aliasNumber = String(request.body.aliasNumber || "").trim();
+  const aliasType = String(request.body.aliasType || "alternate").trim();
+  if (!aliasNumber || !["alternate", "superseded", "supersedes", "supplier", "casting"].includes(aliasType)) return response.status(400).json({ error: "Provide an alias number and supported alias type." });
+  const alias = await withConnection(async (connection) => {
+    const partReader = await connection.runAndReadAll("SELECT id FROM partmaster_canonical_parts WHERE id = $id", { id: request.params.id });
+    if (!partReader.getRowObjectsJson().length) throw new Error("Canonical part not found.");
+    const id = randomUUID();
+    await connection.run(
+      `INSERT INTO partmaster_part_aliases
+       (id, part_id, alias_number, alias_norm, alias_type, status, confidence, evidence_url)
+       VALUES ($id, $partId, $aliasNumber, $aliasNorm, $aliasType, $status, $confidence, $evidenceUrl)
+       ON CONFLICT (part_id, alias_norm, alias_type) DO UPDATE SET confidence = excluded.confidence,
+        evidence_url = excluded.evidence_url, status = excluded.status`,
+      { id, partId: request.params.id, aliasNumber, aliasNorm: normalizePartNumber(aliasNumber), aliasType, status: request.body.status === "suggested" ? "suggested" : "verified", confidence: Math.max(0, Math.min(1, Number(request.body.confidence) || 0.9)), evidenceUrl: String(request.body.evidenceUrl || "").trim() || null },
+    );
+    return { id, aliasNumber, aliasType };
+  });
+  response.json({ alias });
+}));
+
 app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, response) => {
   const decision = String(request.body.decision || "");
   if (!["approve", "reject"].includes(decision)) {
@@ -2858,9 +3453,10 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
       confidence: decision === "approve" ? Math.max(Number(candidate.confidence) || 0, 0.9) : Number(candidate.confidence) || 0,
       decision,
     };
+    let reviewedPartId = null;
     if (decision === "approve") {
       if (!normalizePartNumber(edited.enriched_part_number)) throw new Error("An OEM part number is required before approval.");
-      await promoteCandidate(connection, edited, "human_verified");
+      reviewedPartId = await promoteCandidate(connection, edited, "human_verified");
     }
     await connection.run(
       `UPDATE partmaster_enrichment_candidates SET
@@ -2901,6 +3497,19 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
         notes: String(request.body.notes || "").trim() || null,
       },
     );
+    const feedbackFields = [
+      ["part_number", candidate.enriched_part_number || candidate.part_number_raw, edited.enriched_part_number],
+      ["description", candidate.enriched_description || candidate.description_raw, edited.enriched_description],
+      ["side", candidate.side, edited.side], ["position", candidate.position, edited.position],
+      ["family", candidate.family_name, edited.family_name], ["component_scope", candidate.component_scope, edited.component_scope],
+      ["required_options", candidate.required_options, edited.required_options], ["excluded_options", candidate.excluded_options, edited.excluded_options],
+    ].filter(([, before, after]) => String(before || "").trim() !== String(after || "").trim()).map(([field]) => field);
+    await connection.run(
+      `INSERT INTO partmaster_review_feedback
+       (id, candidate_id, part_id, decision, changed_fields, reason, source_host)
+       VALUES ($id, $candidateId, $partId, $decision, $changedFields, $reason, $sourceHost)`,
+      { id: randomUUID(), candidateId: candidate.id, partId: reviewedPartId, decision, changedFields: feedbackFields.join(", ") || null, reason: String(request.body.notes || "").trim() || null, sourceHost: safeSourceHost(candidate.evidence_url || candidate.source_url) },
+    );
     await refreshEnrichmentJobStats(connection, candidate.job_id);
     return edited;
   });
@@ -2908,6 +3517,7 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
   if (decision === "approve") {
     scheduleCompatibilityEnrichment(reviewedCandidate);
   }
+  setImmediate(() => refreshPartIntelligence().catch(() => {}));
 }));
 
 app.get("/api/local/master/stats", asyncRoute(async (_request, response) => {
@@ -2962,10 +3572,18 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const applicationsFilename = `part-applications-${stamp}.csv`;
     const relationshipsFilename = `part-relationships-${stamp}.csv`;
     const compatibilityFilename = `part-compatibility-${stamp}.csv`;
+    const intelligenceFilename = `part-intelligence-${stamp}.csv`;
+    const evidenceFilename = `field-evidence-${stamp}.csv`;
+    const aliasesFilename = `part-aliases-${stamp}.csv`;
+    const conflictsFilename = `data-conflicts-${stamp}.csv`;
     const partsPath = join(EXPORT_ROOT, partsFilename);
     const applicationsPath = join(EXPORT_ROOT, applicationsFilename);
     const relationshipsPath = join(EXPORT_ROOT, relationshipsFilename);
     const compatibilityPath = join(EXPORT_ROOT, compatibilityFilename);
+    const intelligencePath = join(EXPORT_ROOT, intelligenceFilename);
+    const evidencePath = join(EXPORT_ROOT, evidenceFilename);
+    const aliasesPath = join(EXPORT_ROOT, aliasesFilename);
+    const conflictsPath = join(EXPORT_ROOT, conflictsFilename);
     await connection.run(
       `COPY (SELECT parts.manufacturer AS "Manufacturer", families.family_name AS "Part Family",
        parts.part_number AS "OEM Part Number", parts.description AS "Description",
@@ -3035,11 +3653,54 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
         compatibility.model, compatibility.model_code, compatibility.assembly)
        TO ${quoteString(compatibilityPath)} (FORMAT CSV, HEADER true)`,
     );
+    await connection.run(
+      `COPY (SELECT parts.manufacturer AS "Manufacturer", parts.part_number AS "OEM Part Number",
+       families.family_name AS "Part Family", scores.identity_score AS "Identity Score",
+       scores.description_score AS "Description Score", scores.fitment_score AS "Fitment Score",
+       scores.variant_score AS "Variant Score", scores.evidence_score AS "Evidence Score",
+       scores.freshness_score AS "Freshness Score", scores.conflict_risk AS "Conflict Risk",
+       scores.overall_score AS "Overall Score", scores.missing_fields AS "Next Improvements",
+       scores.calculated_at AS "Calculated At"
+       FROM partmaster_quality_scores scores JOIN partmaster_canonical_parts parts ON parts.id = scores.part_id
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       ORDER BY scores.overall_score, parts.manufacturer_norm, parts.part_number_norm)
+       TO ${quoteString(intelligencePath)} (FORMAT CSV, HEADER true)`,
+    );
+    await connection.run(
+      `COPY (SELECT parts.manufacturer AS "Manufacturer", parts.part_number AS "OEM Part Number",
+       evidence.field_name AS "Field", evidence.field_value AS "Observed Value",
+       evidence.source_url AS "Source URL", evidence.source_title AS "Source Title",
+       evidence.source_method AS "Method", evidence.confidence AS "Confidence",
+       evidence.accepted AS "Accepted", evidence.observed_at AS "Observed At"
+       FROM partmaster_field_evidence evidence JOIN partmaster_canonical_parts parts ON parts.id = evidence.part_id
+       ORDER BY parts.manufacturer_norm, parts.part_number_norm, evidence.field_name, evidence.confidence DESC)
+       TO ${quoteString(evidencePath)} (FORMAT CSV, HEADER true)`,
+    );
+    await connection.run(
+      `COPY (SELECT parts.manufacturer AS "Manufacturer", parts.part_number AS "Canonical OEM Part Number",
+       aliases.alias_number AS "Alias Number", aliases.alias_type AS "Alias Type", aliases.status AS "Status",
+       aliases.confidence AS "Confidence", aliases.evidence_url AS "Evidence URL"
+       FROM partmaster_part_aliases aliases JOIN partmaster_canonical_parts parts ON parts.id = aliases.part_id
+       ORDER BY parts.manufacturer_norm, parts.part_number_norm, aliases.alias_type, aliases.alias_norm)
+       TO ${quoteString(aliasesPath)} (FORMAT CSV, HEADER true)`,
+    );
+    await connection.run(
+      `COPY (SELECT parts.manufacturer AS "Manufacturer", parts.part_number AS "OEM Part Number",
+       conflicts.field_name AS "Field", conflicts.severity AS "Severity", conflicts.values_seen AS "Values Seen",
+       conflicts.explanation AS "Explanation", conflicts.status AS "Status", conflicts.detected_at AS "Detected At"
+       FROM partmaster_data_conflicts conflicts JOIN partmaster_canonical_parts parts ON parts.id = conflicts.part_id
+       ORDER BY conflicts.status, conflicts.severity, parts.manufacturer_norm, parts.part_number_norm)
+       TO ${quoteString(conflictsPath)} (FORMAT CSV, HEADER true)`,
+    );
     return [
       { filename: partsFilename, path: partsPath, bytes: (await stat(partsPath)).size },
       { filename: applicationsFilename, path: applicationsPath, bytes: (await stat(applicationsPath)).size },
       { filename: relationshipsFilename, path: relationshipsPath, bytes: (await stat(relationshipsPath)).size },
       { filename: compatibilityFilename, path: compatibilityPath, bytes: (await stat(compatibilityPath)).size },
+      { filename: intelligenceFilename, path: intelligencePath, bytes: (await stat(intelligencePath)).size },
+      { filename: evidenceFilename, path: evidencePath, bytes: (await stat(evidencePath)).size },
+      { filename: aliasesFilename, path: aliasesPath, bytes: (await stat(aliasesPath)).size },
+      { filename: conflictsFilename, path: conflictsPath, bytes: (await stat(conflictsPath)).size },
     ];
   });
   response.json({ exports });
@@ -3055,6 +3716,7 @@ const vehicleMappingBackfillResult = vehicleMappingLoadResult.loaded
   ? await backfillApplicationVehicleMappings().catch((error) => ({ backfilled: 0, reason: error.message }))
   : { backfilled: 0 };
 await backfillVariantIntelligence();
+const intelligenceBackfillResult = await refreshPartIntelligence().catch((error) => ({ partsScored: 0, reason: error.message }));
 
 const resumableJobIds = await withConnection(async (connection) => {
   await connection.run("UPDATE partmaster_enrichment_candidates SET status = 'pending' WHERE status = 'processing'");
@@ -3079,6 +3741,8 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   } else {
     console.log(`Vehicle mapping reference not loaded: ${vehicleMappingLoadResult.reason}`);
   }
+  if (intelligenceBackfillResult.reason) console.log(`Parts intelligence refresh skipped: ${intelligenceBackfillResult.reason}`);
+  else console.log(`Parts intelligence: ${Number(intelligenceBackfillResult.partsScored || 0).toLocaleString()} parts scored, ${Number(intelligenceBackfillResult.conflicts || 0).toLocaleString()} conflicts detected`);
   resumableJobIds.forEach(scheduleEnrichmentJob);
   resumableRowEnhancementJobIds.forEach(scheduleRowEnhancementJob);
 });
