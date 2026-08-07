@@ -62,6 +62,7 @@ await withConnection((connection) => connection.run(`
     id VARCHAR PRIMARY KEY,
     dataset_id VARCHAR NOT NULL,
     name VARCHAR NOT NULL,
+    mode VARCHAR NOT NULL DEFAULT 'full',
     status VARCHAR NOT NULL,
     batch_size INTEGER NOT NULL,
     start_row_id BIGINT NOT NULL DEFAULT 0,
@@ -513,6 +514,7 @@ await withConnection((connection) => connection.run(`
 
 await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_pipeline_jobs ADD COLUMN IF NOT EXISTS attribute_processed BIGINT DEFAULT 0;
+  ALTER TABLE partmaster_pipeline_jobs ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'full';
   ALTER TABLE partmaster_enrichment_jobs ADD COLUMN IF NOT EXISTS start_row_id BIGINT DEFAULT 0;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS application_key VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS family_name VARCHAR;
@@ -2387,12 +2389,45 @@ async function runFullPipeline(jobId) {
   try {
     const job = await withConnection(async (connection) => {
       await connection.run(
-        `UPDATE partmaster_pipeline_jobs SET status = 'running', phase = 'importing_sources',
+        `UPDATE partmaster_pipeline_jobs SET status = 'running', phase = CASE WHEN mode = 'online_only' THEN 'checking_shared_sources' ELSE 'importing_sources' END,
          started_at = coalesce(started_at, current_timestamp), completed_at = NULL, last_error = NULL WHERE id = $jobId`, { jobId },
       );
       const reader = await connection.runAndReadAll("SELECT * FROM partmaster_pipeline_jobs WHERE id = $jobId", { jobId });
       return reader.getRowObjectsJson()[0];
     });
+    if (job.mode === "online_only") {
+      const baseline = await withConnection(async (connection) => {
+        const reader = await connection.runAndReadAll(
+          `SELECT * FROM partmaster_pipeline_jobs
+           WHERE id != $jobId AND mode = 'full' AND status = 'completed'
+           ORDER BY completed_at DESC LIMIT 1`, { jobId },
+        );
+        return reader.getRowObjectsJson()[0];
+      });
+      if (!baseline) throw new Error("Run the full local pipeline once before continuing online checks.");
+      await withConnection((connection) => connection.run(
+        `UPDATE partmaster_pipeline_jobs SET total_rows = $totalRows, scanned_rows = $scannedRows,
+         invalid_rows = $invalidRows, unique_parts = $uniqueParts, duplicates_removed = $duplicatesRemoved,
+         attribute_processed = $attributeProcessed, attributed_parts = $attributedParts,
+         attribute_facts = $attributeFacts, source_pages = $sourcePages WHERE id = $jobId`,
+        {
+          jobId, totalRows: baseline.total_rows, scannedRows: baseline.scanned_rows,
+          invalidRows: baseline.invalid_rows, uniqueParts: baseline.unique_parts,
+          duplicatesRemoved: baseline.duplicates_removed, attributeProcessed: baseline.attribute_processed,
+          attributedParts: baseline.attributed_parts, attributeFacts: baseline.attribute_facts,
+          sourcePages: baseline.source_pages,
+        },
+      ));
+      await checkOfflineSourcePages(jobId, Math.max(0, Number(job.online_budget || 0) - Number(job.online_checked || 0)));
+      await withConnection((connection) => connection.run(
+        `UPDATE partmaster_pipeline_jobs SET status = 'completed', phase = 'completed',
+         attributed_parts = (SELECT count(*) FROM partmaster_offline_parts WHERE extracted_attribute_count > 0),
+         attribute_facts = (SELECT coalesce(sum(extracted_attribute_count), 0) FROM partmaster_offline_parts),
+         online_verified_parts = (SELECT count(*) FROM partmaster_offline_parts WHERE online_status = 'verified'),
+         completed_at = current_timestamp WHERE id = $jobId AND status = 'running'`, { jobId },
+      ));
+      return;
+    }
     let datasets = await ensurePipelineDatasets(Boolean(job.import_missing));
     const selectedIds = new Set(String(job.dataset_ids || "").split(",").filter(Boolean));
     if (selectedIds.size) datasets = datasets.filter((dataset) => selectedIds.has(dataset.id));
@@ -3627,15 +3662,18 @@ app.post("/api/local/pipeline/jobs", asyncRoute(async (request, response) => {
   if (active) return response.status(409).json({ error: "A full-dataset pipeline is already running." });
   const id = randomUUID();
   const datasetIds = Array.isArray(request.body.datasetIds) ? request.body.datasetIds.map(String).filter(Boolean) : [];
-  const onlineBudget = Math.max(0, Math.min(5000, Number(request.body.onlineBudget) || 250));
+  const requestedBudget = Number(request.body.onlineBudget);
+  const onlineBudget = Math.max(0, Math.min(5000, Number.isFinite(requestedBudget) ? requestedBudget : 250));
   const importMissing = request.body.importMissing !== false;
+  const mode = request.body.continueOnline === true ? "online_only" : "full";
   await withConnection((connection) => connection.run(
     `INSERT INTO partmaster_pipeline_jobs
-     (id, name, status, phase, dataset_ids, import_missing, online_budget)
-     VALUES ($id, $name, 'queued', 'queued', $datasetIds, $importMissing, $onlineBudget)`,
+     (id, name, mode, status, phase, dataset_ids, import_missing, online_budget)
+     VALUES ($id, $name, $mode, 'queued', 'queued', $datasetIds, $importMissing, $onlineBudget)`,
     {
       id,
-      name: String(request.body.name || "Full local parts pipeline").slice(0, 200),
+      name: String(request.body.name || (mode === "online_only" ? "Continue prioritized online checks" : "Full local parts pipeline")).slice(0, 200),
+      mode,
       datasetIds: datasetIds.join(",") || null,
       importMissing,
       onlineBudget,
@@ -3683,6 +3721,8 @@ app.get("/api/local/pipeline/catalog", asyncRoute(async (request, response) => {
        count(*) FILTER (WHERE extracted_attribute_count > 0) AS attributed_parts,
        coalesce(sum(extracted_attribute_count), 0) AS attribute_facts,
        count(*) FILTER (WHERE online_status = 'verified') AS online_verified_parts
+       ,(SELECT count(*) FROM partmaster_offline_source_pages WHERE status = 'pending') AS pending_source_pages
+       ,(SELECT count(*) FROM partmaster_offline_source_pages WHERE status != 'pending') AS processed_source_pages
        FROM partmaster_offline_parts`,
     );
     return { rows: rowsReader.getRowObjectsJson(), stats: statsReader.getRowObjectsJson()[0] };
