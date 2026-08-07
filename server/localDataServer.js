@@ -1878,6 +1878,107 @@ async function processEnrichmentCandidate(candidate, threshold) {
   return update;
 }
 
+async function checkCanonicalPart(partId) {
+  const context = await withConnection(async (connection) => {
+    const partReader = await connection.runAndReadAll(
+      "SELECT * FROM partmaster_canonical_parts WHERE id = $id",
+      { id: partId },
+    );
+    const part = partReader.getRowObjectsJson()[0];
+    if (!part) {
+      const error = new Error("Canonical part not found.");
+      error.status = 404;
+      throw error;
+    }
+    const candidateReader = await connection.runAndReadAll(
+      `SELECT * FROM partmaster_enrichment_candidates
+       WHERE manufacturer_norm = $manufacturer AND part_number_norm = $partNumber
+        AND source_url IS NOT NULL AND trim(source_url) != ''
+       ORDER BY CASE WHEN evidence_url IS NOT NULL THEN 0 ELSE 1 END,
+        confidence DESC NULLS LAST, processed_at DESC NULLS LAST LIMIT 1`,
+      { manufacturer: part.manufacturer_norm, partNumber: part.part_number_norm },
+    );
+    return { part, candidate: candidateReader.getRowObjectsJson()[0] };
+  });
+  if (!context.candidate) {
+    return { status: "no_source", updated: false, message: "No saved source URL is available for this part number.", part: context.part };
+  }
+  const page = await getEvidencePage(context.candidate.source_url);
+  const evidence = extractPageEvidence(page.html, context.part.part_number);
+  const catalogItem = extractCatalogItems(page.html)
+    .find((item) => normalizePartNumber(item.partNumber) === context.part.part_number_norm);
+  const exactFound = Boolean(catalogItem || evidence.structuredExact || evidence.exactNumberFound);
+  if (!exactFound) {
+    return {
+      status: "not_found",
+      updated: false,
+      confidence: 0,
+      message: "The saved source page did not confirm this exact OEM number.",
+      evidenceUrl: page.finalUrl,
+      evidenceTitle: evidence.title,
+      part: context.part,
+    };
+  }
+  const confidence = catalogItem || evidence.structuredExact
+    ? 0.98
+    : pageTitleMatchesContext(context.candidate, evidence.title) ? 0.96 : 0.9;
+  const description = catalogItem?.description || evidence.description || context.part.description;
+  const location = inferLocation(description, context.candidate.assembly, evidence.title);
+  const checked = applyVariantIntelligence({
+    side: location.side,
+    position: location.position,
+    familyName: context.candidate.family_name,
+    componentScope: context.candidate.component_scope,
+    confidence,
+    evidenceUrl: page.finalUrl,
+  }, inferVariantIntelligence(context.candidate, description), context.candidate);
+  const updated = confidence >= 0.94;
+  const refreshed = await withConnection(async (connection) => {
+    if (updated) {
+      await connection.run(
+        `UPDATE partmaster_canonical_parts SET description = coalesce(nullif($description, ''), description),
+         confidence = greatest(coalesce(confidence, 0), $confidence), verification_status = 'online_verified',
+         evidence_url = $evidenceUrl, verified_at = current_timestamp, updated_at = current_timestamp
+         WHERE id = $id`,
+        { id: partId, description, confidence, evidenceUrl: page.finalUrl },
+      );
+      await syncVariantAttributes(connection, partId, {
+        ...context.candidate,
+        side: checked.side,
+        heated_state: checked.heatedState,
+        auto_dimming_state: checked.autoDimmingState,
+        power_folding_state: checked.powerFoldingState,
+        memory_state: checked.memoryState,
+        blind_spot_state: checked.blindSpotState,
+        camera_state: checked.cameraState,
+        turn_signal_state: checked.turnSignalState,
+        connector_pins: checked.connectorPins,
+        required_options: checked.requiredOptions,
+        excluded_options: checked.excludedOptions,
+        confidence,
+        evidence_url: page.finalUrl,
+      });
+    }
+    const partReader = await connection.runAndReadAll("SELECT * FROM partmaster_canonical_parts WHERE id = $id", { id: partId });
+    const attributeReader = await connection.runAndReadAll(
+      "SELECT attribute_name, attribute_value FROM partmaster_variant_attributes WHERE part_id = $id ORDER BY attribute_name",
+      { id: partId },
+    );
+    return { part: partReader.getRowObjectsJson()[0], attributes: attributeReader.getRowObjectsJson() };
+  });
+  return {
+    status: updated ? "verified" : "review",
+    updated,
+    confidence,
+    message: updated
+      ? "Exact OEM number verified. Available description and meaningful attributes were refreshed."
+      : "The number appears on the page, but the evidence is not strong enough to update automatically.",
+    evidenceUrl: page.finalUrl,
+    evidenceTitle: evidence.title,
+    ...refreshed,
+  };
+}
+
 async function runEnrichmentJob(jobId) {
   if (activeEnrichmentJobs.has(jobId)) return;
   activeEnrichmentJobs.add(jobId);
@@ -2606,6 +2707,7 @@ app.get("/api/local/enrichment/candidates/:id/variants", asyncRoute(async (reque
     const familyKey = normalizeApplicationValue(familyName);
     const reader = await connection.runAndReadAll(
       `SELECT parts.id, parts.part_number, parts.description, parts.component_scope, parts.variant_summary,
+       parts.confidence, parts.verification_status, parts.evidence_url,
        max(CASE WHEN attributes.attribute_name = 'side' THEN attributes.attribute_value END) AS side,
        max(CASE WHEN attributes.attribute_name = 'heated' THEN attributes.attribute_value END) AS heated,
        max(CASE WHEN attributes.attribute_name = 'auto_dimming' THEN attributes.attribute_value END) AS auto_dimming,
@@ -2618,7 +2720,8 @@ app.get("/api/local/enrichment/candidates/:id/variants", asyncRoute(async (reque
        JOIN partmaster_part_families families ON families.id = parts.family_id
        LEFT JOIN partmaster_variant_attributes attributes ON attributes.part_id = parts.id
        WHERE parts.manufacturer_norm = $manufacturer AND families.family_key = $familyKey
-       GROUP BY parts.id, parts.part_number, parts.description, parts.component_scope, parts.variant_summary
+       GROUP BY parts.id, parts.part_number, parts.description, parts.component_scope, parts.variant_summary,
+        parts.confidence, parts.verification_status, parts.evidence_url
        ORDER BY parts.part_number LIMIT 20`,
       { manufacturer: candidate.manufacturer_norm, familyKey },
     );
@@ -2641,6 +2744,10 @@ app.get("/api/local/enrichment/candidates/:id/variants", asyncRoute(async (reque
     };
   });
   response.json(result);
+}));
+
+app.post("/api/local/master/parts/:id/check", asyncRoute(async (request, response) => {
+  response.json(await checkCanonicalPart(request.params.id));
 }));
 
 app.post("/api/local/enrichment/candidates/:id/compatibility", asyncRoute(async (request, response) => {

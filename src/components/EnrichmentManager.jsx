@@ -158,6 +158,8 @@ function ReviewModal({ candidate, onClose, onDecision }) {
   const [compatibilityLoading, setCompatibilityLoading] = useState(false);
   const [compatibilityUrl, setCompatibilityUrl] = useState("");
   const [compatibilityText, setCompatibilityText] = useState("");
+  const [checkingPartId, setCheckingPartId] = useState("");
+  const [partCheckResult, setPartCheckResult] = useState(null);
 
   useEffect(() => {
     let active = true;
@@ -199,8 +201,27 @@ function ReviewModal({ candidate, onClose, onDecision }) {
     }
   }
 
+  async function checkPart(variant) {
+    setCheckingPartId(variant.id);
+    setPartCheckResult(null);
+    setReviewError("");
+    try {
+      const result = await localDataApi.checkMasterPart(variant.id);
+      setPartCheckResult({ ...result, partNumber: variant.part_number });
+      const refreshed = await localDataApi.candidateVariants(candidate.id);
+      setComparison(refreshed);
+    } catch (requestError) {
+      setReviewError(requestError.message || "This part could not be checked.");
+    } finally {
+      setCheckingPartId("");
+    }
+  }
+
+  const equipmentAttributeKeys = ["heated", "auto_dimming", "power_folding", "memory", "blind_spot", "camera", "connector_pins"];
+  const showEquipmentColumns = /mirror|rearview/i.test(comparison.familyName || values.familyName || "") || comparison.variants?.some((variant) => equipmentAttributeKeys.some((key) => variant[key] && !["unknown", "none_known"].includes(String(variant[key]).toLowerCase())));
+
   return <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/55 p-4">
-    <div className="max-h-[92vh] w-full max-w-3xl overflow-y-auto rounded-2xl bg-white shadow-2xl">
+    <div className="max-h-[92vh] w-full max-w-6xl overflow-y-auto rounded-2xl bg-white shadow-2xl">
       <header className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-slate-200 bg-white px-5 py-4">
         <div><h3 className="font-semibold">Review enrichment evidence</h3><p className="mt-1 text-xs text-slate-500">Source row {candidate.source_row_id} · Confidence {Math.round(Number(candidate.confidence || 0) * 100)}%</p><div className="mt-3 flex flex-wrap gap-2">{(candidate.vehicle_year || candidate.year) && <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-bold text-blue-700"><span className="mr-1 font-medium text-blue-500">Year</span>{candidate.vehicle_year || candidate.year}</span>}{(candidate.vehicle_make || candidate.manufacturer_raw) && <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700"><span className="mr-1 font-medium text-emerald-500">Make</span>{candidate.vehicle_make || candidate.manufacturer_raw}</span>}{(candidate.family_name || candidate.assembly) && <span className="rounded-full bg-violet-50 px-3 py-1 text-xs font-bold text-violet-700"><span className="mr-1 font-medium text-violet-500">Category</span>{candidate.family_name || candidate.assembly}</span>}</div></div>
         <button type="button" onClick={onClose} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"><X size={18} /></button>
@@ -219,7 +240,7 @@ function ReviewModal({ candidate, onClose, onDecision }) {
             <label className="text-xs font-bold uppercase tracking-wide text-slate-500">Part family<input value={values.familyName} onChange={(event) => setValues((current) => ({ ...current, familyName: event.target.value }))} placeholder="Exterior Mirror" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label>
             <label className="text-xs font-bold uppercase tracking-wide text-slate-500">Component scope<select value={values.componentScope} onChange={(event) => setValues((current) => ({ ...current, componentScope: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal"><option value="assembly">Complete assembly</option><option value="component">Component</option><option value="kit">Kit</option><option value="unknown">Unknown</option></select></label>
           </div>
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {showEquipmentColumns ? <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <FeatureSelect label="Heated" value={values.heatedState} onChange={(value) => setValues((current) => ({ ...current, heatedState: value }))} />
             <FeatureSelect label="Auto dimming" value={values.autoDimmingState} onChange={(value) => setValues((current) => ({ ...current, autoDimmingState: value }))} />
             <FeatureSelect label="Power folding" value={values.powerFoldingState} onChange={(value) => setValues((current) => ({ ...current, powerFoldingState: value }))} />
@@ -228,7 +249,7 @@ function ReviewModal({ candidate, onClose, onDecision }) {
             <FeatureSelect label="Camera" value={values.cameraState} onChange={(value) => setValues((current) => ({ ...current, cameraState: value }))} />
             <FeatureSelect label="Turn signal" value={values.turnSignalState} onChange={(value) => setValues((current) => ({ ...current, turnSignalState: value }))} />
             <label className="text-xs font-bold uppercase tracking-wide text-slate-500">Connector pins<input value={values.connectorPins} onChange={(event) => setValues((current) => ({ ...current, connectorPins: event.target.value }))} placeholder="e.g. 5" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label>
-          </div>
+          </div> : <p className="mt-4 rounded-xl border border-violet-100 bg-white px-3 py-2.5 text-xs leading-5 text-violet-700">Mirror equipment fields are hidden because they do not apply to this {values.familyName || "part"} family. The part checker below focuses on description, scope, source evidence, and confidence.</p>}
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
             <label className="text-xs font-bold uppercase tracking-wide text-slate-500">Required vehicle options<input value={values.requiredOptions} onChange={(event) => setValues((current) => ({ ...current, requiredOptions: event.target.value }))} placeholder="BMW S430A, S5DFA…" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label>
             <label className="text-xs font-bold uppercase tracking-wide text-slate-500">Excluded vehicle options<input value={values.excludedOptions} onChange={(event) => setValues((current) => ({ ...current, excludedOptions: event.target.value }))} placeholder="Not with S5DLA…" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label>
@@ -237,8 +258,14 @@ function ReviewModal({ candidate, onClose, onDecision }) {
           </div>
         </section>
         <section className="overflow-hidden rounded-2xl border border-slate-200 sm:col-span-2">
-          <header className="flex items-center justify-between bg-slate-50 px-4 py-3"><div><h4 className="text-sm font-bold text-slate-800">Compare related variants</h4><p className="mt-0.5 text-xs text-slate-500">Existing {comparison.familyName || values.familyName || "part family"} records</p></div>{comparisonLoading && <LoaderCircle className="animate-spin text-brand-600" size={17} />}</header>
-          {!comparisonLoading && comparison.variants?.length ? <div className="overflow-x-auto"><table className="min-w-full text-xs"><thead className="border-y border-slate-200 bg-white text-left uppercase tracking-wide text-slate-500"><tr>{["Part number", "Side", "Heated", "Auto dim", "Folding", "Memory", "Blind spot", "Camera", "Pins"].map((heading) => <th key={heading} className="whitespace-nowrap px-3 py-2">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{comparison.variants.map((variant) => <tr key={variant.id} className="text-slate-700"><td className="whitespace-nowrap px-3 py-2 font-mono font-bold text-brand-700">{variant.part_number}</td><td className="whitespace-nowrap px-3 py-2">{variant.side || "—"}</td>{["heated", "auto_dimming", "power_folding", "memory", "blind_spot", "camera"].map((key) => <td key={key} className="px-3 py-2 capitalize">{variant[key] || "—"}</td>)}<td className="px-3 py-2">{variant.connector_pins || "—"}</td></tr>)}</tbody></table></div> : !comparisonLoading && <p className="px-4 py-5 text-sm text-slate-500">No related master variants yet. Approving this record will begin the family.</p>}
+          <header className="flex items-center justify-between bg-slate-50 px-4 py-3"><div><h4 className="text-sm font-bold text-slate-800">Part checker</h4><p className="mt-0.5 text-xs text-slate-500">Existing {comparison.familyName || values.familyName || "part family"} records · columns adapt to the category</p></div>{comparisonLoading && <LoaderCircle className="animate-spin text-brand-600" size={17} />}</header>
+          {partCheckResult && <div className={`border-t px-4 py-3 text-sm ${partCheckResult.status === "verified" ? "border-emerald-200 bg-emerald-50 text-emerald-900" : partCheckResult.status === "not_found" || partCheckResult.status === "no_source" ? "border-amber-200 bg-amber-50 text-amber-900" : "border-blue-200 bg-blue-50 text-blue-900"}`}><div className="flex flex-wrap items-center justify-between gap-2"><p><span className="font-mono font-bold">{partCheckResult.partNumber}</span> — {partCheckResult.message}</p><span className="flex items-center gap-3">{partCheckResult.confidence != null && <strong>{Math.round(Number(partCheckResult.confidence) * 100)}% confidence</strong>}{partCheckResult.evidenceUrl && <a href={partCheckResult.evidenceUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-bold underline">Open evidence <ExternalLink size={13} /></a>}</span></div></div>}
+          {!comparisonLoading && comparison.variants?.length ? <div className="overflow-x-auto"><table className="min-w-full text-xs"><thead className="border-y border-slate-200 bg-white text-left uppercase tracking-wide text-slate-500"><tr><th className="whitespace-nowrap px-3 py-2">Part number</th><th className="px-3 py-2">Description</th><th className="whitespace-nowrap px-3 py-2">Scope</th><th className="whitespace-nowrap px-3 py-2">Evidence</th><th className="whitespace-nowrap px-3 py-2">Confidence</th>{showEquipmentColumns && ["Side", "Heated", "Auto dim", "Folding", "Memory", "Blind spot", "Camera", "Pins"].map((heading) => <th key={heading} className="whitespace-nowrap px-3 py-2">{heading}</th>)}<th className="px-3 py-2"><span className="sr-only">Action</span></th></tr></thead><tbody className="divide-y divide-slate-100">{comparison.variants.map((variant) => {
+            const confidence = Number(variant.confidence || 0);
+            const evidenceLabel = variant.evidence_url ? (confidence >= 0.94 ? "Verified" : "Needs review") : "No evidence";
+            const evidenceTone = variant.evidence_url ? (confidence >= 0.94 ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700") : "bg-slate-100 text-slate-600";
+            return <tr key={variant.id} className="text-slate-700"><td className="whitespace-nowrap px-3 py-2 font-mono font-bold text-brand-700">{variant.part_number}</td><td className="min-w-56 max-w-80 px-3 py-2"><p className="line-clamp-2">{variant.description || "No description saved"}</p>{variant.variant_summary && <p className="mt-1 text-[11px] font-semibold text-violet-700">{variant.variant_summary}</p>}</td><td className="whitespace-nowrap px-3 py-2 capitalize">{variant.component_scope || "Unknown"}</td><td className="whitespace-nowrap px-3 py-2"><span className={`rounded-full px-2 py-1 font-bold ${evidenceTone}`}>{evidenceLabel}</span>{variant.evidence_url && <a href={variant.evidence_url} target="_blank" rel="noreferrer" className="ml-2 font-bold text-brand-700">Open</a>}</td><td className="px-3 py-2 font-bold">{confidence ? `${Math.round(confidence * 100)}%` : "—"}</td>{showEquipmentColumns && <><td className="whitespace-nowrap px-3 py-2">{variant.side || "—"}</td>{["heated", "auto_dimming", "power_folding", "memory", "blind_spot", "camera"].map((key) => <td key={key} className="px-3 py-2 capitalize">{variant[key] || "—"}</td>)}<td className="px-3 py-2">{variant.connector_pins || "—"}</td></>}<td className="whitespace-nowrap px-3 py-2"><button type="button" disabled={Boolean(checkingPartId)} onClick={() => checkPart(variant)} className="inline-flex items-center gap-1.5 rounded-lg border border-brand-200 bg-brand-50 px-2.5 py-1.5 font-bold text-brand-700 disabled:opacity-50">{checkingPartId === variant.id ? <LoaderCircle className="animate-spin" size={13} /> : <SearchCheck size={13} />}Check part</button></td></tr>;
+          })}</tbody></table></div> : !comparisonLoading && <p className="px-4 py-5 text-sm text-slate-500">No related master variants yet. Approving this record will begin the family.</p>}
         </section>
         <section className="overflow-hidden rounded-2xl border border-cyan-200 bg-cyan-50/40 sm:col-span-2">
           <header className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"><div><h4 className="text-sm font-bold text-cyan-950">Vehicle and assembly compatibility</h4><p className="mt-0.5 text-xs text-cyan-700">{Number(comparison.compatibility?.length || 0).toLocaleString()} verified “where used” fitments for this exact OEM number</p></div><button type="button" disabled={compatibilityLoading || (!compatibilityUrl && !compatibilityText.trim())} onClick={fetchCompatibility} className="inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-40">{compatibilityLoading ? <LoaderCircle className="animate-spin" size={15} /> : <Globe2 size={15} />}{compatibilityText.trim() ? "Import pasted list" : comparison.compatibility?.length ? "Refresh compatibility" : "Fetch compatibility"}</button></header>

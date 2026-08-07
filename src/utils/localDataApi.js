@@ -41,6 +41,7 @@ export const localDataApi = {
     return request(`/enrichment/candidates?${query}`);
   },
   candidateVariants: (candidateId) => request(`/enrichment/candidates/${encodeURIComponent(candidateId)}/variants`),
+  checkMasterPart: (partId) => request(`/master/parts/${encodeURIComponent(partId)}/check`, { method: "POST", body: "{}" }),
   fetchCandidateCompatibility: (candidateId, options = {}) => request(`/enrichment/candidates/${encodeURIComponent(candidateId)}/compatibility`, { method: "POST", body: JSON.stringify(options) }),
   savePartRelationship: (relationship) => request("/master/relationships", { method: "POST", body: JSON.stringify(relationship) }),
   reviewEnrichmentCandidate: (candidateId, changes) => request(`/enrichment/candidates/${encodeURIComponent(candidateId)}`, { method: "PATCH", body: JSON.stringify(changes) }),
