@@ -2268,7 +2268,10 @@ async function extractOfflineAttributes(jobId) {
       const jobReader = await connection.runAndReadAll("SELECT status FROM partmaster_pipeline_jobs WHERE id = $jobId", { jobId });
       if (jobReader.getRowObjectsJson()[0]?.status !== "running") return null;
       const reader = await connection.runAndReadAll(
-        "SELECT * FROM partmaster_offline_parts WHERE attribute_status = 'pending' ORDER BY occurrence_count DESC LIMIT 1000",
+        `SELECT parts.*, coalesce((SELECT arg_max(sources.description, length(coalesce(sources.description, '')))
+         FROM partmaster_offline_part_sources sources WHERE sources.part_key = parts.part_key), parts.description) AS local_description
+         FROM partmaster_offline_parts parts WHERE attribute_status = 'pending'
+         ORDER BY occurrence_count DESC LIMIT 1000`,
       );
       return reader.getRowObjectsJson();
     });
@@ -2277,9 +2280,12 @@ async function extractOfflineAttributes(jobId) {
       await connection.run("BEGIN TRANSACTION");
       try {
         for (const part of state) {
-          const candidate = { description_raw: part.description, assembly: "", part_number_raw: part.part_number, manufacturer_raw: part.manufacturer };
+          const candidate = { description_raw: part.local_description || part.description, assembly: "", part_number_raw: part.part_number, manufacturer_raw: part.manufacturer };
           const intelligence = inferVariantIntelligence(candidate);
-          const attributes = inferCategoryAttributes({ ...candidate, family_name: intelligence.familyName }, part.description);
+          const attributes = inferCategoryAttributes({ ...candidate, family_name: intelligence.familyName }, candidate.description_raw);
+          let existingAttributes = {};
+          try { existingAttributes = JSON.parse(part.extracted_attributes_json || "{}"); } catch { /* Replace malformed legacy JSON safely. */ }
+          const mergedAttributes = { ...attributes, ...existingAttributes };
           await connection.run(
             `UPDATE partmaster_offline_parts SET family_name = $familyName, component_scope = $componentScope,
              side = $side, position = $position, extracted_attributes_json = $attributes,
@@ -2287,8 +2293,8 @@ async function extractOfflineAttributes(jobId) {
              attribute_status = 'complete', updated_at = current_timestamp WHERE part_key = $partKey`,
             {
               partKey: part.part_key, familyName: intelligence.familyName, componentScope: intelligence.componentScope,
-              side: intelligence.side, position: intelligence.position || null, attributes: JSON.stringify(attributes),
-              attributeCount: Object.keys(attributes).length, confidence: part.description ? 0.7 : 0.5,
+              side: intelligence.side, position: intelligence.position || null, attributes: JSON.stringify(mergedAttributes),
+              attributeCount: Object.keys(mergedAttributes).length, confidence: Math.max(Number(part.confidence || 0), part.description ? 0.7 : 0.5),
             },
           );
         }
@@ -2348,12 +2354,15 @@ async function checkOfflineSourcePages(jobId, budget) {
             const candidate = { description_raw: description, part_number_raw: part.part_number, manufacturer_raw: part.manufacturer };
             const familyName = inferFamilyName(description, "");
             const attributes = inferCategoryAttributes({ ...candidate, family_name: familyName }, description);
+            let existingAttributes = {};
+            try { existingAttributes = JSON.parse(part.extracted_attributes_json || "{}"); } catch { /* Replace malformed legacy JSON safely. */ }
+            const mergedAttributes = { ...existingAttributes, ...attributes };
             await connection.run(
               `UPDATE partmaster_offline_parts SET description = coalesce(nullif($description, ''), description),
                family_name = $familyName, extracted_attributes_json = $attributes,
                extracted_attribute_count = $attributeCount, confidence = .98, online_status = 'verified',
                updated_at = current_timestamp WHERE part_key = $partKey`,
-              { partKey: part.part_key, description, familyName, attributes: JSON.stringify(attributes), attributeCount: Object.keys(attributes).length },
+              { partKey: part.part_key, description, familyName, attributes: JSON.stringify(mergedAttributes), attributeCount: Object.keys(mergedAttributes).length },
             );
             verified += 1;
           }
@@ -2418,6 +2427,7 @@ async function runFullPipeline(jobId) {
           sourcePages: baseline.source_pages,
         },
       ));
+      await extractOfflineAttributes(jobId);
       await checkOfflineSourcePages(jobId, Math.max(0, Number(job.online_budget || 0) - Number(job.online_checked || 0)));
       await withConnection((connection) => connection.run(
         `UPDATE partmaster_pipeline_jobs SET status = 'completed', phase = 'completed',
