@@ -26,4 +26,17 @@ export const localDataApi = {
   deleteRow: (datasetId, rowId) => request(`/datasets/${encodeURIComponent(datasetId)}/rows/${encodeURIComponent(rowId)}`, { method: "DELETE" }),
   exportRows: (datasetId, filters) => request(`/datasets/${encodeURIComponent(datasetId)}/exports`, { method: "POST", body: JSON.stringify(filters) }),
   deleteDataset: (datasetId) => request(`/datasets/${encodeURIComponent(datasetId)}`, { method: "DELETE" }),
+  enrichmentJobs: () => request("/enrichment/jobs"),
+  enrichmentJob: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}`),
+  startEnrichment: (options) => request("/enrichment/jobs", { method: "POST", body: JSON.stringify(options) }),
+  pauseEnrichment: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}/pause`, { method: "POST", body: "{}" }),
+  resumeEnrichment: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST", body: "{}" }),
+  reprocessEnrichmentReview: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}/reprocess-review`, { method: "POST", body: "{}" }),
+  enrichmentCandidates: (parameters = {}) => {
+    const query = new URLSearchParams(Object.entries(parameters).filter(([, value]) => value !== "" && value != null));
+    return request(`/enrichment/candidates?${query}`);
+  },
+  reviewEnrichmentCandidate: (candidateId, changes) => request(`/enrichment/candidates/${encodeURIComponent(candidateId)}`, { method: "PATCH", body: JSON.stringify(changes) }),
+  masterStats: () => request("/master/stats"),
+  exportMaster: () => request("/master/exports", { method: "POST", body: "{}" }),
 };

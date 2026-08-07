@@ -43,6 +43,31 @@ Everything inside `local_data/` except the small directory instructions and
 placeholder files is ignored by Git. The GitHub Pages build includes the UI,
 but the local-data screen can only connect when the Mac service is running.
 
+## Local enrichment worker
+
+The **Enrichment** workspace creates persistent, resumable jobs in DuckDB. A
+job takes a bounded set of deduplicated part-application candidates from an imported dataset,
+normalizes manufacturer and OEM numbers, checks each public source URL, and
+extracts product evidence from structured page metadata. High-confidence exact
+matches are promoted automatically; missing, conflicting, blocked, and weaker
+results stay in an evidence-review queue.
+
+Approved records are stored at two levels:
+
+- `partmaster_canonical_parts`: one row per manufacturer and normalized OEM
+  part number.
+- `partmaster_part_applications`: vehicle, assembly, item number, side,
+  position, quantity, and source relationships for each part.
+
+Use **Export master CSVs** to create separate part-master and application files
+in `local_data/exports/`. The original imported rows are never overwritten.
+
+Start with 1,000 candidates. The worker is deliberately conservative and
+currently verifies the source URLs already present in imported catalogs; it
+does not scrape general-purpose search-engine result pages. Configure memory,
+threads, page-size, and fetch timeouts with the `PARTMASTER_*` values shown in
+`.env.example`.
+
 ## Local development
 
 1. Copy `.env.example` to `.env` and adjust the repository values if needed.

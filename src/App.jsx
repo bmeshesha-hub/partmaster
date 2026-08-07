@@ -8,11 +8,13 @@ import {
   Library,
   LoaderCircle,
   RefreshCw,
+  SearchCheck,
   Settings,
 } from "lucide-react";
 import { createElement, useCallback, useEffect, useState } from "react";
 import AnalysisWorkflow from "./components/AnalysisWorkflow.jsx";
 import Dashboard from "./components/Dashboard.jsx";
+import EnrichmentManager from "./components/EnrichmentManager.jsx";
 import GitHubAuth from "./components/GitHubAuth.jsx";
 import LocalDataManager from "./components/LocalDataManager.jsx";
 import PartsLibrary from "./components/PartsLibrary.jsx";
@@ -32,6 +34,7 @@ const NAVIGATION = [
   { id: "analyze", label: "Analyze parts", shortLabel: "Analyze", icon: FileSearch },
   { id: "library", label: "Library", shortLabel: "Library", icon: Library },
   { id: "local", label: "Local data", shortLabel: "Local", icon: HardDrive },
+  { id: "enrichment", label: "Enrichment", shortLabel: "Enrich", icon: SearchCheck },
 ];
 const VIEW_COPY = {
   dashboard: ["Operations dashboard", "Part processing progress"],
@@ -39,6 +42,7 @@ const VIEW_COPY = {
   analyze: ["Research workflow", "Import and analyze parts"],
   library: ["Completed records", "Parts library"],
   local: ["Mac data workspace", "Large local datasets"],
+  enrichment: ["Local background worker", "Enrichment and evidence review"],
 };
 
 export default function App() {
@@ -125,19 +129,21 @@ export default function App() {
       </header>
 
       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
-        <nav className="mb-6 grid grid-cols-5 rounded-xl bg-slate-200/70 p-1 md:hidden" aria-label="Primary navigation">
+        <nav className="mb-6 grid grid-cols-6 rounded-xl bg-slate-200/70 p-1 md:hidden" aria-label="Primary navigation">
           {NAVIGATION.map(({ id, shortLabel, icon }) => <button key={id} type="button" onClick={() => setView(id)} className={`flex flex-col items-center gap-1 rounded-lg px-1 py-2 text-[11px] font-medium sm:flex-row sm:justify-center sm:text-sm ${view === id ? "bg-white text-brand-700 shadow-sm" : "text-slate-600"}`}>{createElement(icon, { size: 16, "aria-hidden": true })}{shortLabel}</button>)}
         </nav>
 
         <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-          <div><p className="text-sm font-semibold text-brand-700">{eyebrow}</p><h2 className="mt-1 text-2xl font-bold tracking-tight text-ink">{heading}</h2><p className="mt-2 text-sm text-slate-500">{view === "local" ? "Stored only in partmaster/local_data on this Mac" : `${DEFAULT_REPOSITORY.owner}/${DEFAULT_REPOSITORY.repo} · ${DEFAULT_REPOSITORY.branch}`}</p></div>
-          {view !== "analyze" && view !== "local" && <div className="flex items-center gap-3"><span className="rounded-full bg-white px-3 py-1.5 text-sm font-medium text-slate-600 shadow-sm ring-1 ring-slate-200">{data.queue.length} pending</span><button type="button" onClick={loadWorkspace} disabled={!token || loading || Boolean(approvingId)} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"><RefreshCw className={loading ? "animate-spin" : ""} size={16} />Refresh</button></div>}
+          <div><p className="text-sm font-semibold text-brand-700">{eyebrow}</p><h2 className="mt-1 text-2xl font-bold tracking-tight text-ink">{heading}</h2><p className="mt-2 text-sm text-slate-500">{["local", "enrichment"].includes(view) ? "Stored only in partmaster/local_data on this Mac" : `${DEFAULT_REPOSITORY.owner}/${DEFAULT_REPOSITORY.repo} · ${DEFAULT_REPOSITORY.branch}`}</p></div>
+          {!["analyze", "local", "enrichment"].includes(view) && <div className="flex items-center gap-3"><span className="rounded-full bg-white px-3 py-1.5 text-sm font-medium text-slate-600 shadow-sm ring-1 ring-slate-200">{data.queue.length} pending</span><button type="button" onClick={loadWorkspace} disabled={!token || loading || Boolean(approvingId)} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"><RefreshCw className={loading ? "animate-spin" : ""} size={16} />Refresh</button></div>}
         </div>
 
         {error && <div className="mb-5 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" role="alert"><AlertCircle className="mt-0.5 shrink-0" size={18} /><span>{error}</span></div>}
 
         {view === "local" ? (
           <LocalDataManager />
+        ) : view === "enrichment" ? (
+          <EnrichmentManager />
         ) : !token ? (
           <div className="rounded-2xl border border-slate-200 bg-white px-6 py-16 text-center shadow-panel"><Settings className="mx-auto text-brand-600" size={40} /><h2 className="mt-4 text-lg font-semibold">Connect the data repository</h2><p className="mx-auto mt-2 max-w-md text-sm text-slate-500">Add a GitHub personal access token to load your dashboard, analyses, and completed-parts library.</p><button type="button" onClick={() => setSettingsOpen(true)} className="mt-5 rounded-xl bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700">Open settings</button></div>
         ) : loading && !data.headSha ? (

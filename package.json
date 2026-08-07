@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "dev:local": "concurrently -k -n DATA,WEB -c magenta,cyan \"npm:local:data\" \"npm:dev\"",
-    "local:data": "node server/localDataServer.js",
+    "local:data": "node --env-file-if-exists=.env server/localDataServer.js",
     "build": "vite build",
     "preview": "vite preview",
     "lint": "eslint ."
