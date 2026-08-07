@@ -12,6 +12,7 @@ const EXPORT_ROOT = join(DATA_ROOT, "exports");
 const REFERENCE_ROOT = join(DATA_ROOT, "reference");
 const VEHICLE_MASTER_PATH = join(REFERENCE_ROOT, "vehicle_master.csv");
 const VEHICLE_ALIASES_PATH = join(REFERENCE_ROOT, "vehicle_source_aliases.csv");
+const MPSOV_INBOX_PATH = join(INBOX_ROOT, "MPSOV.csv");
 const DATABASE_PATH = resolve(process.env.PARTMASTER_DATABASE_PATH || join(DATA_ROOT, "partmaster.duckdb"));
 const PORT = Number(process.env.PARTMASTER_DATA_PORT || 8787);
 const importJobs = new Map();
@@ -456,6 +457,7 @@ await withConnection((connection) => connection.run(`
     model_name VARCHAR,
     trim_name VARCHAR,
     vehicle_type VARCHAR,
+    motorcycle_type VARCHAR,
     year_norm VARCHAR,
     make_norm VARCHAR,
     model_norm VARCHAR,
@@ -537,6 +539,7 @@ await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_model VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_trim VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_type VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_motorcycle_type VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_mapping_method VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_mapping_confidence DOUBLE;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS extracted_attributes_json VARCHAR;
@@ -552,6 +555,8 @@ await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_model VARCHAR;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_trim VARCHAR;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_type VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_motorcycle_type VARCHAR;
+  ALTER TABLE partmaster_vehicle_master ADD COLUMN IF NOT EXISTS motorcycle_type VARCHAR;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_mapping_method VARCHAR;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_mapping_confidence DOUBLE;
   CREATE UNIQUE INDEX IF NOT EXISTS part_applications_key_idx
@@ -900,6 +905,9 @@ async function loadVehicleMappingReferences() {
     return { loaded: false, reason: "Extract Vehicle Mapping ePID.xlsx to create the optional reference CSVs." };
   }
   return withConnection(async (connection) => {
+    let mpsovAvailable = false;
+    try { await stat(MPSOV_INBOX_PATH); mpsovAvailable = true; } catch { /* Extracted workbook references remain sufficient. */ }
+    let mpsovStats = { rows: 0, unique_epids: 0, new_epids: 0, changed_epids: 0 };
     await connection.run("BEGIN TRANSACTION");
     try {
       await connection.run("DELETE FROM partmaster_vehicle_source_aliases");
@@ -926,6 +934,73 @@ async function loadVehicleMappingReferences() {
           quote = '"', escape = '"', strict_mode = true)`,
         { path: VEHICLE_ALIASES_PATH },
       );
+      if (mpsovAvailable) {
+        const statsReader = await connection.runAndReadAll(
+          `WITH source AS (
+            SELECT trim(epid) AS epid, trim(make) AS make_name, trim(model) AS model_name,
+             nullif(trim(submodel), '--') AS trim_name, trim(_year) AS year,
+             nullif(trim(vehicle_type), '') AS vehicle_type, nullif(trim(motorcycle_type), '') AS motorcycle_type
+            FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
+             quote = '"', escape = '"', strict_mode = true) WHERE trim(epid) != ''
+          ), unique_source AS (SELECT * FROM source QUALIFY row_number() OVER (PARTITION BY epid ORDER BY epid) = 1)
+          SELECT (SELECT count(*) FROM source) AS rows, (SELECT count(*) FROM unique_source) AS unique_epids,
+           count(*) FILTER (WHERE master.epid IS NULL) AS new_epids,
+           count(*) FILTER (WHERE master.epid IS NOT NULL AND (
+            coalesce(master.year, '') != coalesce(source.year, '') OR
+            coalesce(master.make_name, '') != coalesce(source.make_name, '') OR
+            coalesce(master.model_name, '') != coalesce(source.model_name, '') OR
+            coalesce(master.trim_name, '') != coalesce(source.trim_name, '') OR
+            coalesce(master.vehicle_type, '') != coalesce(source.vehicle_type, '')
+            OR coalesce(master.motorcycle_type, '') != coalesce(source.motorcycle_type, '')
+           )) AS changed_epids
+          FROM unique_source source LEFT JOIN partmaster_vehicle_master master ON master.epid = source.epid`,
+          { path: MPSOV_INBOX_PATH },
+        );
+        mpsovStats = statsReader.getRowObjectsJson()[0];
+        await connection.run(
+          `INSERT INTO partmaster_vehicle_master
+           (epid, year, make_name, model_name, trim_name, vehicle_type, motorcycle_type, year_norm, make_norm, model_norm)
+           SELECT trim(epid), trim(_year), trim(make), trim(model), nullif(trim(submodel), '--'),
+            nullif(trim(vehicle_type), ''), nullif(trim(motorcycle_type), ''),
+            upper(regexp_replace(trim(_year), '[^A-Za-z0-9]', '', 'g')),
+            upper(regexp_replace(trim(make), '[^A-Za-z0-9]', '', 'g')),
+            upper(regexp_replace(trim(model), '[^A-Za-z0-9]', '', 'g'))
+           FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
+            quote = '"', escape = '"', strict_mode = true)
+           WHERE trim(epid) != '' QUALIFY row_number() OVER (PARTITION BY trim(epid) ORDER BY trim(epid)) = 1
+           ON CONFLICT (epid) DO UPDATE SET year = excluded.year, make_name = excluded.make_name,
+            model_name = excluded.model_name, trim_name = excluded.trim_name, vehicle_type = excluded.vehicle_type,
+            motorcycle_type = excluded.motorcycle_type,
+            year_norm = excluded.year_norm, make_norm = excluded.make_norm, model_norm = excluded.model_norm,
+            loaded_at = now()`,
+          { path: MPSOV_INBOX_PATH },
+        );
+        await connection.run(
+          `INSERT INTO partmaster_vehicle_source_aliases
+           (epid, source, year, make_name, model_name, trim_name, year_norm, make_norm, model_norm)
+           SELECT trim(epid), 'MPSOV CSV', trim(_year), trim(make), trim(model), nullif(trim(submodel), '--'),
+            upper(regexp_replace(trim(_year), '[^A-Za-z0-9]', '', 'g')),
+            upper(regexp_replace(trim(make), '[^A-Za-z0-9]', '', 'g')),
+            upper(regexp_replace(trim(model), '[^A-Za-z0-9]', '', 'g'))
+           FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
+            quote = '"', escape = '"', strict_mode = true) WHERE trim(epid) != ''
+           ON CONFLICT DO NOTHING`,
+          { path: MPSOV_INBOX_PATH },
+        );
+        await connection.run(
+          `INSERT INTO partmaster_vehicle_source_aliases
+           (epid, source, year, make_name, model_name, trim_name, year_norm, make_norm, model_norm)
+           SELECT trim(epid), 'MPSOV Model+Submodel', trim(_year), trim(make), trim(model_submodel), nullif(trim(submodel), '--'),
+            upper(regexp_replace(trim(_year), '[^A-Za-z0-9]', '', 'g')),
+            upper(regexp_replace(trim(make), '[^A-Za-z0-9]', '', 'g')),
+            upper(regexp_replace(trim(model_submodel), '[^A-Za-z0-9]', '', 'g'))
+           FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
+            quote = '"', escape = '"', strict_mode = true)
+           WHERE trim(epid) != '' AND trim(model_submodel) != '' AND trim(model_submodel) != trim(model)
+           ON CONFLICT DO NOTHING`,
+          { path: MPSOV_INBOX_PATH },
+        );
+      }
       await connection.run("COMMIT");
     } catch (error) {
       await connection.run("ROLLBACK");
@@ -936,7 +1011,7 @@ async function loadVehicleMappingReferences() {
        (SELECT count(*) FROM partmaster_vehicle_source_aliases) AS aliases`,
     );
     const counts = reader.getRowObjectsJson()[0];
-    return { loaded: true, vehicles: counts.vehicles, aliases: counts.aliases };
+    return { loaded: true, vehicles: counts.vehicles, aliases: counts.aliases, mpsov: mpsovAvailable ? mpsovStats : null };
   });
 }
 
@@ -946,6 +1021,9 @@ async function vehicleMappingStats() {
       `SELECT (SELECT count(*) FROM partmaster_vehicle_master) AS vehicles,
        (SELECT count(*) FROM partmaster_vehicle_source_aliases) AS aliases,
        (SELECT count(DISTINCT epid) FROM partmaster_vehicle_source_aliases) AS mapped_vehicles,
+       (SELECT count(*) FROM partmaster_vehicle_source_aliases WHERE source LIKE 'MPSOV%') AS mpsov_aliases,
+       (SELECT count(*) FROM partmaster_part_applications WHERE vehicle_motorcycle_type IS NOT NULL) AS mpsov_enriched_applications,
+       (SELECT count(*) FROM partmaster_enrichment_candidates WHERE vehicle_motorcycle_type IS NOT NULL) AS mpsov_enriched_candidates,
        (SELECT max(loaded_at) FROM partmaster_vehicle_master) AS loaded_at`,
     );
     return reader.getRowObjectsJson()[0];
@@ -962,9 +1040,21 @@ async function backfillApplicationVehicleMappings() {
       UPDATE partmaster_part_applications AS applications SET
        vehicle_make = master.make_name, vehicle_model = master.model_name,
        vehicle_trim = nullif(master.trim_name, '--'), vehicle_type = master.vehicle_type,
+       vehicle_motorcycle_type = master.motorcycle_type,
        vehicle_mapping_method = 'exact_epid', vehicle_mapping_confidence = 1
       FROM partmaster_vehicle_master AS master
-      WHERE applications.epid = master.epid AND applications.vehicle_mapping_method IS NULL
+      WHERE applications.epid = master.epid
+       AND (applications.vehicle_mapping_method IS NULL OR applications.vehicle_motorcycle_type IS NULL)
+    `);
+    await connection.run(`
+      UPDATE partmaster_enrichment_candidates AS candidates SET
+       vehicle_year = master.year, vehicle_make = master.make_name, vehicle_model = master.model_name,
+       vehicle_trim = nullif(master.trim_name, '--'), vehicle_type = master.vehicle_type,
+       vehicle_motorcycle_type = master.motorcycle_type,
+       vehicle_mapping_method = coalesce(candidates.vehicle_mapping_method, 'exact_epid'),
+       vehicle_mapping_confidence = greatest(coalesce(candidates.vehicle_mapping_confidence, 0), 1)
+      FROM partmaster_vehicle_master AS master
+      WHERE candidates.epid = master.epid
     `);
     await connection.run(`
       WITH application_norm AS (
@@ -988,6 +1078,7 @@ async function backfillApplicationVehicleMappings() {
       UPDATE partmaster_part_applications AS applications SET
        epid = matches.epid, vehicle_make = master.make_name, vehicle_model = master.model_name,
        vehicle_trim = nullif(master.trim_name, '--'), vehicle_type = master.vehicle_type,
+       vehicle_motorcycle_type = master.motorcycle_type,
        vehicle_mapping_method = 'unique_vehicle_text_backfill', vehicle_mapping_confidence = .92
       FROM unique_matches AS matches
       JOIN partmaster_vehicle_master AS master ON master.epid = matches.epid
@@ -1031,12 +1122,12 @@ async function lookupVehicleMapping({ epid, year, make, model }) {
     if (!matchedEpid) return null;
     const reader = await connection.runAndReadAll(
       `SELECT master.epid, master.year, master.make_name, master.model_name, master.trim_name,
-       master.vehicle_type, count(DISTINCT aliases.source) AS source_count,
+       master.vehicle_type, master.motorcycle_type, count(DISTINCT aliases.source) AS source_count,
        string_agg(DISTINCT aliases.source, ', ' ORDER BY aliases.source) AS sources
        FROM partmaster_vehicle_master master
        LEFT JOIN partmaster_vehicle_source_aliases aliases ON aliases.epid = master.epid
        WHERE master.epid = $epid
-       GROUP BY master.epid, master.year, master.make_name, master.model_name, master.trim_name, master.vehicle_type`,
+       GROUP BY master.epid, master.year, master.make_name, master.model_name, master.trim_name, master.vehicle_type, master.motorcycle_type`,
       { epid: matchedEpid },
     );
     const vehicle = reader.getRowObjectsJson()[0];
@@ -1055,6 +1146,7 @@ function applyVehicleMapping(update, vehicle, candidate = {}) {
     vehicleModel: vehicle.model_name,
     vehicleTrim: vehicle.trim_name && vehicle.trim_name !== "--" ? vehicle.trim_name : null,
     vehicleType: vehicle.vehicle_type,
+    vehicleMotorcycleType: vehicle.motorcycle_type,
     vehicleMappingMethod: vehicle.method,
     vehicleMappingConfidence: vehicle.confidence,
     fitmentExplanation: [update.fitmentExplanation, mappingExplanation].filter(Boolean).join(" "),
@@ -1416,6 +1508,7 @@ function suggestedVehicleChanges(row, columns, vehicle) {
   add("model", vehicle.model_name);
   add("trim", vehicle.trim_name);
   add("vehicle_type", vehicle.vehicle_type);
+  add("motorcycle_type", vehicle.motorcycle_type);
   return changes;
 }
 
@@ -1980,6 +2073,7 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
     vehicleModel: candidate.vehicle_model || null,
     vehicleTrim: candidate.vehicle_trim || null,
     vehicleType: candidate.vehicle_type || null,
+    vehicleMotorcycleType: candidate.vehicle_motorcycle_type || null,
     vehicleMappingMethod: candidate.vehicle_mapping_method || null,
     vehicleMappingConfidence: candidate.vehicle_mapping_confidence || null,
     assembly: candidate.assembly || null,
@@ -2000,6 +2094,7 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
       `UPDATE partmaster_part_applications SET
        epid = $epid, year = $year, model = $model, vehicle_make = $vehicleMake,
        vehicle_model = $vehicleModel, vehicle_trim = $vehicleTrim, vehicle_type = $vehicleType,
+       vehicle_motorcycle_type = $vehicleMotorcycleType,
        vehicle_mapping_method = $vehicleMappingMethod, vehicle_mapping_confidence = $vehicleMappingConfidence,
        assembly = $assembly, item_number = $itemNumber,
        side = $side, position = $position, location_notes = $locationNotes, quantity = $quantity,
@@ -2015,6 +2110,7 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
         vehicleModel: applicationValues.vehicleModel,
         vehicleTrim: applicationValues.vehicleTrim,
         vehicleType: applicationValues.vehicleType,
+        vehicleMotorcycleType: applicationValues.vehicleMotorcycleType,
         vehicleMappingMethod: applicationValues.vehicleMappingMethod,
         vehicleMappingConfidence: applicationValues.vehicleMappingConfidence,
         assembly: applicationValues.assembly,
@@ -2035,10 +2131,10 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
     await connection.run(
       `INSERT INTO partmaster_part_applications
        (id, application_key, part_id, dataset_id, source_row_id, epid, year, model, vehicle_make, vehicle_model,
-        vehicle_trim, vehicle_type, vehicle_mapping_method, vehicle_mapping_confidence, assembly, item_number, side, position,
+        vehicle_trim, vehicle_type, vehicle_motorcycle_type, vehicle_mapping_method, vehicle_mapping_confidence, assembly, item_number, side, position,
         location_notes, quantity, source_url, evidence_url, required_options, excluded_options, fitment_explanation, confidence)
        VALUES ($id, $applicationKey, $partId, $datasetId, $sourceRowId, $epid, $year, $model, $vehicleMake, $vehicleModel,
-        $vehicleTrim, $vehicleType, $vehicleMappingMethod, $vehicleMappingConfidence, $assembly, $itemNumber, $side,
+        $vehicleTrim, $vehicleType, $vehicleMotorcycleType, $vehicleMappingMethod, $vehicleMappingConfidence, $assembly, $itemNumber, $side,
         $position, $locationNotes, $quantity, $sourceUrl, $evidenceUrl, $requiredOptions, $excludedOptions,
         $fitmentExplanation, $confidence)`,
       applicationValues,
@@ -2147,7 +2243,7 @@ async function ensurePipelineDatasets(importMissing) {
   const sourceFiles = entries
     .filter((entry) => entry.isFile() && [".csv", ".tsv", ".txt"].includes(extname(entry.name).toLowerCase()))
     .map((entry) => entry.name)
-    .filter((name) => !/sample/i.test(name));
+    .filter((name) => !/sample|^mpsov\.csv$|^vehicle_(master|source_aliases)\.csv$/i.test(name));
   if (importMissing) {
     const imported = await withConnection(async (connection) => {
       const reader = await connection.runAndReadAll("SELECT DISTINCT source_file FROM partmaster_datasets");
@@ -3070,6 +3166,7 @@ async function runEnrichmentJob(jobId) {
                variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation,
                epid = $epid, vehicle_year = $vehicleYear, vehicle_make = $vehicleMake,
                vehicle_model = $vehicleModel, vehicle_trim = $vehicleTrim, vehicle_type = $vehicleType,
+               vehicle_motorcycle_type = $vehicleMotorcycleType,
                vehicle_mapping_method = $vehicleMappingMethod,
                vehicle_mapping_confidence = $vehicleMappingConfidence,
                extracted_attributes_json = $extractedAttributesJson,
@@ -3106,6 +3203,7 @@ async function runEnrichmentJob(jobId) {
                 vehicleModel: nullableResult("vehicleModel"),
                 vehicleTrim: nullableResult("vehicleTrim"),
                 vehicleType: nullableResult("vehicleType"),
+                vehicleMotorcycleType: nullableResult("vehicleMotorcycleType"),
                 vehicleMappingMethod: nullableResult("vehicleMappingMethod"),
                 vehicleMappingConfidence: nullableResult("vehicleMappingConfidence"),
                 extractedAttributesJson: nullableResult("extractedAttributesJson"),
@@ -3143,6 +3241,7 @@ async function runEnrichmentJob(jobId) {
                 vehicle_model: result.vehicleModel,
                 vehicle_trim: result.vehicleTrim,
                 vehicle_type: result.vehicleType,
+                vehicle_motorcycle_type: result.vehicleMotorcycleType,
                 vehicle_mapping_method: result.vehicleMappingMethod,
                 vehicle_mapping_confidence: result.vehicleMappingConfidence,
                 confidence: result.confidence,
@@ -3625,6 +3724,9 @@ app.get("/api/local/vehicle-mappings", asyncRoute(async (_request, response) => 
     vehicles: stats.vehicles,
     mappedVehicles: stats.mapped_vehicles,
     aliases: stats.aliases,
+    mpsov_aliases: stats.mpsov_aliases,
+    mpsov_enriched_applications: stats.mpsov_enriched_applications,
+    mpsov_enriched_candidates: stats.mpsov_enriched_candidates,
     loadedAt: stats.loaded_at,
     referenceRoot: REFERENCE_ROOT,
   });
@@ -3642,7 +3744,7 @@ app.get("/api/local/files", asyncRoute(async (_request, response) => {
     .filter((entry) => entry.isFile() && [".csv", ".tsv", ".txt"].includes(extname(entry.name).toLowerCase()))
     .map(async (entry) => {
       const details = await stat(join(INBOX_ROOT, entry.name));
-      return { name: entry.name, bytes: details.size, modifiedAt: details.mtime.toISOString() };
+      return { name: entry.name, bytes: details.size, modifiedAt: details.mtime.toISOString(), kind: /^mpsov\.csv$/i.test(entry.name) ? "vehicle_reference" : "parts_source" };
     }));
   files.sort((left, right) => right.modifiedAt.localeCompare(left.modifiedAt));
   response.json({ files, inboxPath: INBOX_ROOT });
@@ -4768,6 +4870,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
        applications.vehicle_model AS "Canonical Vehicle Model",
        applications.vehicle_trim AS "Canonical Vehicle Trim",
        applications.vehicle_type AS "Vehicle Type",
+       applications.vehicle_motorcycle_type AS "Motorcycle Type",
        applications.vehicle_mapping_method AS "Vehicle Mapping Method",
        applications.vehicle_mapping_confidence AS "Vehicle Mapping Confidence",
        applications.assembly AS "Assembly",
@@ -4938,6 +5041,7 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`Local data directory: ${DATA_ROOT}`);
   if (vehicleMappingLoadResult.loaded) {
     console.log(`Vehicle mapping reference: ${Number(vehicleMappingLoadResult.vehicles).toLocaleString()} vehicles, ${Number(vehicleMappingLoadResult.aliases).toLocaleString()} source aliases`);
+    if (vehicleMappingLoadResult.mpsov) console.log(`MPSOV.csv: ${Number(vehicleMappingLoadResult.mpsov.rows).toLocaleString()} rows, ${Number(vehicleMappingLoadResult.mpsov.new_epids).toLocaleString()} new ePIDs, ${Number(vehicleMappingLoadResult.mpsov.changed_epids).toLocaleString()} updated mappings`);
     if (vehicleMappingBackfillResult.reason) console.log(`Vehicle mapping backfill skipped: ${vehicleMappingBackfillResult.reason}`);
     else if (vehicleMappingBackfillResult.backfilled) console.log(`Vehicle mapping backfill: ${Number(vehicleMappingBackfillResult.backfilled).toLocaleString()} existing applications updated`);
   } else {
