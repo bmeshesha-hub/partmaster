@@ -24,6 +24,7 @@ const activePipelineJobs = new Set();
 const compatibilityQueue = [];
 const queuedCompatibilityKeys = new Set();
 let compatibilityWorkerRunning = false;
+let schedulerChecking = false;
 let shuttingDown = false;
 const ENRICHMENT_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.PARTMASTER_FETCH_TIMEOUT_MS) || 15000);
 const ENRICHMENT_MAX_PAGE_BYTES = Math.max(100000, Number(process.env.PARTMASTER_MAX_PAGE_BYTES) || 2_000_000);
@@ -224,6 +225,24 @@ await withConnection((connection) => connection.run(`
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     started_at TIMESTAMP,
     completed_at TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_pipeline_schedules (
+    id VARCHAR PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    schedule_type VARCHAR NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    run_at VARCHAR,
+    time_of_day VARCHAR,
+    online_budget INTEGER NOT NULL DEFAULT 10000,
+    dataset_ids VARCHAR,
+    run_all_remaining BOOLEAN NOT NULL DEFAULT false,
+    next_run_at TIMESTAMP,
+    last_run_at TIMESTAMP,
+    last_job_id VARCHAR,
+    last_status VARCHAR,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
   );
 
   CREATE TABLE IF NOT EXISTS partmaster_offline_part_sources (
@@ -3810,6 +3829,64 @@ async function intelligentPartSearch(query) {
   return { interpreted, results: results.sort((left, right) => right.matchScore - left.matchScore).slice(0, 100) };
 }
 
+function localTimestamp(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function parseLocalTimestamp(value) {
+  if (value instanceof Date) return value;
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const parsed = new Date(text.includes("T") ? text : text.replace(" ", "T"));
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function nextDailyRun(timeOfDay, after = new Date()) {
+  const match = String(timeOfDay || "22:00").match(/^(\d{2}):(\d{2})$/);
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) throw new Error("Choose a valid daily start time.");
+  const next = new Date(after);
+  next.setHours(Number(match[1]), Number(match[2]), 0, 0);
+  if (next <= after) next.setDate(next.getDate() + 1);
+  return next;
+}
+
+function scheduleNextRun({ scheduleType, runAt, timeOfDay }, after = new Date()) {
+  if (scheduleType === "daily") return nextDailyRun(timeOfDay, after);
+  const next = parseLocalTimestamp(runAt);
+  if (!next) throw new Error("Choose a valid date and time for the one-time job.");
+  return next;
+}
+
+async function createPipelineJob(options = {}) {
+  const active = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll("SELECT id FROM partmaster_pipeline_jobs WHERE status IN ('queued', 'running') LIMIT 1");
+    return reader.getRowObjectsJson()[0];
+  });
+  if (active) { const error = new Error("A full-dataset pipeline is already running."); error.status = 409; throw error; }
+  const id = randomUUID();
+  const datasetIds = Array.isArray(options.datasetIds) ? options.datasetIds.map(String).filter(Boolean) : [];
+  const requestedBudget = Number(options.onlineBudget);
+  const onlineBudget = Math.max(0, Math.min(PIPELINE_MAX_ONLINE_BUDGET, Number.isFinite(requestedBudget) ? requestedBudget : 250));
+  const importMissing = options.importMissing !== false;
+  const mode = options.continueOnline === true ? "online_only" : "full";
+  await withConnection((connection) => connection.run(
+    `INSERT INTO partmaster_pipeline_jobs
+     (id, name, mode, status, phase, dataset_ids, import_missing, online_budget)
+     VALUES ($id, $name, $mode, 'queued', 'queued', $datasetIds, $importMissing, $onlineBudget)`,
+    {
+      id,
+      name: String(options.name || (mode === "online_only" ? "Continue prioritized online checks" : "Full local parts pipeline")).slice(0, 200),
+      mode,
+      datasetIds: datasetIds.join(",") || null,
+      importMissing,
+      onlineBudget,
+    },
+  ));
+  scheduleFullPipeline(id);
+  return id;
+}
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
@@ -3861,31 +3938,7 @@ app.get("/api/local/pipeline/jobs", asyncRoute(async (_request, response) => {
 }));
 
 app.post("/api/local/pipeline/jobs", asyncRoute(async (request, response) => {
-  const active = await withConnection(async (connection) => {
-    const reader = await connection.runAndReadAll("SELECT id FROM partmaster_pipeline_jobs WHERE status IN ('queued', 'running') LIMIT 1");
-    return reader.getRowObjectsJson()[0];
-  });
-  if (active) return response.status(409).json({ error: "A full-dataset pipeline is already running." });
-  const id = randomUUID();
-  const datasetIds = Array.isArray(request.body.datasetIds) ? request.body.datasetIds.map(String).filter(Boolean) : [];
-  const requestedBudget = Number(request.body.onlineBudget);
-  const onlineBudget = Math.max(0, Math.min(PIPELINE_MAX_ONLINE_BUDGET, Number.isFinite(requestedBudget) ? requestedBudget : 250));
-  const importMissing = request.body.importMissing !== false;
-  const mode = request.body.continueOnline === true ? "online_only" : "full";
-  await withConnection((connection) => connection.run(
-    `INSERT INTO partmaster_pipeline_jobs
-     (id, name, mode, status, phase, dataset_ids, import_missing, online_budget)
-     VALUES ($id, $name, $mode, 'queued', 'queued', $datasetIds, $importMissing, $onlineBudget)`,
-    {
-      id,
-      name: String(request.body.name || (mode === "online_only" ? "Continue prioritized online checks" : "Full local parts pipeline")).slice(0, 200),
-      mode,
-      datasetIds: datasetIds.join(",") || null,
-      importMissing,
-      onlineBudget,
-    },
-  ));
-  scheduleFullPipeline(id);
+  const id = await createPipelineJob(request.body);
   response.status(202).json({ jobId: id });
 }));
 
@@ -3908,6 +3961,150 @@ app.post("/api/local/pipeline/jobs/:id/resume", asyncRoute(async (request, respo
   if (resumed) scheduleFullPipeline(request.params.id);
   response.json({ ok: true, resumed });
 }));
+
+async function pendingPagesForDatasets(datasetIds = []) {
+  return withConnection(async (connection) => {
+    if (!datasetIds.length) {
+      const reader = await connection.runAndReadAll("SELECT count(*) AS count FROM partmaster_offline_source_pages WHERE status = 'pending'");
+      return Number(reader.getRowObjectsJson()[0]?.count || 0);
+    }
+    const quotedIds = datasetIds.map(quoteString).join(", ");
+    const reader = await connection.runAndReadAll(
+      `SELECT count(DISTINCT pages.source_url) AS count
+       FROM partmaster_offline_source_pages pages
+       JOIN partmaster_offline_part_sources sources ON sources.source_url = pages.source_url
+       WHERE pages.status = 'pending' AND sources.dataset_id IN (${quotedIds})`,
+    );
+    return Number(reader.getRowObjectsJson()[0]?.count || 0);
+  });
+}
+
+async function runPipelineSchedule(schedule, { manual = false } = {}) {
+  const datasetIds = String(schedule.dataset_ids || "").split(",").filter(Boolean);
+  const pagesLeft = await pendingPagesForDatasets(datasetIds);
+  const requestedBudget = schedule.run_all_remaining ? pagesLeft : Number(schedule.online_budget || 0);
+  const budget = Math.min(PIPELINE_MAX_ONLINE_BUDGET, pagesLeft, requestedBudget);
+  const now = new Date();
+  const nextRun = schedule.schedule_type === "daily" ? nextDailyRun(schedule.time_of_day, now) : null;
+  if (!budget) {
+    await withConnection((connection) => connection.run(
+      `UPDATE partmaster_pipeline_schedules SET last_run_at = current_timestamp, last_status = 'no_work',
+       enabled = $enabled, next_run_at = $nextRun, updated_at = current_timestamp WHERE id = $id`,
+      { id: schedule.id, enabled: schedule.schedule_type === "daily", nextRun: nextRun ? localTimestamp(nextRun) : null },
+    ));
+    return { jobId: null, pagesLeft: 0 };
+  }
+  const jobId = await createPipelineJob({
+    name: `${schedule.name}${manual ? " — run now" : " — scheduled"}`,
+    continueOnline: true,
+    importMissing: false,
+    onlineBudget: budget,
+    datasetIds,
+  });
+  await withConnection((connection) => connection.run(
+    `UPDATE partmaster_pipeline_schedules SET last_run_at = current_timestamp, last_job_id = $jobId,
+     last_status = 'started', enabled = $enabled, next_run_at = $nextRun, updated_at = current_timestamp WHERE id = $id`,
+    { id: schedule.id, jobId, enabled: schedule.schedule_type === "daily", nextRun: nextRun ? localTimestamp(nextRun) : null },
+  ));
+  return { jobId, pagesLeft, budget };
+}
+
+app.get("/api/local/pipeline/schedules", asyncRoute(async (_request, response) => {
+  const result = await withConnection(async (connection) => {
+    const schedulesReader = await connection.runAndReadAll(
+      `SELECT schedules.*, jobs.status AS job_status, jobs.online_checked, jobs.online_budget AS job_budget,
+       jobs.completed_at AS job_completed_at, jobs.last_error AS job_error
+       FROM partmaster_pipeline_schedules schedules
+       LEFT JOIN partmaster_pipeline_jobs jobs ON jobs.id = schedules.last_job_id
+       ORDER BY schedules.enabled DESC, schedules.next_run_at NULLS LAST, schedules.created_at DESC`,
+    );
+    const activeReader = await connection.runAndReadAll(
+      "SELECT id, name, status, phase, online_checked, online_budget FROM partmaster_pipeline_jobs WHERE status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1",
+    );
+    return { schedules: schedulesReader.getRowObjectsJson(), activeJob: activeReader.getRowObjectsJson()[0] || null };
+  });
+  response.json(result);
+}));
+
+app.post("/api/local/pipeline/schedules", asyncRoute(async (request, response) => {
+  const scheduleType = request.body.scheduleType === "daily" ? "daily" : "once";
+  const timeOfDay = scheduleType === "daily" ? String(request.body.timeOfDay || "22:00") : null;
+  const runAt = scheduleType === "once" ? String(request.body.runAt || "") : null;
+  const nextRun = scheduleNextRun({ scheduleType, runAt, timeOfDay });
+  if (scheduleType === "once" && nextRun <= new Date()) throw new Error("Choose a future date and time for a one-time job.");
+  const requestedBudget = Number(request.body.onlineBudget);
+  const onlineBudget = Math.max(1, Math.min(PIPELINE_MAX_ONLINE_BUDGET, Number.isFinite(requestedBudget) ? requestedBudget : 10000));
+  const datasetIds = Array.isArray(request.body.datasetIds) ? request.body.datasetIds.map(String).filter(Boolean) : [];
+  const id = randomUUID();
+  await withConnection((connection) => connection.run(
+    `INSERT INTO partmaster_pipeline_schedules
+     (id, name, schedule_type, enabled, run_at, time_of_day, online_budget, dataset_ids, run_all_remaining, next_run_at)
+     VALUES ($id, $name, $scheduleType, true, $runAt, $timeOfDay, $onlineBudget, $datasetIds, $runAllRemaining, $nextRunAt)`,
+    {
+      id,
+      name: String(request.body.name || (scheduleType === "daily" ? "Nightly enrichment" : "Scheduled enrichment")).trim().slice(0, 200),
+      scheduleType,
+      runAt,
+      timeOfDay,
+      onlineBudget,
+      datasetIds: datasetIds.join(",") || null,
+      runAllRemaining: Boolean(request.body.runAllRemaining),
+      nextRunAt: localTimestamp(nextRun),
+    },
+  ));
+  response.status(201).json({ id, nextRunAt: localTimestamp(nextRun) });
+}));
+
+app.patch("/api/local/pipeline/schedules/:id", asyncRoute(async (request, response) => {
+  const existing = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll("SELECT * FROM partmaster_pipeline_schedules WHERE id = $id", { id: request.params.id });
+    return reader.getRowObjectsJson()[0];
+  });
+  if (!existing) return response.status(404).json({ error: "Schedule not found." });
+  const enabled = request.body.enabled == null ? Boolean(existing.enabled) : Boolean(request.body.enabled);
+  let nextRun = existing.next_run_at;
+  if (enabled && !existing.enabled) {
+    nextRun = localTimestamp(scheduleNextRun({ scheduleType: existing.schedule_type, runAt: existing.run_at, timeOfDay: existing.time_of_day }));
+  }
+  await withConnection((connection) => connection.run(
+    "UPDATE partmaster_pipeline_schedules SET enabled = $enabled, next_run_at = $nextRun, updated_at = current_timestamp WHERE id = $id",
+    { id: request.params.id, enabled, nextRun },
+  ));
+  response.json({ ok: true, enabled });
+}));
+
+app.delete("/api/local/pipeline/schedules/:id", asyncRoute(async (request, response) => {
+  await withConnection((connection) => connection.run("DELETE FROM partmaster_pipeline_schedules WHERE id = $id", { id: request.params.id }));
+  response.json({ ok: true });
+}));
+
+app.post("/api/local/pipeline/schedules/:id/run", asyncRoute(async (request, response) => {
+  const schedule = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll("SELECT * FROM partmaster_pipeline_schedules WHERE id = $id", { id: request.params.id });
+    return reader.getRowObjectsJson()[0];
+  });
+  if (!schedule) return response.status(404).json({ error: "Schedule not found." });
+  const result = await runPipelineSchedule(schedule, { manual: true });
+  response.status(result.jobId ? 202 : 200).json(result);
+}));
+
+async function checkPipelineSchedules() {
+  if (schedulerChecking || shuttingDown) return;
+  schedulerChecking = true;
+  try {
+    const due = await withConnection(async (connection) => {
+      const reader = await connection.runAndReadAll(
+        "SELECT * FROM partmaster_pipeline_schedules WHERE enabled = true AND next_run_at <= current_timestamp ORDER BY next_run_at LIMIT 1",
+      );
+      return reader.getRowObjectsJson()[0];
+    });
+    if (due) await runPipelineSchedule(due);
+  } catch (error) {
+    if (error.status !== 409) console.error(`Scheduled enrichment check failed: ${error.message}`);
+  } finally {
+    schedulerChecking = false;
+  }
+}
 
 app.get("/api/local/pipeline/catalog", asyncRoute(async (request, response) => {
   const query = String(request.query.q || "").trim().toLowerCase();
@@ -5373,11 +5570,14 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   resumableRowEnhancementJobIds.forEach(scheduleRowEnhancementJob);
   resumableAutopilotJobIds.forEach(scheduleAutopilotJob);
   resumablePipelineJobIds.forEach(scheduleFullPipeline);
+  setTimeout(() => checkPipelineSchedules(), 1000);
 });
+const schedulerTimer = setInterval(() => checkPipelineSchedules(), 30_000);
 
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  clearInterval(schedulerTimer);
   console.log(`Received ${signal}; checkpointing local data before shutdown…`);
   server.close();
   const deadline = Date.now() + 20_000;

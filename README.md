@@ -84,6 +84,19 @@ does not scrape general-purpose search-engine result pages. Configure memory,
 threads, page-size, and fetch timeouts with the `PARTMASTER_*` values shown in
 `.env.example`.
 
+### Scheduled enrichment
+
+Open **Settings → Scheduler & jobs** in the local app to start an ad-hoc online
+enrichment job, schedule one future run, or create a recurring daily run. The
+schedule, last result, and next run time are stored in the local DuckDB database.
+Daily schedules create at most one pipeline job at a time and automatically
+advance to the next day after starting. If the service was closed at the due
+time, the overdue job starts after `npm run dev:local` is opened again.
+
+The Mac must remain awake and `npm run dev:local` must keep running. A daily
+limit of 10,000 source pages is the recommended starting point; the UI also
+supports a selected CSV source and an explicit all-remaining mode.
+
 ## Local development
 
 1. Copy `.env.example` to `.env` and adjust the repository values if needed.
