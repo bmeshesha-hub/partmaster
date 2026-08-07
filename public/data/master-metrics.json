@@ -1,0 +1,51 @@
+{
+  "generated_at": "2026-08-07T21:16:28.630Z",
+  "snapshot": true,
+  "summary": {
+    "unique_parts": 573841,
+    "usable_occurrences": 64501335,
+    "duplicate_occurrences": 63927494,
+    "manufacturers": 7,
+    "families": 11702,
+    "missing_descriptions": 16,
+    "general_parts": 157799,
+    "parts_with_facts": 177630,
+    "product_facts": 243880,
+    "online_verified_parts": 44781,
+    "high_confidence_parts": 44781,
+    "low_confidence_parts": 16
+  },
+  "source_pages": {
+    "source_pages": 248402,
+    "pending_pages": 246686,
+    "processed_pages": 1716,
+    "failed_pages": 253
+  },
+  "manufacturers": [
+    { "label": "Honda", "parts": 152838, "with_facts": 44407, "verified": 13529 },
+    { "label": "Yamaha", "parts": 110079, "with_facts": 22280, "verified": 13519 },
+    { "label": "Suzuki", "parts": 89618, "with_facts": 29407, "verified": 7120 },
+    { "label": "Kawasaki", "parts": 79964, "with_facts": 24522, "verified": 5497 },
+    { "label": "BMW", "parts": 56570, "with_facts": 20310, "verified": 469 },
+    { "label": "Harley-Davidson", "parts": 46964, "with_facts": 23441, "verified": 0 },
+    { "label": "KTM", "parts": 37808, "with_facts": 13263, "verified": 4647 }
+  ],
+  "families": [
+    { "label": "General Part", "parts": 157799, "with_facts": 19968 },
+    { "label": "Fastener / Hardware", "parts": 50086, "with_facts": 50037 },
+    { "label": "Engine", "parts": 24235, "with_facts": 2310 },
+    { "label": "Brake System", "parts": 18030, "with_facts": 3935 },
+    { "label": "Suspension / Steering", "parts": 17999, "with_facts": 2073 },
+    { "label": "Cover", "parts": 17443, "with_facts": 6365 },
+    { "label": "Seal / Gasket", "parts": 16936, "with_facts": 16936 },
+    { "label": "Wheel", "parts": 12548, "with_facts": 3883 },
+    { "label": "Electrical / Sensor", "parts": 11854, "with_facts": 11854 },
+    { "label": "Bearing / Bushing", "parts": 9851, "with_facts": 9851 },
+    { "label": "Clutch", "parts": 7748, "with_facts": 2176 },
+    { "label": "Cooling / HVAC", "parts": 5697, "with_facts": 518 }
+  ],
+  "evidence": [
+    { "label": "queued", "parts": 529060 },
+    { "label": "verified", "parts": 44781 }
+  ]
+}

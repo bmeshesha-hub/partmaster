@@ -12,6 +12,7 @@ import {
   RefreshCw,
   SearchCheck,
   Settings,
+  TableProperties,
 } from "lucide-react";
 import { createElement, useCallback, useEffect, useState } from "react";
 import AnalysisWorkflow from "./components/AnalysisWorkflow.jsx";
@@ -20,6 +21,7 @@ import Dashboard from "./components/Dashboard.jsx";
 import EnrichmentManager from "./components/EnrichmentManager.jsx";
 import GitHubAuth from "./components/GitHubAuth.jsx";
 import LocalDataManager from "./components/LocalDataManager.jsx";
+import MasterDataPage from "./components/MasterDataPage.jsx";
 import PartsLibrary from "./components/PartsLibrary.jsx";
 import PartsIntelligence from "./components/PartsIntelligence.jsx";
 import ReviewTable from "./components/ReviewTable.jsx";
@@ -34,6 +36,7 @@ const TOKEN_STORAGE_KEY = "partmaster.githubToken";
 const EMPTY_DATA = { input: [], queue: [], approved: [], analyses: [], headSha: "" };
 const NAVIGATION = [
   { id: "dashboard", label: "Dashboard", shortLabel: "Home", icon: LayoutDashboard },
+  { id: "master", label: "Master data", shortLabel: "Master", icon: TableProperties },
   { id: "review", label: "Review", shortLabel: "Review", icon: ClipboardCheck },
   { id: "analyze", label: "Analyze parts", shortLabel: "Analyze", icon: FileSearch },
   { id: "library", label: "Library", shortLabel: "Library", icon: Library },
@@ -44,6 +47,7 @@ const NAVIGATION = [
 ];
 const VIEW_COPY = {
   dashboard: ["Operations dashboard", "Part processing progress"],
+  master: ["Master data", "Quality metrics and searchable consolidated catalog"],
   review: ["Human review", "Parts awaiting review"],
   analyze: ["Research workflow", "Import and analyze parts"],
   library: ["Completed records", "Parts library"],
@@ -122,13 +126,13 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <header className="sticky top-0 z-20 border-b border-slate-200/80 bg-white/90 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4 sm:px-6 lg:px-8">
+        <div className="mx-auto flex max-w-[90rem] items-center justify-between px-4 py-4 sm:px-6 lg:px-8">
           <button type="button" onClick={() => setView("dashboard")} className="flex items-center gap-3 text-left">
             <span className="grid h-10 w-10 place-items-center rounded-xl bg-brand-600 text-white shadow-sm"><Boxes size={22} aria-hidden="true" /></span>
             <span><span className="block text-lg font-bold tracking-tight text-ink">Partmaster</span><span className="block text-xs text-slate-500">Parts intelligence workspace</span></span>
           </button>
           <div className="flex items-center gap-2">
-            <nav className="hidden rounded-xl bg-slate-100 p-1 xl:flex" aria-label="Primary navigation">
+            <nav className="hidden rounded-xl bg-slate-100 p-1 2xl:flex" aria-label="Primary navigation">
               {NAVIGATION.map(({ id, label, icon }) => <button key={id} type="button" onClick={() => setView(id)} className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium ${view === id ? "bg-white text-brand-700 shadow-sm" : "text-slate-600 hover:text-slate-900"}`}>{createElement(icon, { size: 16, "aria-hidden": true })}{label}</button>)}
             </nav>
             <button type="button" onClick={() => setSettingsOpen(true)} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"><Settings size={17} aria-hidden="true" /><span className="hidden sm:inline">Settings</span></button>
@@ -137,18 +141,20 @@ export default function App() {
       </header>
 
       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
-        <nav className="mb-6 grid grid-cols-4 rounded-xl bg-slate-200/70 p-1 lg:grid-cols-8 xl:hidden" aria-label="Primary navigation">
+        <nav className="mb-6 grid grid-cols-3 rounded-xl bg-slate-200/70 p-1 sm:grid-cols-5 lg:grid-cols-9 2xl:hidden" aria-label="Primary navigation">
           {NAVIGATION.map(({ id, shortLabel, icon }) => <button key={id} type="button" onClick={() => setView(id)} className={`flex flex-col items-center gap-1 rounded-lg px-1 py-2 text-[11px] font-medium sm:flex-row sm:justify-center sm:text-sm ${view === id ? "bg-white text-brand-700 shadow-sm" : "text-slate-600"}`}>{createElement(icon, { size: 16, "aria-hidden": true })}{shortLabel}</button>)}
         </nav>
 
         <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-          <div><p className="text-sm font-semibold text-brand-700">{eyebrow}</p><h2 className="mt-1 text-2xl font-bold tracking-tight text-ink">{heading}</h2><p className="mt-2 text-sm text-slate-500">{view === "about" ? "A transparent guide for operators, reviewers, and partners" : ["local", "enrichment", "intelligence"].includes(view) ? "Stored only in partmaster/local_data on this Mac" : `${DEFAULT_REPOSITORY.owner}/${DEFAULT_REPOSITORY.repo} · ${DEFAULT_REPOSITORY.branch}`}</p></div>
-          {!["analyze", "local", "enrichment", "about"].includes(view) && <div className="flex items-center gap-3"><span className="rounded-full bg-white px-3 py-1.5 text-sm font-medium text-slate-600 shadow-sm ring-1 ring-slate-200">{data.queue.length} pending</span><button type="button" onClick={loadWorkspace} disabled={!token || loading || Boolean(approvingId)} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"><RefreshCw className={loading ? "animate-spin" : ""} size={16} />Refresh</button></div>}
+          <div><p className="text-sm font-semibold text-brand-700">{eyebrow}</p><h2 className="mt-1 text-2xl font-bold tracking-tight text-ink">{heading}</h2><p className="mt-2 text-sm text-slate-500">{view === "about" ? "A transparent guide for operators, reviewers, and partners" : view === "master" ? "Public aggregate metrics · detailed records stay on this Mac" : ["local", "enrichment", "intelligence"].includes(view) ? "Stored only in partmaster/local_data on this Mac" : `${DEFAULT_REPOSITORY.owner}/${DEFAULT_REPOSITORY.repo} · ${DEFAULT_REPOSITORY.branch}`}</p></div>
+          {!["analyze", "master", "local", "enrichment", "about"].includes(view) && <div className="flex items-center gap-3"><span className="rounded-full bg-white px-3 py-1.5 text-sm font-medium text-slate-600 shadow-sm ring-1 ring-slate-200">{data.queue.length} pending</span><button type="button" onClick={loadWorkspace} disabled={!token || loading || Boolean(approvingId)} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"><RefreshCw className={loading ? "animate-spin" : ""} size={16} />Refresh</button></div>}
         </div>
 
         {error && <div className="mb-5 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" role="alert"><AlertCircle className="mt-0.5 shrink-0" size={18} /><span>{error}</span></div>}
 
-        {view === "local" ? (
+        {view === "master" ? (
+          <MasterDataPage />
+        ) : view === "local" ? (
           <LocalDataManager />
         ) : view === "enrichment" ? (
           <EnrichmentManager />

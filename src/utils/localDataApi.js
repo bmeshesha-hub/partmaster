@@ -36,6 +36,12 @@ export const localDataApi = {
   resumePipeline: (jobId) => request(`/pipeline/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST", body: "{}" }),
   pipelineCatalog: (query = "") => request(`/pipeline/catalog${query ? `?q=${encodeURIComponent(query)}` : ""}`),
   pipelineSources: () => request("/pipeline/sources"),
+  masterDashboard: () => request("/master-dashboard"),
+  masterCatalogFilters: () => request("/master-catalog/filters"),
+  masterCatalog: (parameters = {}) => {
+    const query = new URLSearchParams(Object.entries(parameters).filter(([, value]) => value !== "" && value != null));
+    return request(`/master-catalog?${query}`);
+  },
   exportPipelineCatalog: () => request("/pipeline/exports", { method: "POST", body: "{}" }),
   enrichmentJobs: () => request("/enrichment/jobs"),
   enrichmentJob: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}`),

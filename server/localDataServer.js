@@ -3882,6 +3882,114 @@ app.get("/api/local/pipeline/sources", asyncRoute(async (_request, response) => 
   response.json({ sources });
 }));
 
+app.get("/api/local/master-dashboard", asyncRoute(async (_request, response) => {
+  const dashboard = await withConnection(async (connection) => {
+    const summaryReader = await connection.runAndReadAll(
+      `SELECT count(*) AS unique_parts, coalesce(sum(occurrence_count), 0) AS usable_occurrences,
+       greatest(0, coalesce(sum(occurrence_count), 0) - count(*)) AS duplicate_occurrences,
+       count(DISTINCT manufacturer_norm) AS manufacturers, count(DISTINCT family_name) AS families,
+       count(*) FILTER (WHERE description IS NULL OR trim(description) = '') AS missing_descriptions,
+       count(*) FILTER (WHERE family_name IS NULL OR family_name = 'General Part') AS general_parts,
+       count(*) FILTER (WHERE extracted_attribute_count > 0) AS parts_with_facts,
+       coalesce(sum(extracted_attribute_count), 0) AS product_facts,
+       count(*) FILTER (WHERE online_status = 'verified') AS online_verified_parts,
+       count(*) FILTER (WHERE confidence >= .9) AS high_confidence_parts,
+       count(*) FILTER (WHERE confidence < .7) AS low_confidence_parts
+       FROM partmaster_offline_parts`,
+    );
+    const manufacturerReader = await connection.runAndReadAll(
+      `SELECT CASE manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
+        WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM' WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha'
+        WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE manufacturer_norm END AS label, count(*) AS parts,
+       count(*) FILTER (WHERE extracted_attribute_count > 0) AS with_facts,
+       count(*) FILTER (WHERE online_status = 'verified') AS verified
+       FROM partmaster_offline_parts GROUP BY manufacturer_norm ORDER BY parts DESC`,
+    );
+    const familyReader = await connection.runAndReadAll(
+      `SELECT coalesce(family_name, 'Unclassified') AS label, count(*) AS parts,
+       count(*) FILTER (WHERE extracted_attribute_count > 0) AS with_facts
+       FROM partmaster_offline_parts GROUP BY family_name ORDER BY parts DESC LIMIT 16`,
+    );
+    const evidenceReader = await connection.runAndReadAll(
+      `SELECT online_status AS label, count(*) AS parts FROM partmaster_offline_parts
+       GROUP BY online_status ORDER BY parts DESC`,
+    );
+    const pagesReader = await connection.runAndReadAll(
+      `SELECT count(*) AS source_pages,
+       count(*) FILTER (WHERE status = 'pending') AS pending_pages,
+       count(*) FILTER (WHERE status != 'pending') AS processed_pages,
+       count(*) FILTER (WHERE status = 'failed') AS failed_pages
+       FROM partmaster_offline_source_pages`,
+    );
+    return {
+      generated_at: new Date().toISOString(),
+      summary: summaryReader.getRowObjectsJson()[0],
+      source_pages: pagesReader.getRowObjectsJson()[0],
+      manufacturers: manufacturerReader.getRowObjectsJson(),
+      families: familyReader.getRowObjectsJson(),
+      evidence: evidenceReader.getRowObjectsJson(),
+    };
+  });
+  response.json(dashboard);
+}));
+
+app.get("/api/local/master-catalog/filters", asyncRoute(async (_request, response) => {
+  const filters = await withConnection(async (connection) => {
+    const manufacturers = await connection.runAndReadAll(
+      `SELECT CASE manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
+       WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM' WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha'
+       WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE manufacturer_norm END AS value, count(*) AS count
+       FROM partmaster_offline_parts GROUP BY manufacturer_norm ORDER BY value`,
+    );
+    const families = await connection.runAndReadAll(
+      "SELECT coalesce(family_name, 'Unclassified') AS value, count(*) AS count FROM partmaster_offline_parts GROUP BY family_name ORDER BY count DESC, value LIMIT 200",
+    );
+    return { manufacturers: manufacturers.getRowObjectsJson(), families: families.getRowObjectsJson() };
+  });
+  response.json(filters);
+}));
+
+app.get("/api/local/master-catalog", asyncRoute(async (request, response) => {
+  const page = Math.max(1, Number(request.query.page) || 1);
+  const pageSize = Math.max(10, Math.min(200, Number(request.query.pageSize) || 50));
+  const conditions = [];
+  const values = {};
+  const query = String(request.query.q || "").trim().toLowerCase();
+  if (query) {
+    conditions.push("lower(concat_ws(' ', manufacturer, part_number, description, family_name, side, position, extracted_attributes_json)) LIKE $query");
+    values.query = `%${query}%`;
+  }
+  if (request.query.manufacturer) { conditions.push("manufacturer_norm = $manufacturer"); values.manufacturer = normalizePartNumber(normalizeManufacturer(request.query.manufacturer)); }
+  if (request.query.family) { conditions.push("coalesce(family_name, 'Unclassified') = $family"); values.family = String(request.query.family); }
+  if (request.query.onlineStatus) { conditions.push("online_status = $onlineStatus"); values.onlineStatus = String(request.query.onlineStatus); }
+  if (request.query.factStatus === "with_facts") conditions.push("extracted_attribute_count > 0");
+  if (request.query.factStatus === "missing_facts") conditions.push("extracted_attribute_count = 0");
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const sortColumns = {
+    occurrences: "occurrence_count", manufacturer: "manufacturer_norm", part_number: "part_number_norm",
+    family: "family_name", facts: "extracted_attribute_count", confidence: "confidence", updated: "updated_at",
+  };
+  const sort = sortColumns[request.query.sort] || "occurrence_count";
+  const direction = String(request.query.direction).toLowerCase() === "asc" ? "ASC" : "DESC";
+  const result = await withConnection(async (connection) => {
+    const countReader = await connection.runAndReadAll(`SELECT count(*) AS count FROM partmaster_offline_parts ${where}`, values);
+    const total = Number(countReader.getRowObjectsJson()[0].count);
+    const rowsReader = await connection.runAndReadAll(
+      `SELECT part_key, CASE manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
+        WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM' WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha'
+        WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE manufacturer END AS manufacturer,
+       part_number, description, family_name, component_scope, side, position,
+       extracted_attributes_json, extracted_attribute_count, occurrence_count, dataset_count, application_count,
+       source_page_count, best_source_url, confidence, attribute_status, online_status, updated_at
+       FROM partmaster_offline_parts ${where}
+       ORDER BY ${sort} ${direction} NULLS LAST, manufacturer_norm, part_number_norm
+       LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values,
+    );
+    return { rows: rowsReader.getRowObjectsJson(), total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)) };
+  });
+  response.json(result);
+}));
+
 app.post("/api/local/pipeline/exports", asyncRoute(async (_request, response) => {
   const attributeKeys = [...new Set(CATEGORY_ATTRIBUTE_SCHEMAS.flatMap((schema) => schema.attributes.map((attribute) => attribute.key)))]
     .filter((key) => !["side", "position"].includes(key));
