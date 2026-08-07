@@ -35,6 +35,7 @@ export const localDataApi = {
   pausePipeline: (jobId) => request(`/pipeline/jobs/${encodeURIComponent(jobId)}/pause`, { method: "POST", body: "{}" }),
   resumePipeline: (jobId) => request(`/pipeline/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST", body: "{}" }),
   pipelineCatalog: (query = "") => request(`/pipeline/catalog${query ? `?q=${encodeURIComponent(query)}` : ""}`),
+  pipelineSources: () => request("/pipeline/sources"),
   exportPipelineCatalog: () => request("/pipeline/exports", { method: "POST", body: "{}" }),
   enrichmentJobs: () => request("/enrichment/jobs"),
   enrichmentJob: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}`),

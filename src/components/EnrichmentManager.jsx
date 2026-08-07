@@ -182,14 +182,15 @@ function TransformationShowcase({ data, jobs, selectedJobId, loading, onSelectJo
 function FullDatasetPipeline() {
   const [jobs, setJobs] = useState([]);
   const [catalog, setCatalog] = useState({ stats: {}, rows: [] });
+  const [pipelineSources, setPipelineSources] = useState([]);
   const [onlineBudget, setOnlineBudget] = useState(250);
   const [busy, setBusy] = useState(false);
   const [pipelineError, setPipelineError] = useState("");
   const [pipelineExports, setPipelineExports] = useState([]);
   const load = useCallback(async () => {
     try {
-      const [jobResult, catalogResult] = await Promise.all([localDataApi.pipelineJobs(), localDataApi.pipelineCatalog()]);
-      setJobs(jobResult.jobs || []); setCatalog(catalogResult); setPipelineError("");
+      const [jobResult, catalogResult, sourceResult] = await Promise.all([localDataApi.pipelineJobs(), localDataApi.pipelineCatalog(), localDataApi.pipelineSources()]);
+      setJobs(jobResult.jobs || []); setCatalog(catalogResult); setPipelineSources(sourceResult.sources || []); setPipelineError("");
     } catch (error) { setPipelineError(error.message); }
   }, []);
   useEffect(() => { load(); }, [load]);
@@ -211,9 +212,9 @@ function FullDatasetPipeline() {
     extracting_attributes: "Extracting category-specific product facts", checking_shared_sources: "Checking high-value shared source pages", completed: "Full pipeline complete", failed: "Pipeline needs attention",
   }[job?.phase] || String(job?.phase || "Ready").replaceAll("_", " ");
 
-  async function start(continueOnline = false) {
+  async function start(continueOnline = false, datasetId = "") {
     setBusy(true); setPipelineError("");
-    try { await localDataApi.startPipeline({ importMissing: !continueOnline, continueOnline, onlineBudget }); await load(); }
+    try { await localDataApi.startPipeline({ importMissing: !continueOnline, continueOnline, onlineBudget, datasetIds: datasetId ? [datasetId] : [] }); await load(); }
     catch (error) { setPipelineError(error.message); }
     finally { setBusy(false); }
   }
@@ -243,6 +244,7 @@ function FullDatasetPipeline() {
         ["Product facts", job?.attribute_facts || catalog.stats?.attribute_facts], ["Pages remaining", catalog.stats?.pending_source_pages], ["Online verified", catalog.stats?.online_verified_parts || job?.online_verified_parts],
       ].map(([label, value]) => <div key={label} className="rounded-xl bg-slate-50 p-3"><p className="text-[10px] font-bold uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 text-xl font-black text-slate-900">{Number(value || 0).toLocaleString()}</p></div>)}</div>
       {job?.status === "completed" && <div className="mt-5 rounded-2xl border border-emerald-200 bg-emerald-50 p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="font-bold text-emerald-950">Your deduplicated enriched catalog is ready</p><p className="mt-1 text-xs text-emerald-800">Export the flattened part catalog plus full source traceability and online-check quality results.</p></div><button type="button" disabled={busy} onClick={exportCatalog} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-black text-white disabled:opacity-50">{busy ? <LoaderCircle className="animate-spin" size={16} /> : <Download size={16} />}Create CSV downloads</button></div>{pipelineExports.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{pipelineExports.map((item) => <a key={item.filename} href={item.downloadUrl} download className="inline-flex items-center gap-2 rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-bold text-emerald-800 hover:bg-emerald-100"><Download size={14} />{item.filename} · {formatBytes(item.bytes)}</a>)}</div>}</div>}
+      {pipelineSources.some((source) => Number(source.unique_parts)) && <div className="mt-6 overflow-hidden rounded-2xl border border-slate-200"><header className="bg-slate-50 px-4 py-3"><h4 className="text-sm font-bold">Completion by source CSV</h4><p className="mt-0.5 text-xs text-slate-500">Offline coverage is complete when usable rows and unique parts are indexed. Online verification continues only through that source’s remaining linked pages.</p></header><div className="overflow-x-auto"><table className="min-w-full text-xs"><thead className="border-y border-slate-200 bg-white text-left uppercase tracking-wide text-slate-500"><tr>{["Source", "Raw rows", "Usable", "Unique parts", "With facts", "Online verified", "Pages left", ""].map((heading) => <th key={heading} className="whitespace-nowrap px-3 py-2">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{pipelineSources.filter((source) => Number(source.unique_parts)).map((source) => <tr key={source.dataset_id}><td className="whitespace-nowrap px-3 py-2 font-bold">{source.source_file}</td><td className="px-3 py-2">{Number(source.raw_rows).toLocaleString()}</td><td className="px-3 py-2">{Number(source.usable_rows).toLocaleString()}</td><td className="px-3 py-2 font-bold">{Number(source.unique_parts).toLocaleString()}</td><td className="px-3 py-2 text-emerald-700">{Number(source.parts_with_facts).toLocaleString()}</td><td className="px-3 py-2 text-cyan-700">{Number(source.online_verified_parts).toLocaleString()}</td><td className="px-3 py-2">{Number(source.pending_source_pages).toLocaleString()}</td><td className="px-3 py-2"><button type="button" disabled={busy || Boolean(active) || !Number(source.pending_source_pages)} onClick={() => start(true, source.dataset_id)} className="whitespace-nowrap rounded-lg border border-cyan-300 bg-cyan-50 px-3 py-1.5 font-bold text-cyan-800 disabled:opacity-40">Continue this source</button></td></tr>)}</tbody></table></div></div>}
       {catalog.rows?.length > 0 && <div className="mt-6 overflow-hidden rounded-2xl border border-slate-200"><header className="bg-slate-50 px-4 py-3"><h4 className="text-sm font-bold">Highest-impact deduplicated parts</h4><p className="mt-0.5 text-xs text-slate-500">One identity per manufacturer + normalized OEM number, ordered by how often it appears.</p></header><div className="overflow-x-auto"><table className="min-w-full text-xs"><thead className="border-y border-slate-200 bg-white text-left uppercase tracking-wide text-slate-500"><tr>{["Make", "OEM number", "Family", "Description", "Occurrences", "Datasets", "Facts", "Online"].map((heading) => <th key={heading} className="whitespace-nowrap px-3 py-2">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{catalog.rows.slice(0, 10).map((part) => <tr key={part.part_key}><td className="px-3 py-2 font-bold">{part.manufacturer}</td><td className="whitespace-nowrap px-3 py-2 font-mono font-bold text-brand-700">{part.part_number}</td><td className="whitespace-nowrap px-3 py-2">{part.family_name || "Pending"}</td><td className="max-w-72 truncate px-3 py-2" title={part.description || ""}>{part.description || "—"}</td><td className="px-3 py-2 font-bold">{Number(part.occurrence_count).toLocaleString()}</td><td className="px-3 py-2">{Number(part.dataset_count).toLocaleString()}</td><td className="px-3 py-2 font-bold text-emerald-700">{Number(part.extracted_attribute_count).toLocaleString()}</td><td className="px-3 py-2 capitalize">{part.online_status.replaceAll("_", " ")}</td></tr>)}</tbody></table></div></div>}
     </div>
   </section>;

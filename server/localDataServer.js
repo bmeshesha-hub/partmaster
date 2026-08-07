@@ -2410,7 +2410,12 @@ async function extractOfflineAttributes(jobId) {
   }
 }
 
-async function checkOfflineSourcePages(jobId, budget) {
+async function checkOfflineSourcePages(jobId, budget, datasetIds = []) {
+  const datasetScope = datasetIds.length
+    ? `AND EXISTS (SELECT 1 FROM partmaster_offline_part_sources scoped_sources
+       WHERE scoped_sources.source_url = partmaster_offline_source_pages.source_url
+        AND scoped_sources.dataset_id IN (${datasetIds.map(quoteString).join(", ")}))`
+    : "";
   await withConnection((connection) => connection.run(
     "UPDATE partmaster_pipeline_jobs SET phase = 'checking_shared_sources' WHERE id = $jobId", { jobId },
   ));
@@ -2419,7 +2424,8 @@ async function checkOfflineSourcePages(jobId, budget) {
       const jobReader = await connection.runAndReadAll("SELECT status FROM partmaster_pipeline_jobs WHERE id = $jobId", { jobId });
       if (jobReader.getRowObjectsJson()[0]?.status !== "running") return null;
       const pageReader = await connection.runAndReadAll(
-        "SELECT * FROM partmaster_offline_source_pages WHERE status = 'pending' ORDER BY priority_score DESC LIMIT 1",
+        `SELECT * FROM partmaster_offline_source_pages WHERE status = 'pending' ${datasetScope}
+         ORDER BY priority_score DESC LIMIT 1`,
       );
       const page = pageReader.getRowObjectsJson()[0];
       if (!page) return null;
@@ -2524,7 +2530,8 @@ async function runFullPipeline(jobId) {
         },
       ));
       await extractOfflineAttributes(jobId);
-      await checkOfflineSourcePages(jobId, Math.max(0, Number(job.online_budget || 0) - Number(job.online_checked || 0)));
+      const scopedDatasetIds = String(job.dataset_ids || "").split(",").filter(Boolean);
+      await checkOfflineSourcePages(jobId, Math.max(0, Number(job.online_budget || 0) - Number(job.online_checked || 0)), scopedDatasetIds);
       await withConnection((connection) => connection.run(
         `UPDATE partmaster_pipeline_jobs SET status = 'completed', phase = 'completed',
          attributed_parts = (SELECT count(*) FROM partmaster_offline_parts WHERE extracted_attribute_count > 0),
@@ -3840,6 +3847,39 @@ app.get("/api/local/pipeline/catalog", asyncRoute(async (request, response) => {
     return { rows: rowsReader.getRowObjectsJson(), stats: statsReader.getRowObjectsJson()[0] };
   });
   response.json(result);
+}));
+
+app.get("/api/local/pipeline/sources", asyncRoute(async (_request, response) => {
+  const sources = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `WITH latest AS (
+        SELECT * EXCLUDE (rank) FROM (
+          SELECT datasets.*, row_number() OVER (PARTITION BY source_file ORDER BY
+           EXISTS (SELECT 1 FROM partmaster_offline_part_sources indexed WHERE indexed.dataset_id = datasets.id) DESC,
+           imported_at DESC) AS rank
+          FROM partmaster_datasets datasets
+        ) ranked WHERE rank = 1
+       )
+       SELECT latest.id AS dataset_id, latest.name, latest.source_file, latest.row_count AS raw_rows,
+        coalesce(sum(sources.occurrence_count), 0) AS usable_rows,
+        greatest(0, latest.row_count - coalesce(sum(sources.occurrence_count), 0)) AS invalid_rows,
+        count(DISTINCT sources.part_key) AS unique_parts,
+        count(DISTINCT sources.part_key) FILTER (WHERE parts.extracted_attribute_count > 0) AS parts_with_facts,
+        coalesce(sum(parts.extracted_attribute_count), 0) AS product_facts,
+        count(DISTINCT sources.part_key) FILTER (WHERE parts.online_status = 'verified') AS online_verified_parts,
+        count(DISTINCT nullif(trim(sources.source_url), '')) AS source_pages,
+        count(DISTINCT sources.source_url) FILTER (WHERE pages.status != 'pending') AS processed_source_pages,
+        count(DISTINCT sources.source_url) FILTER (WHERE pages.status = 'pending') AS pending_source_pages
+       FROM latest
+       LEFT JOIN partmaster_offline_part_sources sources ON sources.dataset_id = latest.id
+       LEFT JOIN partmaster_offline_parts parts ON parts.part_key = sources.part_key
+       LEFT JOIN partmaster_offline_source_pages pages ON pages.source_url = sources.source_url
+       GROUP BY latest.id, latest.name, latest.source_file, latest.row_count, latest.imported_at
+       ORDER BY latest.row_count DESC`,
+    );
+    return reader.getRowObjectsJson();
+  });
+  response.json({ sources });
 }));
 
 app.post("/api/local/pipeline/exports", asyncRoute(async (_request, response) => {
