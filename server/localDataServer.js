@@ -2403,6 +2403,15 @@ async function scanDatasetOffline(jobId, dataset) {
 
 async function rebuildOfflineCatalog(jobId) {
   return withConnection(async (connection) => {
+    // A source file can be re-imported under a new dataset id. Keep only its newest
+    // imported version so repeated imports do not inflate occurrence/duplicate totals.
+    await connection.run(
+      `DELETE FROM partmaster_offline_part_sources WHERE dataset_id IN (
+       SELECT id FROM (
+        SELECT id, row_number() OVER (PARTITION BY source_file ORDER BY imported_at DESC) AS version_rank
+        FROM partmaster_datasets
+       ) dataset_versions WHERE version_rank > 1)`,
+    );
     await connection.run("DELETE FROM partmaster_offline_parts");
     await connection.run(
       `INSERT INTO partmaster_offline_parts
@@ -4064,9 +4073,28 @@ app.get("/api/local/master-dashboard", asyncRoute(async (_request, response) => 
        count(*) FILTER (WHERE status = 'failed') AS failed_pages
        FROM partmaster_offline_source_pages`,
     );
+    const pipelineReader = await connection.runAndReadAll(
+      `SELECT total_rows, scanned_rows, invalid_rows, unique_parts, duplicates_removed,
+       attributed_parts, source_pages, online_checked
+       FROM partmaster_pipeline_jobs
+       WHERE mode = 'full' AND status = 'completed'
+       ORDER BY completed_at DESC LIMIT 1`,
+    );
+    const summary = summaryReader.getRowObjectsJson()[0];
+    const pipeline = pipelineReader.getRowObjectsJson()[0];
+    if (pipeline) {
+      summary.raw_rows = pipeline.total_rows;
+      summary.scanned_rows = pipeline.scanned_rows;
+      summary.raw_rows_remaining = Math.max(0, Number(pipeline.total_rows || 0) - Number(pipeline.scanned_rows || 0));
+      summary.invalid_rows = pipeline.invalid_rows;
+      summary.usable_occurrences = Math.max(0, Number(pipeline.total_rows || 0) - Number(pipeline.invalid_rows || 0));
+      summary.duplicate_occurrences = pipeline.duplicates_removed;
+      summary.master_parts_remaining = Math.max(0, Number(pipeline.unique_parts || 0) - Number(summary.unique_parts || 0));
+      summary.parts_missing_facts = Math.max(0, Number(summary.unique_parts || 0) - Number(summary.parts_with_facts || 0));
+    }
     return {
       generated_at: new Date().toISOString(),
-      summary: summaryReader.getRowObjectsJson()[0],
+      summary,
       source_pages: pagesReader.getRowObjectsJson()[0],
       manufacturers: manufacturerReader.getRowObjectsJson(),
       families: familyReader.getRowObjectsJson(),

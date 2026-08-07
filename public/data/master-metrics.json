@@ -1,51 +1,57 @@
 {
-  "generated_at": "2026-08-07T21:16:28.630Z",
+  "generated_at": "2026-08-07T22:34:25.494Z",
   "snapshot": true,
   "summary": {
-    "unique_parts": 573841,
-    "usable_occurrences": 64501335,
-    "duplicate_occurrences": 63927494,
+    "unique_parts": 573849,
+    "raw_rows": 79501473,
+    "scanned_rows": 79501473,
+    "raw_rows_remaining": 0,
+    "invalid_rows": 15000146,
+    "usable_occurrences": 64501327,
+    "duplicate_occurrences": 63927478,
+    "master_parts_remaining": 0,
     "manufacturers": 7,
-    "families": 11702,
+    "families": 18,
     "missing_descriptions": 16,
-    "general_parts": 157799,
-    "parts_with_facts": 177630,
-    "product_facts": 243880,
-    "online_verified_parts": 44781,
-    "high_confidence_parts": 44781,
+    "general_parts": 386637,
+    "parts_with_facts": 176721,
+    "parts_missing_facts": 397128,
+    "product_facts": 242127,
+    "online_verified_parts": 9252,
+    "high_confidence_parts": 9252,
     "low_confidence_parts": 16
   },
   "source_pages": {
-    "source_pages": 248402,
-    "pending_pages": 246686,
-    "processed_pages": 1716,
-    "failed_pages": 253
+    "source_pages": 342065,
+    "pending_pages": 341815,
+    "processed_pages": 250,
+    "failed_pages": 54
   },
   "manufacturers": [
-    { "label": "Honda", "parts": 152838, "with_facts": 44407, "verified": 13529 },
-    { "label": "Yamaha", "parts": 110079, "with_facts": 22280, "verified": 13519 },
-    { "label": "Suzuki", "parts": 89618, "with_facts": 29407, "verified": 7120 },
-    { "label": "Kawasaki", "parts": 79964, "with_facts": 24522, "verified": 5497 },
-    { "label": "BMW", "parts": 56570, "with_facts": 20310, "verified": 469 },
-    { "label": "Harley-Davidson", "parts": 46964, "with_facts": 23441, "verified": 0 },
-    { "label": "KTM", "parts": 37808, "with_facts": 13263, "verified": 4647 }
+    { "label": "Honda", "parts": 152838, "with_facts": 44350, "verified": 3177 },
+    { "label": "Yamaha", "parts": 110081, "with_facts": 22252, "verified": 2883 },
+    { "label": "Suzuki", "parts": 89618, "with_facts": 29358, "verified": 1236 },
+    { "label": "Kawasaki", "parts": 79970, "with_facts": 24453, "verified": 530 },
+    { "label": "BMW", "parts": 56570, "with_facts": 20134, "verified": 0 },
+    { "label": "Harley-Davidson", "parts": 46964, "with_facts": 23090, "verified": 0 },
+    { "label": "KTM", "parts": 37808, "with_facts": 13084, "verified": 1426 }
   ],
   "families": [
-    { "label": "General Part", "parts": 157799, "with_facts": 19968 },
-    { "label": "Fastener / Hardware", "parts": 50086, "with_facts": 50037 },
-    { "label": "Engine", "parts": 24235, "with_facts": 2310 },
-    { "label": "Brake System", "parts": 18030, "with_facts": 3935 },
-    { "label": "Suspension / Steering", "parts": 17999, "with_facts": 2073 },
-    { "label": "Cover", "parts": 17443, "with_facts": 6365 },
-    { "label": "Seal / Gasket", "parts": 16936, "with_facts": 16936 },
-    { "label": "Wheel", "parts": 12548, "with_facts": 3883 },
-    { "label": "Electrical / Sensor", "parts": 11854, "with_facts": 11854 },
-    { "label": "Bearing / Bushing", "parts": 9851, "with_facts": 9851 },
-    { "label": "Clutch", "parts": 7748, "with_facts": 2176 },
-    { "label": "Cooling / HVAC", "parts": 5697, "with_facts": 518 }
+    { "label": "General Part", "parts": 386637, "with_facts": 66255 },
+    { "label": "Fastener / Hardware", "parts": 50087, "with_facts": 50037 },
+    { "label": "Engine", "parts": 24327, "with_facts": 2314 },
+    { "label": "Brake System", "parts": 18035, "with_facts": 3925 },
+    { "label": "Suspension / Steering", "parts": 18015, "with_facts": 2073 },
+    { "label": "Seal / Gasket", "parts": 16949, "with_facts": 16949 },
+    { "label": "Wheel", "parts": 12552, "with_facts": 3885 },
+    { "label": "Electrical / Sensor", "parts": 11856, "with_facts": 11856 },
+    { "label": "Bearing / Bushing", "parts": 9855, "with_facts": 9855 },
+    { "label": "Clutch", "parts": 7762, "with_facts": 2182 },
+    { "label": "Cooling / HVAC", "parts": 5702, "with_facts": 519 },
+    { "label": "Paint / Chemical", "parts": 2004, "with_facts": 2004 }
   ],
   "evidence": [
-    { "label": "queued", "parts": 529060 },
-    { "label": "verified", "parts": 44781 }
+    { "label": "queued", "parts": 564597 },
+    { "label": "verified", "parts": 9252 }
   ]
 }

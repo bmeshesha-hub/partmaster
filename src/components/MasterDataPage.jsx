@@ -1,4 +1,4 @@
-import { BarChart3, ChevronLeft, ChevronRight, Database, ExternalLink, HardDrive, LoaderCircle, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
+import { BarChart3, CheckCircle2, ChevronLeft, ChevronRight, Database, ExternalLink, HardDrive, LoaderCircle, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { localDataApi } from "../utils/localDataApi.js";
 
@@ -35,8 +35,30 @@ export default function MasterDataPage() {
       setConnected(false);
       return;
     }
-    Promise.all([localDataApi.masterDashboard(), localDataApi.masterCatalogFilters()])
-      .then(([dashboard, availableFilters]) => { setMetrics(dashboard); setMetricSource("live"); setFilters(availableFilters); setConnected(true); })
+    Promise.all([localDataApi.masterDashboard(), localDataApi.masterCatalogFilters(), localDataApi.pipelineSources()])
+      .then(([dashboard, availableFilters, sourceAudit]) => {
+        const coverage = sourceAudit.summary || {};
+        const liveDashboard = {
+          ...dashboard,
+          summary: {
+            ...dashboard.summary,
+            raw_rows: coverage.known_raw_rows,
+            scanned_rows: coverage.indexed_raw_rows,
+            raw_rows_remaining: coverage.pending_scan_rows,
+            invalid_rows: coverage.invalid_rows,
+            duplicate_occurrences: Math.max(0, Number(coverage.usable_rows || 0) - Number(coverage.raw_unique_parts || 0)),
+            master_parts_remaining: coverage.remaining_master_parts,
+            parts_missing_facts: coverage.remaining_fact_parts,
+          },
+          source_pages: {
+            ...dashboard.source_pages,
+            source_pages: coverage.source_pages,
+            processed_pages: coverage.processed_source_pages,
+            pending_pages: coverage.pending_source_pages,
+          },
+        };
+        setMetrics(liveDashboard); setMetricSource("live"); setFilters(availableFilters); setConnected(true);
+      })
       .catch(() => setConnected(false));
   }, []);
 
@@ -56,6 +78,9 @@ export default function MasterDataPage() {
 
   const summary = metrics?.summary || {};
   const sourcePages = metrics?.source_pages || {};
+  const rawRowsRemaining = Number(summary.raw_rows_remaining || 0);
+  const masterPartsRemaining = Number(summary.master_parts_remaining || 0);
+  const partsMissingFacts = Number(summary.parts_missing_facts ?? Math.max(0, Number(summary.unique_parts || 0) - Number(summary.parts_with_facts || 0)));
   const visibleFamilies = useMemo(() => (metrics?.families || []).slice(0, 10), [metrics]);
   const updateQuery = (changes) => setQuery((current) => ({ ...current, ...changes, page: changes.page || 1 }));
 
@@ -63,6 +88,7 @@ export default function MasterDataPage() {
     <section className="overflow-hidden rounded-3xl bg-gradient-to-br from-slate-950 via-blue-950 to-emerald-950 text-white shadow-panel"><div className="flex flex-wrap items-start justify-between gap-5 px-6 py-7 sm:px-8"><div><p className="flex items-center gap-2 text-xs font-black uppercase tracking-[0.18em] text-cyan-300"><Database size={16} />Consolidated master catalog</p><h3 className="mt-2 text-3xl font-black tracking-tight">One searchable identity for every usable OEM part</h3><p className="mt-2 max-w-3xl text-sm leading-6 text-slate-300">Public metrics are lightweight and safe for GitHub Pages. The detailed catalog stays on this Mac and is queried page-by-page only when the local worker is connected.</p></div><div className="text-right"><div className={`rounded-full px-3 py-1.5 text-xs font-black ${metricSource === "live" ? "bg-emerald-400 text-emerald-950" : "bg-white/10 text-slate-200"}`}>{metricSource === "live" ? "Live local metrics" : "Published snapshot"}</div>{metrics?.generated_at && <p className="mt-2 text-[10px] font-semibold text-slate-400">Updated {new Date(metrics.generated_at).toLocaleString()}</p>}</div></div></section>
 
     {!metrics ? <div className="grid min-h-48 place-items-center rounded-3xl border border-slate-200 bg-white"><LoaderCircle className="animate-spin text-brand-600" size={28} /></div> : <>
+      {summary.raw_rows != null && <section className="overflow-hidden rounded-3xl border border-blue-200 bg-white shadow-panel"><header className="flex flex-wrap items-start justify-between gap-3 border-b border-blue-100 bg-blue-50 px-5 py-4 sm:px-6"><div><p className="text-xs font-black uppercase tracking-[0.16em] text-blue-700">Raw data → master status</p><h3 className="mt-1 text-xl font-black text-slate-950">All raw rows are accounted for</h3><p className="mt-1 text-sm text-slate-600">Raw rows and unique master parts are different units. This equation shows where every source row went.</p></div><span className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-black ${rawRowsRemaining || masterPartsRemaining ? "bg-amber-100 text-amber-800" : "bg-emerald-100 text-emerald-800"}`}><CheckCircle2 size={15} />{rawRowsRemaining ? `${number(rawRowsRemaining)} rows await scanning` : masterPartsRemaining ? `${number(masterPartsRemaining)} parts await master` : "Raw consolidation complete"}</span></header><div className="grid gap-2 p-5 sm:p-6 lg:grid-cols-[1fr_auto_1fr_auto_1fr_auto_1fr] lg:items-center"><MetricCard label="Raw source rows" value={summary.raw_rows} detail={`${number(summary.scanned_rows)} scanned · ${number(rawRowsRemaining)} waiting`} /><span className="text-center text-xl font-black text-slate-300">−</span><MetricCard label="Invalid rows held out" value={summary.invalid_rows} detail="No usable manufacturer + OEM identity" tone="text-amber-700" /><span className="text-center text-xl font-black text-slate-300">−</span><MetricCard label="Duplicate occurrences" value={summary.duplicate_occurrences} detail="Repeated appearances consolidated" tone="text-brand-700" /><span className="text-center text-xl font-black text-slate-300">=</span><MetricCard label="Unique parts in master" value={summary.unique_parts} detail={`${number(masterPartsRemaining)} known identities missing from master`} tone="text-emerald-700" /></div><footer className="grid gap-2 border-t border-slate-200 bg-slate-50 px-5 py-4 text-sm sm:grid-cols-2 sm:px-6"><p className="font-bold text-emerald-800"><span className="font-black">Consolidation remaining:</span> {number(rawRowsRemaining)} raw rows and {number(masterPartsRemaining)} known master parts.</p><p className="font-bold text-violet-800"><span className="font-black">Enrichment remaining:</span> {number(partsMissingFacts)} parts need product facts and {number(sourcePages.pending_pages)} linked pages need checking.</p></footer></section>}
       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6"><MetricCard label="Unique parts" value={summary.unique_parts} detail="Manufacturer + normalized OEM identity" /><MetricCard label="Duplicates consolidated" value={summary.duplicate_occurrences} detail="Occurrences preserved as traceability" tone="text-brand-700" /><MetricCard label="Parts with facts" value={summary.parts_with_facts} detail={`${percent(summary.parts_with_facts, summary.unique_parts)} have extracted product attributes`} tone="text-emerald-700" /><MetricCard label="Product facts" value={summary.product_facts} detail="Category-aware structured attributes" /><MetricCard label="Online verified" value={summary.online_verified_parts} detail={`${percent(summary.online_verified_parts, summary.unique_parts)} supported by linked pages`} tone="text-cyan-700" /><MetricCard label="Missing descriptions" value={summary.missing_descriptions} detail="Held visible for repair—not guessed" tone="text-amber-700" /></section>
       <div className="grid gap-6 lg:grid-cols-2"><Bars title="Parts by manufacturer" subtitle="Deduplicated identities; public snapshot contains counts only." rows={metrics.manufacturers} /><Bars title="Largest part families" subtitle="The detailed rows and attribute JSON remain local." rows={visibleFamilies} accent="bg-emerald-500" /></div>
       <section className="grid gap-4 rounded-3xl border border-slate-200 bg-white p-5 shadow-panel sm:grid-cols-2 sm:p-6 lg:grid-cols-4"><div><p className="text-xs font-black uppercase tracking-wide text-slate-500">Source pages</p><p className="mt-1 text-2xl font-black">{number(sourcePages.source_pages)}</p></div><div><p className="text-xs font-black uppercase tracking-wide text-emerald-700">Processed pages</p><p className="mt-1 text-2xl font-black text-emerald-700">{number(sourcePages.processed_pages)}</p></div><div><p className="text-xs font-black uppercase tracking-wide text-cyan-700">High confidence</p><p className="mt-1 text-2xl font-black text-cyan-700">{number(summary.high_confidence_parts)}</p></div><div><p className="text-xs font-black uppercase tracking-wide text-amber-700">General/unclassified</p><p className="mt-1 text-2xl font-black text-amber-700">{number(summary.general_parts)}</p></div></section>
