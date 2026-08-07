@@ -9,6 +9,9 @@ const APP_ROOT = resolve(import.meta.dirname, "..");
 const DATA_ROOT = join(APP_ROOT, "local_data");
 const INBOX_ROOT = join(DATA_ROOT, "inbox");
 const EXPORT_ROOT = join(DATA_ROOT, "exports");
+const REFERENCE_ROOT = join(DATA_ROOT, "reference");
+const VEHICLE_MASTER_PATH = join(REFERENCE_ROOT, "vehicle_master.csv");
+const VEHICLE_ALIASES_PATH = join(REFERENCE_ROOT, "vehicle_source_aliases.csv");
 const DATABASE_PATH = resolve(process.env.PARTMASTER_DATABASE_PATH || join(DATA_ROOT, "partmaster.duckdb"));
 const PORT = Number(process.env.PARTMASTER_DATA_PORT || 8787);
 const importJobs = new Map();
@@ -24,6 +27,7 @@ const ENRICHMENT_MAX_PAGE_BYTES = Math.max(100000, Number(process.env.PARTMASTER
 await Promise.all([
   mkdir(INBOX_ROOT, { recursive: true }),
   mkdir(EXPORT_ROOT, { recursive: true }),
+  mkdir(REFERENCE_ROOT, { recursive: true }),
 ]);
 
 const instance = await DuckDBInstance.create(DATABASE_PATH, {
@@ -254,6 +258,33 @@ await withConnection((connection) => connection.run(`
     UNIQUE (job_id, row_id)
   );
 
+  CREATE TABLE IF NOT EXISTS partmaster_vehicle_master (
+    epid VARCHAR PRIMARY KEY,
+    year VARCHAR,
+    make_name VARCHAR,
+    model_name VARCHAR,
+    trim_name VARCHAR,
+    vehicle_type VARCHAR,
+    year_norm VARCHAR,
+    make_norm VARCHAR,
+    model_norm VARCHAR,
+    loaded_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_vehicle_source_aliases (
+    epid VARCHAR NOT NULL,
+    source VARCHAR NOT NULL,
+    year VARCHAR,
+    make_name VARCHAR,
+    model_name VARCHAR,
+    trim_name VARCHAR,
+    year_norm VARCHAR,
+    make_norm VARCHAR,
+    model_norm VARCHAR,
+    loaded_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (epid, source, year, make_name, model_name, trim_name)
+  );
+
   CREATE INDEX IF NOT EXISTS enrichment_candidates_job_status_idx
     ON partmaster_enrichment_candidates (job_id, status);
   CREATE INDEX IF NOT EXISTS canonical_parts_lookup_idx
@@ -265,7 +296,13 @@ await withConnection((connection) => connection.run(`
   CREATE INDEX IF NOT EXISTS part_compatibility_part_idx
     ON partmaster_part_compatibility (part_id);
   CREATE INDEX IF NOT EXISTS row_enhancement_items_job_idx
-    ON partmaster_row_enhancement_items (job_id, status)
+    ON partmaster_row_enhancement_items (job_id, status);
+  CREATE INDEX IF NOT EXISTS vehicle_master_text_idx
+    ON partmaster_vehicle_master (year_norm, make_norm, model_norm);
+  CREATE INDEX IF NOT EXISTS vehicle_alias_text_idx
+    ON partmaster_vehicle_source_aliases (year_norm, make_norm, model_norm);
+  CREATE INDEX IF NOT EXISTS vehicle_alias_epid_idx
+    ON partmaster_vehicle_source_aliases (epid)
 `));
 
 await withConnection((connection) => connection.run(`
@@ -285,12 +322,27 @@ await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS excluded_options VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS variant_summary VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS fitment_explanation VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS epid VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_year VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_make VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_model VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_trim VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_type VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_mapping_method VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_mapping_confidence DOUBLE;
   ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS family_id VARCHAR;
   ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS component_scope VARCHAR;
   ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS variant_summary VARCHAR;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS required_options VARCHAR;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS excluded_options VARCHAR;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS fitment_explanation VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS epid VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_make VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_model VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_trim VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_type VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_mapping_method VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_mapping_confidence DOUBLE;
   CREATE UNIQUE INDEX IF NOT EXISTS part_applications_key_idx
     ON partmaster_part_applications (application_key);
   CREATE INDEX IF NOT EXISTS canonical_parts_family_idx
@@ -394,6 +446,125 @@ function normalizePartNumber(value) {
 
 function normalizeApplicationValue(value) {
   return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+async function loadVehicleMappingReferences() {
+  try {
+    await Promise.all([stat(VEHICLE_MASTER_PATH), stat(VEHICLE_ALIASES_PATH)]);
+  } catch {
+    return { loaded: false, reason: "Extract Vehicle Mapping ePID.xlsx to create the optional reference CSVs." };
+  }
+  return withConnection(async (connection) => {
+    await connection.run("BEGIN TRANSACTION");
+    try {
+      await connection.run("DELETE FROM partmaster_vehicle_source_aliases");
+      await connection.run("DELETE FROM partmaster_vehicle_master");
+      await connection.run(
+        `INSERT INTO partmaster_vehicle_master
+         (epid, year, make_name, model_name, trim_name, vehicle_type, year_norm, make_norm, model_norm)
+         SELECT trim(epid), trim("year"), trim("make"), trim(model), trim("trim"), trim(vehicle_type),
+          upper(regexp_replace(trim("year"), '[^A-Za-z0-9]', '', 'g')),
+          upper(regexp_replace(trim("make"), '[^A-Za-z0-9]', '', 'g')),
+          upper(regexp_replace(trim(model), '[^A-Za-z0-9]', '', 'g'))
+         FROM read_csv($path, header = true, all_varchar = true, normalize_names = false,
+          quote = '"', escape = '"', strict_mode = true)`,
+        { path: VEHICLE_MASTER_PATH },
+      );
+      await connection.run(
+        `INSERT INTO partmaster_vehicle_source_aliases
+         (epid, source, year, make_name, model_name, trim_name, year_norm, make_norm, model_norm)
+         SELECT trim(epid), trim("source"), trim("year"), trim("make"), trim(model), trim("trim"),
+          upper(regexp_replace(trim("year"), '[^A-Za-z0-9]', '', 'g')),
+          upper(regexp_replace(trim("make"), '[^A-Za-z0-9]', '', 'g')),
+          upper(regexp_replace(trim(model), '[^A-Za-z0-9]', '', 'g'))
+         FROM read_csv($path, header = true, all_varchar = true, normalize_names = false,
+          quote = '"', escape = '"', strict_mode = true)`,
+        { path: VEHICLE_ALIASES_PATH },
+      );
+      await connection.run("COMMIT");
+    } catch (error) {
+      await connection.run("ROLLBACK");
+      throw error;
+    }
+    const reader = await connection.runAndReadAll(
+      `SELECT (SELECT count(*) FROM partmaster_vehicle_master) AS vehicles,
+       (SELECT count(*) FROM partmaster_vehicle_source_aliases) AS aliases`,
+    );
+    const counts = reader.getRowObjectsJson()[0];
+    return { loaded: true, vehicles: counts.vehicles, aliases: counts.aliases };
+  });
+}
+
+async function vehicleMappingStats() {
+  return withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT (SELECT count(*) FROM partmaster_vehicle_master) AS vehicles,
+       (SELECT count(*) FROM partmaster_vehicle_source_aliases) AS aliases,
+       (SELECT count(DISTINCT epid) FROM partmaster_vehicle_source_aliases) AS mapped_vehicles,
+       (SELECT max(loaded_at) FROM partmaster_vehicle_master) AS loaded_at`,
+    );
+    return reader.getRowObjectsJson()[0];
+  });
+}
+
+async function lookupVehicleMapping({ epid, year, make, model }) {
+  const exactEpid = String(epid || "").trim();
+  return withConnection(async (connection) => {
+    let matchedEpid = exactEpid;
+    let method = exactEpid ? "exact_epid" : null;
+    let confidence = exactEpid ? 1 : 0;
+    if (!matchedEpid && year && make && model) {
+      const yearNorm = normalizeApplicationValue(year);
+      const makeNorm = normalizeApplicationValue(make);
+      const modelNorm = normalizeApplicationValue(model);
+      const candidateReader = await connection.runAndReadAll(
+        `SELECT DISTINCT epid FROM (
+          SELECT epid FROM partmaster_vehicle_master
+          WHERE year_norm = $year AND make_norm = $make AND model_norm = $model
+          UNION
+          SELECT epid FROM partmaster_vehicle_source_aliases
+          WHERE year_norm = $year AND make_norm = $make AND model_norm = $model
+        ) matches LIMIT 2`,
+        { year: yearNorm, make: makeNorm, model: modelNorm },
+      );
+      const candidates = candidateReader.getRowObjectsJson();
+      if (candidates.length === 1) {
+        matchedEpid = candidates[0].epid;
+        method = "unique_vehicle_text";
+        confidence = 0.92;
+      }
+    }
+    if (!matchedEpid) return null;
+    const reader = await connection.runAndReadAll(
+      `SELECT master.epid, master.year, master.make_name, master.model_name, master.trim_name,
+       master.vehicle_type, count(DISTINCT aliases.source) AS source_count,
+       string_agg(DISTINCT aliases.source, ', ' ORDER BY aliases.source) AS sources
+       FROM partmaster_vehicle_master master
+       LEFT JOIN partmaster_vehicle_source_aliases aliases ON aliases.epid = master.epid
+       WHERE master.epid = $epid
+       GROUP BY master.epid, master.year, master.make_name, master.model_name, master.trim_name, master.vehicle_type`,
+      { epid: matchedEpid },
+    );
+    const vehicle = reader.getRowObjectsJson()[0];
+    return vehicle ? { ...vehicle, method, confidence } : null;
+  });
+}
+
+function applyVehicleMapping(update, vehicle, candidate = {}) {
+  if (!vehicle) return { ...update, epid: candidate.epid || update.epid || null };
+  const mappingExplanation = `Vehicle mapping: ${vehicle.year} ${vehicle.make_name} ${vehicle.model_name}${vehicle.trim_name && vehicle.trim_name !== "--" ? ` ${vehicle.trim_name}` : ""} (${vehicle.method === "exact_epid" ? "exact ePID" : "unique text match"}).`;
+  return {
+    ...update,
+    epid: vehicle.epid,
+    vehicleYear: vehicle.year,
+    vehicleMake: vehicle.make_name,
+    vehicleModel: vehicle.model_name,
+    vehicleTrim: vehicle.trim_name && vehicle.trim_name !== "--" ? vehicle.trim_name : null,
+    vehicleType: vehicle.vehicle_type,
+    vehicleMappingMethod: vehicle.method,
+    vehicleMappingConfidence: vehicle.confidence,
+    fitmentExplanation: [update.fitmentExplanation, mappingExplanation].filter(Boolean).join(" "),
+  };
 }
 
 function titleCase(value) {
@@ -688,6 +859,23 @@ function suggestedRowChanges(row, columns, item, sourceUrl) {
   return changes;
 }
 
+function suggestedVehicleChanges(row, columns, vehicle) {
+  if (!vehicle) return {};
+  const changes = {};
+  const add = (column, value) => {
+    if (columns.includes(column) && missingValue(row[column]) && !missingValue(value)) changes[column] = String(value);
+  };
+  add("epid", vehicle.epid);
+  add("year", vehicle.year);
+  add("brand", vehicle.make_name);
+  add("make", vehicle.make_name);
+  add("manufacturer", vehicle.make_name);
+  add("model", vehicle.model_name);
+  add("trim", vehicle.trim_name);
+  add("vehicle_type", vehicle.vehicle_type);
+  return changes;
+}
+
 async function previewRowEnhancement(datasetId, rowId) {
   const context = await withConnection(async (connection) => {
     const dataset = await getDataset(connection, datasetId);
@@ -704,13 +892,41 @@ async function previewRowEnhancement(datasetId, rowId) {
     }
     return { dataset, columns, row };
   });
+  const vehicleMapping = await lookupVehicleMapping({
+    epid: context.row.epid,
+    year: context.row.year,
+    make: context.row.brand || context.row.make || context.row.manufacturer,
+    model: context.row.model || context.row.model_name,
+  });
+  const vehicleChanges = suggestedVehicleChanges(context.row, context.columns, vehicleMapping);
+  const vehicleReason = vehicleMapping
+    ? `Vehicle mapped by ${vehicleMapping.method === "exact_epid" ? "exact ePID" : "a unique exact year/make/model alias"} to ${vehicleMapping.year} ${vehicleMapping.make_name} ${vehicleMapping.model_name}.`
+    : "No unique vehicle mapping was available; online enrichment can continue normally.";
   const sourceUrl = String(context.row.url || context.row.source_url || "").trim();
-  if (!sourceUrl) return { ...context, sourceUrl: "", changes: {}, confidence: 0, reason: "This row has no source URL." };
-  if (!isSafeEvidenceUrl(sourceUrl)) return { ...context, sourceUrl, changes: {}, confidence: 0, reason: "This row does not contain a permitted public source URL." };
-  const page = await getEvidencePage(sourceUrl);
+  if (!sourceUrl) return { ...context, sourceUrl: "", changes: vehicleChanges, confidence: vehicleMapping?.confidence || 0, reason: vehicleReason, vehicleMapping };
+  if (!isSafeEvidenceUrl(sourceUrl)) return { ...context, sourceUrl, changes: vehicleChanges, confidence: vehicleMapping?.confidence || 0, reason: vehicleReason, vehicleMapping };
+  let page;
+  try {
+    page = await getEvidencePage(sourceUrl);
+  } catch (error) {
+    if (!vehicleMapping) throw error;
+    return {
+      ...context,
+      sourceUrl,
+      changes: vehicleChanges,
+      confidence: vehicleMapping.confidence,
+      reason: `${vehicleReason} The online source could not be checked: ${error.message}`,
+      vehicleMapping,
+    };
+  }
   const items = extractCatalogItems(page.html);
   const match = matchCatalogItem(context.row, items);
-  const changes = match.item ? suggestedRowChanges(context.row, context.columns, match.item, page.finalUrl || sourceUrl) : {};
+  const catalogChanges = match.item ? suggestedRowChanges(context.row, context.columns, match.item, page.finalUrl || sourceUrl) : {};
+  const changes = { ...vehicleChanges, ...catalogChanges };
+  const confidences = [
+    Object.keys(vehicleChanges).length ? vehicleMapping?.confidence : null,
+    Object.keys(catalogChanges).length ? match.confidence : null,
+  ].filter((value) => value != null);
   return {
     ...context,
     sourceUrl: page.finalUrl || sourceUrl,
@@ -718,8 +934,9 @@ async function previewRowEnhancement(datasetId, rowId) {
     catalogItemCount: items.length,
     matchedItem: match.item,
     changes,
-    confidence: match.confidence,
-    reason: match.reason,
+    confidence: confidences.length ? Math.min(...confidences) : Math.max(match.confidence, vehicleMapping?.confidence || 0),
+    reason: [match.reason, vehicleMapping ? vehicleReason : null].filter(Boolean).join(" "),
+    vehicleMapping,
   };
 }
 
@@ -1152,8 +1369,9 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
 
   const applicationKey = [
     partId,
-    candidate.year,
-    candidate.model,
+    candidate.epid,
+    candidate.vehicle_year || candidate.year,
+    candidate.vehicle_model || candidate.model,
     candidate.assembly,
     candidate.item_number,
     candidate.side,
@@ -1170,8 +1388,15 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
     partId,
     datasetId: candidate.dataset_id,
     sourceRowId: candidate.source_row_id,
-    year: candidate.year || null,
-    model: candidate.model || null,
+    epid: candidate.epid || null,
+    year: candidate.vehicle_year || candidate.year || null,
+    model: candidate.vehicle_model || candidate.model || null,
+    vehicleMake: candidate.vehicle_make || null,
+    vehicleModel: candidate.vehicle_model || null,
+    vehicleTrim: candidate.vehicle_trim || null,
+    vehicleType: candidate.vehicle_type || null,
+    vehicleMappingMethod: candidate.vehicle_mapping_method || null,
+    vehicleMappingConfidence: candidate.vehicle_mapping_confidence || null,
     assembly: candidate.assembly || null,
     itemNumber: candidate.item_number || null,
     side: candidate.side || "Unknown",
@@ -1188,15 +1413,25 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
   if (applicationId) {
     await connection.run(
       `UPDATE partmaster_part_applications SET
-       year = $year, model = $model, assembly = $assembly, item_number = $itemNumber,
+       epid = $epid, year = $year, model = $model, vehicle_make = $vehicleMake,
+       vehicle_model = $vehicleModel, vehicle_trim = $vehicleTrim, vehicle_type = $vehicleType,
+       vehicle_mapping_method = $vehicleMappingMethod, vehicle_mapping_confidence = $vehicleMappingConfidence,
+       assembly = $assembly, item_number = $itemNumber,
        side = $side, position = $position, location_notes = $locationNotes, quantity = $quantity,
        source_url = $sourceUrl, evidence_url = $evidenceUrl, required_options = $requiredOptions,
        excluded_options = $excludedOptions, fitment_explanation = $fitmentExplanation, confidence = $confidence,
        updated_at = current_timestamp WHERE id = $id`,
       {
         id: applicationValues.id,
+        epid: applicationValues.epid,
         year: applicationValues.year,
         model: applicationValues.model,
+        vehicleMake: applicationValues.vehicleMake,
+        vehicleModel: applicationValues.vehicleModel,
+        vehicleTrim: applicationValues.vehicleTrim,
+        vehicleType: applicationValues.vehicleType,
+        vehicleMappingMethod: applicationValues.vehicleMappingMethod,
+        vehicleMappingConfidence: applicationValues.vehicleMappingConfidence,
         assembly: applicationValues.assembly,
         itemNumber: applicationValues.itemNumber,
         side: applicationValues.side,
@@ -1214,9 +1449,11 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
   } else {
     await connection.run(
       `INSERT INTO partmaster_part_applications
-       (id, application_key, part_id, dataset_id, source_row_id, year, model, assembly, item_number, side, position,
+       (id, application_key, part_id, dataset_id, source_row_id, epid, year, model, vehicle_make, vehicle_model,
+        vehicle_trim, vehicle_type, vehicle_mapping_method, vehicle_mapping_confidence, assembly, item_number, side, position,
         location_notes, quantity, source_url, evidence_url, required_options, excluded_options, fitment_explanation, confidence)
-       VALUES ($id, $applicationKey, $partId, $datasetId, $sourceRowId, $year, $model, $assembly, $itemNumber, $side,
+       VALUES ($id, $applicationKey, $partId, $datasetId, $sourceRowId, $epid, $year, $model, $vehicleMake, $vehicleModel,
+        $vehicleTrim, $vehicleType, $vehicleMappingMethod, $vehicleMappingConfidence, $assembly, $itemNumber, $side,
         $position, $locationNotes, $quantity, $sourceUrl, $evidenceUrl, $requiredOptions, $excludedOptions,
         $fitmentExplanation, $confidence)`,
       applicationValues,
@@ -1359,6 +1596,7 @@ async function createEnrichmentJob(options) {
     const description = firstColumnExpression(columns, ["part_name", "description"]);
     const quantity = firstColumnExpression(columns, ["quantity", "qty", "quatity"]);
     const sourceUrl = firstColumnExpression(columns, ["url", "source_url"]);
+    const epid = firstColumnExpression(columns, ["epid", "e_pid"]);
     const scanLimit = Math.min(500000, Math.max(requestedCandidates * 30, requestedCandidates));
     const query = `
       WITH source_rows AS (
@@ -1372,7 +1610,8 @@ async function createEnrichmentJob(options) {
           ${partNumber} AS part_number_raw,
           ${description} AS description_raw,
           ${quantity} AS quantity,
-          ${sourceUrl} AS source_url
+          ${sourceUrl} AS source_url,
+          ${epid} AS epid
         FROM ${quoteIdentifier(dataset.table_name)} source
         WHERE _row_id > $startRowId
           AND (${partNumber} IS NOT NULL OR ${description} IS NOT NULL)
@@ -1423,9 +1662,9 @@ async function createEnrichmentJob(options) {
         await connection.run(
           `INSERT INTO partmaster_enrichment_candidates
            (id, job_id, dataset_id, source_row_id, manufacturer_raw, manufacturer_norm, year, model,
-            assembly, item_number, part_number_raw, part_number_norm, description_raw, quantity, source_url)
+            assembly, item_number, part_number_raw, part_number_norm, description_raw, quantity, source_url, epid)
            VALUES ($id, $jobId, $datasetId, $sourceRowId, $manufacturerRaw, $manufacturerNorm, $year, $model,
-            $assembly, $itemNumber, $partNumberRaw, $partNumberNorm, $descriptionRaw, $quantity, $sourceUrl)`,
+            $assembly, $itemNumber, $partNumberRaw, $partNumberNorm, $descriptionRaw, $quantity, $sourceUrl, $epid)`,
           {
             id: randomUUID(),
             jobId,
@@ -1442,6 +1681,7 @@ async function createEnrichmentJob(options) {
             descriptionRaw: candidate.description_raw || null,
             quantity: candidate.quantity || null,
             sourceUrl: candidate.source_url || null,
+            epid: candidate.epid || null,
           },
         );
       }
@@ -1498,7 +1738,13 @@ async function findExistingVariantConflicts(candidate, result) {
 
 async function processEnrichmentCandidate(candidate, threshold) {
   const localLocation = inferLocation(candidate.description_raw, candidate.assembly, candidate.item_number);
-  let update = applyVariantIntelligence({
+  const vehicleMapping = await lookupVehicleMapping({
+    epid: candidate.epid,
+    year: candidate.year,
+    make: candidate.manufacturer_raw,
+    model: candidate.model,
+  });
+  let update = applyVehicleMapping(applyVariantIntelligence({
     enrichedPartNumber: candidate.part_number_raw || null,
     enrichedDescription: candidate.description_raw || null,
     side: localLocation.side,
@@ -1509,17 +1755,26 @@ async function processEnrichmentCandidate(candidate, threshold) {
     confidence: candidate.part_number_norm && candidate.description_raw ? 0.6 : 0.35,
     status: "needs_review",
     decision: null,
-  }, inferVariantIntelligence(candidate), candidate);
+  }, inferVariantIntelligence(candidate), candidate), vehicleMapping, candidate);
 
   if (!candidate.source_url) {
     if (!candidate.part_number_norm) update.status = "not_found";
     return update;
   }
 
-  const { html, finalUrl } = await getEvidencePage(candidate.source_url);
+  let html;
+  let finalUrl;
+  try {
+    ({ html, finalUrl } = await getEvidencePage(candidate.source_url));
+  } catch (error) {
+    if (!vehicleMapping) throw error;
+    update.decision = `Vehicle mapping was saved, but the online part source could not be checked: ${error.message}`;
+    update.status = candidate.part_number_norm ? "needs_review" : "not_found";
+    return update;
+  }
   const evidence = extractPageEvidence(html, candidate.part_number_raw);
   const evidenceLocation = inferLocation(evidence.description, evidence.title);
-  update = applyVariantIntelligence({
+  update = applyVehicleMapping(applyVariantIntelligence({
     ...update,
     enrichedPartNumber: candidate.part_number_raw || evidence.productNumber || null,
     enrichedDescription: evidence.description || candidate.description_raw || null,
@@ -1527,7 +1782,7 @@ async function processEnrichmentCandidate(candidate, threshold) {
     position: evidenceLocation.position || localLocation.position || (candidate.item_number ? `Position ${candidate.item_number}` : null),
     evidenceUrl: finalUrl,
     evidenceTitle: evidence.title || null,
-  }, inferVariantIntelligence(candidate, evidence.description), candidate);
+  }, inferVariantIntelligence(candidate, evidence.description), candidate), vehicleMapping, candidate);
 
   const onlinePartNorm = normalizePartNumber(evidence.productNumber);
   if (candidate.part_number_norm && onlinePartNorm && onlinePartNorm !== candidate.part_number_norm) {
@@ -1630,6 +1885,10 @@ async function runEnrichmentJob(jobId) {
                turn_signal_state = $turnSignalState, connector_pins = $connectorPins,
                required_options = $requiredOptions, excluded_options = $excludedOptions,
                variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation,
+               epid = $epid, vehicle_year = $vehicleYear, vehicle_make = $vehicleMake,
+               vehicle_model = $vehicleModel, vehicle_trim = $vehicleTrim, vehicle_type = $vehicleType,
+               vehicle_mapping_method = $vehicleMappingMethod,
+               vehicle_mapping_confidence = $vehicleMappingConfidence,
                confidence = $confidence, status = $status, decision_notes = $decision,
                processed_at = current_timestamp
                WHERE id = $id`,
@@ -1656,6 +1915,14 @@ async function runEnrichmentJob(jobId) {
                 excludedOptions: result.excludedOptions,
                 variantSummary: result.variantSummary,
                 fitmentExplanation: result.fitmentExplanation,
+                epid: result.epid,
+                vehicleYear: result.vehicleYear,
+                vehicleMake: result.vehicleMake,
+                vehicleModel: result.vehicleModel,
+                vehicleTrim: result.vehicleTrim,
+                vehicleType: result.vehicleType,
+                vehicleMappingMethod: result.vehicleMappingMethod,
+                vehicleMappingConfidence: result.vehicleMappingConfidence,
                 confidence: result.confidence,
                 status: result.status,
                 decision: result.decision,
@@ -1683,6 +1950,14 @@ async function runEnrichmentJob(jobId) {
                 excluded_options: result.excludedOptions,
                 variant_summary: result.variantSummary,
                 fitment_explanation: result.fitmentExplanation,
+                epid: result.epid,
+                vehicle_year: result.vehicleYear,
+                vehicle_make: result.vehicleMake,
+                vehicle_model: result.vehicleModel,
+                vehicle_trim: result.vehicleTrim,
+                vehicle_type: result.vehicleType,
+                vehicle_mapping_method: result.vehicleMappingMethod,
+                vehicle_mapping_confidence: result.vehicleMappingConfidence,
                 confidence: result.confidence,
               } }, "online_verified");
             }
@@ -1917,6 +2192,18 @@ app.get("/api/local/health", (_request, response) => {
   response.json({ ok: true, dataRoot: DATA_ROOT, databasePath: DATABASE_PATH });
 });
 
+app.get("/api/local/vehicle-mappings", asyncRoute(async (_request, response) => {
+  const stats = await vehicleMappingStats();
+  response.json({
+    available: Number(stats.vehicles) > 0,
+    vehicles: stats.vehicles,
+    mappedVehicles: stats.mapped_vehicles,
+    aliases: stats.aliases,
+    loadedAt: stats.loaded_at,
+    referenceRoot: REFERENCE_ROOT,
+  });
+}));
+
 app.post("/api/local/open-folder", (_request, response) => {
   const child = spawn("open", [INBOX_ROOT], { detached: true, stdio: "ignore" });
   child.unref();
@@ -2014,6 +2301,7 @@ app.post("/api/local/datasets/:id/rows/:rowId/enhance", asyncRoute(async (reques
     evidenceUrl: preview.sourceUrl || null,
     evidenceTitle: preview.pageTitle || null,
     matchedItem: preview.matchedItem || null,
+    vehicleMapping: preview.vehicleMapping || null,
     catalogItemCount: preview.catalogItemCount || 0,
     applied: Boolean(request.body.apply && preview.confidence >= 0.94 && Object.keys(preview.changes).length),
   });
@@ -2519,7 +2807,14 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
        parts.description AS "Description", applications.item_number AS "Item #",
        applications.side AS "Side", applications.position AS "Position",
        applications.location_notes AS "Location Notes", applications.year AS "Year",
-       applications.model AS "Model", applications.assembly AS "Assembly",
+       applications.model AS "Model", applications.epid AS "ePID",
+       applications.vehicle_make AS "Canonical Vehicle Make",
+       applications.vehicle_model AS "Canonical Vehicle Model",
+       applications.vehicle_trim AS "Canonical Vehicle Trim",
+       applications.vehicle_type AS "Vehicle Type",
+       applications.vehicle_mapping_method AS "Vehicle Mapping Method",
+       applications.vehicle_mapping_confidence AS "Vehicle Mapping Confidence",
+       applications.assembly AS "Assembly",
        applications.quantity AS "Quantity", applications.source_url AS "Source URL",
        applications.required_options AS "Required Options", applications.excluded_options AS "Excluded Options",
        applications.fitment_explanation AS "Why It Fits", applications.evidence_url AS "Evidence URL",
@@ -2567,6 +2862,7 @@ app.use((error, _request, response, _next) => {
   response.status(error.status || 500).json({ error: error.message || "Local data service error." });
 });
 
+const vehicleMappingLoadResult = await loadVehicleMappingReferences().catch((error) => ({ loaded: false, reason: error.message }));
 await backfillVariantIntelligence();
 
 const resumableJobIds = await withConnection(async (connection) => {
@@ -2585,6 +2881,11 @@ const resumableRowEnhancementJobIds = await withConnection(async (connection) =>
 const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`Partmaster local data service: http://127.0.0.1:${PORT}`);
   console.log(`Local data directory: ${DATA_ROOT}`);
+  if (vehicleMappingLoadResult.loaded) {
+    console.log(`Vehicle mapping reference: ${Number(vehicleMappingLoadResult.vehicles).toLocaleString()} vehicles, ${Number(vehicleMappingLoadResult.aliases).toLocaleString()} source aliases`);
+  } else {
+    console.log(`Vehicle mapping reference not loaded: ${vehicleMappingLoadResult.reason}`);
+  }
   resumableJobIds.forEach(scheduleEnrichmentJob);
   resumableRowEnhancementJobIds.forEach(scheduleRowEnhancementJob);
 });

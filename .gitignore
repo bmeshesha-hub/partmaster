@@ -4,6 +4,8 @@ dist/
 .env.local
 .DS_Store
 npm-debug.log*
+__pycache__/
+*.pyc
 
 # Local-only large data. Raw CSVs, DuckDB files, and exports must never be
 # committed or uploaded to GitHub.

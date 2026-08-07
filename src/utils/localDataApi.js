@@ -14,6 +14,7 @@ export const localDataApi = {
   health: () => request("/health"),
   files: () => request("/files"),
   datasets: () => request("/datasets"),
+  vehicleMappings: () => request("/vehicle-mappings"),
   openFolder: () => request("/open-folder", { method: "POST", body: "{}" }),
   startImport: (filename, name) => request("/imports", { method: "POST", body: JSON.stringify({ filename, name }) }),
   importJob: (jobId) => request(`/imports/${encodeURIComponent(jobId)}`),
