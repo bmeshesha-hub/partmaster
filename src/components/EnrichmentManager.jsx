@@ -216,15 +216,23 @@ function FullDatasetPipeline() {
   const [pipelineExports, setPipelineExports] = useState([]);
   const load = useCallback(async () => {
     try {
-      const [jobResult, catalogResult, sourceResult] = await Promise.all([localDataApi.pipelineJobs(), localDataApi.pipelineCatalog(), localDataApi.pipelineSources()]);
-      setJobs(jobResult.jobs || []); setCatalog(catalogResult); setPipelineSources(sourceResult.sources || []); setSourceCoverage(sourceResult.summary || {}); setRawDataPath(sourceResult.rawDataPath || ""); setPipelineError("");
+      const jobResult = await localDataApi.pipelineJobs();
+      const nextJobs = jobResult.jobs || [];
+      setJobs(nextJobs);
+      if (nextJobs.some((pipelineJob) => ["queued", "running"].includes(pipelineJob.status))) {
+        setPipelineError("");
+        return;
+      }
+      const catalogResult = await localDataApi.pipelineCatalog();
+      const sourceResult = await localDataApi.pipelineSources();
+      setCatalog(catalogResult); setPipelineSources(sourceResult.sources || []); setSourceCoverage(sourceResult.summary || {}); setRawDataPath(sourceResult.rawDataPath || ""); setPipelineError("");
     } catch (error) { setPipelineError(error.message); }
   }, []);
   useEffect(() => { load(); }, [load]);
   const active = jobs.find((job) => ["queued", "running"].includes(job.status));
   useEffect(() => {
     if (!active) return undefined;
-    const timer = window.setInterval(load, 2500);
+    const timer = window.setInterval(load, 5000);
     return () => window.clearInterval(timer);
   }, [active, load]);
   const job = active || jobs[0];

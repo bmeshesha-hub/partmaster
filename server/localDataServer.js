@@ -36,7 +36,7 @@ await Promise.all([
 ]);
 
 const instance = await DuckDBInstance.create(DATABASE_PATH, {
-  threads: String(Math.max(2, Math.min(8, Number(process.env.PARTMASTER_THREADS) || 4))),
+  threads: String(Math.max(1, Math.min(4, Number(process.env.PARTMASTER_THREADS) || 2))),
   memory_limit: process.env.PARTMASTER_MEMORY_LIMIT || "4GB",
 });
 
@@ -595,6 +595,14 @@ await withConnection((connection) => connection.run(`
 
 function asyncRoute(handler) {
   return (request, response, next) => Promise.resolve(handler(request, response, next)).catch(next);
+}
+
+function friendlyDataError(error) {
+  const message = String(error?.message || error || "Local data service error.");
+  if (/out of memory|failed to pin block/i.test(message)) {
+    return "The local database reached its memory limit, so the job stopped safely. Partmaster is now using low-memory mode; resume the job to continue.";
+  }
+  return message;
 }
 
 function quoteIdentifier(value) {
@@ -2338,23 +2346,36 @@ async function scanDatasetOffline(jobId, dataset) {
     );
     const counts = countsReader.getRowObjectsJson()[0];
     await connection.run("DELETE FROM partmaster_offline_part_sources WHERE dataset_id = $datasetId", { datasetId: dataset.id });
-    await connection.run(
-      `INSERT INTO partmaster_offline_part_sources
-       (part_key, dataset_id, source_row_id, manufacturer, manufacturer_norm, part_number, part_number_norm,
-        description, year, model, assembly, item_number, quantity, source_url, occurrence_count)
-       WITH source_rows AS (${sourceRows}), normalized AS (
-        SELECT *, ${manufacturerNorm} AS manufacturer_norm, ${partNorm} AS part_number_norm FROM source_rows
-       ), valid AS (SELECT * FROM normalized WHERE ${validCondition})
-       SELECT manufacturer_norm || ':' || part_number_norm AS part_key, $datasetId,
-        min(source_row_id), arg_max(manufacturer_raw, length(coalesce(manufacturer_raw, ''))),
-        manufacturer_norm, arg_max(part_number, length(coalesce(part_number, ''))), part_number_norm,
-        arg_max(description, length(coalesce(description, ''))), arg_max(year, length(coalesce(year, ''))),
-        arg_max(model, length(coalesce(model, ''))), arg_max(assembly, length(coalesce(assembly, ''))),
-        arg_max(item_number, length(coalesce(item_number, ''))), arg_max(quantity, length(coalesce(quantity, ''))),
-        arg_max(source_url, length(coalesce(source_url, ''))), count(*)
-       FROM valid GROUP BY manufacturer_norm, part_number_norm`,
-      { datasetId: dataset.id },
-    );
+    const totalRows = Number(counts.rows || 0);
+    const chunkSize = Math.max(50_000, Math.min(1_000_000, Number(process.env.PARTMASTER_SCAN_CHUNK_ROWS) || 500_000));
+    for (let chunkStart = 0; chunkStart < totalRows; chunkStart += chunkSize) {
+      const statusReader = await connection.runAndReadAll("SELECT status FROM partmaster_pipeline_jobs WHERE id = $jobId", { jobId });
+      if (statusReader.getRowObjectsJson()[0]?.status !== "running") return { ...counts, stopped: true };
+      const chunkEnd = Math.min(totalRows, chunkStart + chunkSize);
+      await connection.run(
+        `INSERT INTO partmaster_offline_part_sources
+         (part_key, dataset_id, source_row_id, manufacturer, manufacturer_norm, part_number, part_number_norm,
+          description, year, model, assembly, item_number, quantity, source_url, occurrence_count)
+         WITH source_rows AS (${sourceRows} WHERE _row_id > $chunkStart AND _row_id <= $chunkEnd), normalized AS (
+          SELECT *, ${manufacturerNorm} AS manufacturer_norm, ${partNorm} AS part_number_norm FROM source_rows
+         ), valid AS (SELECT * FROM normalized WHERE ${validCondition})
+         SELECT manufacturer_norm || ':' || part_number_norm AS part_key, $datasetId,
+          min(source_row_id), arg_max(manufacturer_raw, length(coalesce(manufacturer_raw, ''))),
+          manufacturer_norm, arg_max(part_number, length(coalesce(part_number, ''))), part_number_norm,
+          arg_max(description, length(coalesce(description, ''))), arg_max(year, length(coalesce(year, ''))),
+          arg_max(model, length(coalesce(model, ''))), arg_max(assembly, length(coalesce(assembly, ''))),
+          arg_max(item_number, length(coalesce(item_number, ''))), arg_max(quantity, length(coalesce(quantity, ''))),
+          arg_max(source_url, length(coalesce(source_url, ''))), count(*)
+         FROM valid GROUP BY manufacturer_norm, part_number_norm
+         ON CONFLICT (part_key, dataset_id) DO UPDATE SET
+          occurrence_count = partmaster_offline_part_sources.occurrence_count + excluded.occurrence_count`,
+        { datasetId: dataset.id, chunkStart, chunkEnd },
+      );
+      await connection.run(
+        "UPDATE partmaster_pipeline_jobs SET scanned_rows = scanned_rows + $rows, current_dataset = $dataset WHERE id = $jobId",
+        { jobId, rows: chunkEnd - chunkStart, dataset: dataset.name },
+      );
+    }
     const uniqueReader = await connection.runAndReadAll(
       "SELECT count(*) AS unique_parts FROM partmaster_offline_part_sources WHERE dataset_id = $datasetId",
       { datasetId: dataset.id },
@@ -2364,7 +2385,7 @@ async function scanDatasetOffline(jobId, dataset) {
        (dataset_id, raw_rows, usable_rows, invalid_rows, unique_parts, scanned_at)
        VALUES ($datasetId, $rawRows, $usableRows, $invalidRows, $uniqueParts, current_timestamp)
        ON CONFLICT (dataset_id) DO UPDATE SET raw_rows = excluded.raw_rows, usable_rows = excluded.usable_rows,
-        invalid_rows = excluded.invalid_rows, unique_parts = excluded.unique_parts, scanned_at = current_timestamp`,
+        invalid_rows = excluded.invalid_rows, unique_parts = excluded.unique_parts, scanned_at = excluded.scanned_at`,
       {
         datasetId: dataset.id, rawRows: counts.rows,
         usableRows: Math.max(0, Number(counts.rows) - Number(counts.invalid_rows)),
@@ -2372,9 +2393,9 @@ async function scanDatasetOffline(jobId, dataset) {
       },
     );
     await connection.run(
-      `UPDATE partmaster_pipeline_jobs SET scanned_rows = scanned_rows + $rows,
-       invalid_rows = invalid_rows + $invalidRows, current_dataset = $dataset WHERE id = $jobId`,
-      { jobId, rows: counts.rows, invalidRows: counts.invalid_rows, dataset: dataset.name },
+      `UPDATE partmaster_pipeline_jobs SET invalid_rows = invalid_rows + $invalidRows,
+       current_dataset = $dataset WHERE id = $jobId`,
+      { jobId, invalidRows: counts.invalid_rows, dataset: dataset.name },
     );
     return counts;
   });
@@ -2633,7 +2654,7 @@ async function runFullPipeline(jobId) {
   } catch (error) {
     await withConnection((connection) => connection.run(
       "UPDATE partmaster_pipeline_jobs SET status = 'failed', phase = 'failed', last_error = $error, completed_at = current_timestamp WHERE id = $jobId",
-      { jobId, error: error.message },
+      { jobId, error: friendlyDataError(error) },
     )).catch(() => {});
   } finally {
     activePipelineJobs.delete(jobId);
@@ -5270,7 +5291,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
 
 app.use((error, _request, response, _next) => {
   console.error(error);
-  response.status(error.status || 500).json({ error: error.message || "Local data service error." });
+  response.status(error.status || 500).json({ error: friendlyDataError(error) });
 });
 
 const vehicleMappingLoadResult = await loadVehicleMappingReferences().catch((error) => ({ loaded: false, reason: error.message }));
