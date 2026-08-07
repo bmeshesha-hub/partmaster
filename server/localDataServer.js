@@ -17,6 +17,7 @@ const PORT = Number(process.env.PARTMASTER_DATA_PORT || 8787);
 const importJobs = new Map();
 const activeEnrichmentJobs = new Set();
 const activeRowEnhancementJobs = new Set();
+const activeAutopilotJobs = new Set();
 const compatibilityQueue = [];
 const queuedCompatibilityKeys = new Set();
 let compatibilityWorkerRunning = false;
@@ -270,6 +271,48 @@ await withConnection((connection) => connection.run(`
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
   );
 
+  CREATE TABLE IF NOT EXISTS partmaster_autopilot_jobs (
+    id VARCHAR PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    status VARCHAR NOT NULL,
+    requested_parts INTEGER NOT NULL,
+    max_online_requests INTEGER NOT NULL,
+    min_confidence DOUBLE NOT NULL,
+    manufacturers VARCHAR,
+    categories VARCHAR,
+    discover_compatibility BOOLEAN NOT NULL DEFAULT true,
+    recheck_older BOOLEAN NOT NULL DEFAULT false,
+    queued_count INTEGER NOT NULL DEFAULT 0,
+    processed_count INTEGER NOT NULL DEFAULT 0,
+    verified_count INTEGER NOT NULL DEFAULT 0,
+    review_count INTEGER NOT NULL DEFAULT 0,
+    no_source_count INTEGER NOT NULL DEFAULT 0,
+    not_found_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    online_checks INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    last_error VARCHAR
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_autopilot_items (
+    id VARCHAR PRIMARY KEY,
+    job_id VARCHAR NOT NULL,
+    part_id VARCHAR NOT NULL,
+    priority_score DOUBLE,
+    status VARCHAR NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    confidence DOUBLE,
+    evidence_url VARCHAR,
+    message VARCHAR,
+    fields_updated VARCHAR,
+    compatibility_added INTEGER NOT NULL DEFAULT 0,
+    started_at TIMESTAMP,
+    processed_at TIMESTAMP,
+    UNIQUE (job_id, part_id)
+  );
+
   CREATE TABLE IF NOT EXISTS partmaster_page_cache (
     source_url VARCHAR PRIMARY KEY,
     final_url VARCHAR,
@@ -364,6 +407,8 @@ await withConnection((connection) => connection.run(`
     ON partmaster_field_evidence (part_id, field_name);
   CREATE INDEX IF NOT EXISTS conflicts_part_status_idx
     ON partmaster_data_conflicts (part_id, status);
+  CREATE INDEX IF NOT EXISTS autopilot_items_job_status_idx
+    ON partmaster_autopilot_items (job_id, status);
   CREATE INDEX IF NOT EXISTS part_compatibility_part_idx
     ON partmaster_part_compatibility (part_id);
   CREATE INDEX IF NOT EXISTS row_enhancement_items_job_idx
@@ -2074,7 +2119,7 @@ async function processEnrichmentCandidate(candidate, threshold) {
   return update;
 }
 
-async function checkCanonicalPart(partId) {
+async function checkCanonicalPart(partId, { threshold = 0.94, force = false } = {}) {
   const context = await withConnection(async (connection) => {
     const partReader = await connection.runAndReadAll(
       "SELECT * FROM partmaster_canonical_parts WHERE id = $id",
@@ -2099,7 +2144,7 @@ async function checkCanonicalPart(partId) {
   if (!context.candidate) {
     return { status: "no_source", updated: false, message: "No saved source URL is available for this part number.", part: context.part };
   }
-  const page = await getEvidencePage(context.candidate.source_url);
+  const page = await getEvidencePage(context.candidate.source_url, { force });
   const evidence = extractPageEvidence(page.html, context.part.part_number);
   const catalogItem = extractCatalogItems(page.html)
     .find((item) => normalizePartNumber(item.partNumber) === context.part.part_number_norm);
@@ -2128,7 +2173,15 @@ async function checkCanonicalPart(partId) {
     confidence,
     evidenceUrl: page.finalUrl,
   }, inferVariantIntelligence(context.candidate, description), context.candidate);
-  const updated = confidence >= 0.94;
+  const updated = confidence >= Math.max(0.8, Math.min(1, Number(threshold) || 0.94));
+  const fieldsUpdated = [];
+  if (updated) {
+    if (description && description !== context.part.description) fieldsUpdated.push("description");
+    if (page.finalUrl !== context.part.evidence_url) fieldsUpdated.push("evidence");
+    if (confidence > Number(context.part.confidence || 0)) fieldsUpdated.push("confidence");
+    const inferredAttributes = inferCategoryAttributes({ ...context.candidate, family_name: checked.familyName }, description);
+    fieldsUpdated.push(...Object.keys(inferredAttributes));
+  }
   const refreshed = await withConnection(async (connection) => {
     if (updated) {
       await connection.run(
@@ -2173,8 +2226,138 @@ async function checkCanonicalPart(partId) {
       : "The number appears on the page, but the evidence is not strong enough to update automatically.",
     evidenceUrl: page.finalUrl,
     evidenceTitle: evidence.title,
+    cacheHit: Boolean(page.cacheHit),
+    fieldsUpdated: [...new Set(fieldsUpdated)],
     ...refreshed,
   };
+}
+
+async function refreshAutopilotJob(connection, jobId) {
+  const reader = await connection.runAndReadAll(
+    `SELECT count(*) AS queued_count,
+     count(*) FILTER (WHERE status NOT IN ('pending', 'processing', 'deferred_budget')) AS processed_count,
+     count(*) FILTER (WHERE status = 'verified') AS verified_count,
+     count(*) FILTER (WHERE status = 'review') AS review_count,
+     count(*) FILTER (WHERE status = 'no_source') AS no_source_count,
+     count(*) FILTER (WHERE status = 'not_found') AS not_found_count,
+     count(*) FILTER (WHERE status = 'failed') AS failed_count
+     FROM partmaster_autopilot_items WHERE job_id = $jobId`, { jobId },
+  );
+  const counts = reader.getRowObjectsJson()[0];
+  await connection.run(
+    `UPDATE partmaster_autopilot_jobs SET queued_count = $queued, processed_count = $processed,
+     verified_count = $verified, review_count = $review, no_source_count = $noSource,
+     not_found_count = $notFound, failed_count = $failed WHERE id = $jobId`,
+    { jobId, queued: counts.queued_count, processed: counts.processed_count, verified: counts.verified_count, review: counts.review_count, noSource: counts.no_source_count, notFound: counts.not_found_count, failed: counts.failed_count },
+  );
+  return counts;
+}
+
+async function autopilotCompatibility(partId) {
+  const candidate = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT candidates.* FROM partmaster_canonical_parts parts
+       JOIN partmaster_enrichment_candidates candidates
+        ON candidates.manufacturer_norm = parts.manufacturer_norm AND candidates.part_number_norm = parts.part_number_norm
+       WHERE parts.id = $partId AND candidates.source_url IS NOT NULL
+       ORDER BY candidates.confidence DESC NULLS LAST, candidates.processed_at DESC NULLS LAST LIMIT 1`, { partId },
+    );
+    return reader.getRowObjectsJson()[0];
+  });
+  if (!candidate || !compatibilityListUrl(candidate)) return { checked: false, added: 0 };
+  try {
+    const result = await enrichCandidateCompatibility(candidate);
+    return { checked: true, added: Number(result.added || 0), total: Number(result.total || 0) };
+  } catch (error) {
+    return { checked: true, added: 0, error: error.message };
+  }
+}
+
+async function runAutopilotJob(jobId) {
+  if (activeAutopilotJobs.has(jobId)) return;
+  activeAutopilotJobs.add(jobId);
+  try {
+    await withConnection((connection) => connection.run(
+      `UPDATE partmaster_autopilot_jobs SET status = 'running', started_at = coalesce(started_at, current_timestamp),
+       completed_at = NULL, last_error = NULL WHERE id = $jobId AND status IN ('queued', 'running')`, { jobId },
+    ));
+    while (!shuttingDown) {
+      const state = await withConnection(async (connection) => {
+        const jobReader = await connection.runAndReadAll("SELECT * FROM partmaster_autopilot_jobs WHERE id = $jobId", { jobId });
+        const job = jobReader.getRowObjectsJson()[0];
+        if (job?.status === "queued") {
+          await connection.run("UPDATE partmaster_autopilot_jobs SET status = 'running', started_at = coalesce(started_at, current_timestamp) WHERE id = $jobId", { jobId });
+          job.status = "running";
+        }
+        if (!job || job.status !== "running") return { job, item: null };
+        if (Number(job.online_checks || 0) >= Number(job.max_online_requests || 0)) {
+          await connection.run("UPDATE partmaster_autopilot_items SET status = 'deferred_budget', message = 'Deferred because the source-check budget was reached.' WHERE job_id = $jobId AND status = 'pending'", { jobId });
+          await connection.run("UPDATE partmaster_autopilot_jobs SET status = 'completed', completed_at = current_timestamp WHERE id = $jobId", { jobId });
+          await refreshAutopilotJob(connection, jobId);
+          return { job: { ...job, status: "completed" }, item: null };
+        }
+        const itemReader = await connection.runAndReadAll(
+          `SELECT items.*, parts.part_number, parts.manufacturer FROM partmaster_autopilot_items items
+           JOIN partmaster_canonical_parts parts ON parts.id = items.part_id
+           WHERE items.job_id = $jobId AND items.status = 'pending'
+           ORDER BY items.priority_score DESC, items.id LIMIT 1`, { jobId },
+        );
+        const item = itemReader.getRowObjectsJson()[0];
+        if (!item) {
+          await connection.run("UPDATE partmaster_autopilot_jobs SET status = 'completed', completed_at = current_timestamp WHERE id = $jobId", { jobId });
+          await refreshAutopilotJob(connection, jobId);
+          return { job: { ...job, status: "completed" }, item: null };
+        }
+        await connection.run("UPDATE partmaster_autopilot_items SET status = 'processing', attempt_count = attempt_count + 1, started_at = current_timestamp WHERE id = $id", { id: item.id });
+        await connection.run("UPDATE partmaster_autopilot_jobs SET online_checks = online_checks + 1 WHERE id = $jobId", { jobId });
+        return { job, item };
+      });
+      if (!state.item) break;
+      try {
+        const checked = await checkCanonicalPart(state.item.part_id, { threshold: Number(state.job.min_confidence || 0.94), force: Boolean(state.job.recheck_older) });
+        let compatibility = { checked: false, added: 0 };
+        if (checked.status === "verified" && state.job.discover_compatibility) {
+          const budgetAvailable = await withConnection(async (connection) => {
+            const reader = await connection.runAndReadAll("SELECT online_checks, max_online_requests FROM partmaster_autopilot_jobs WHERE id = $jobId", { jobId });
+            const job = reader.getRowObjectsJson()[0];
+            if (Number(job.online_checks) >= Number(job.max_online_requests)) return false;
+            await connection.run("UPDATE partmaster_autopilot_jobs SET online_checks = online_checks + 1 WHERE id = $jobId", { jobId });
+            return true;
+          });
+          if (budgetAvailable) compatibility = await autopilotCompatibility(state.item.part_id);
+        }
+        const status = ["verified", "review", "no_source", "not_found"].includes(checked.status) ? checked.status : "review";
+        const message = [checked.message, compatibility.error ? `Compatibility: ${compatibility.error}` : compatibility.checked ? `${compatibility.total || 0} compatibility fitments available.` : ""].filter(Boolean).join(" ");
+        await withConnection(async (connection) => {
+          await connection.run(
+            `UPDATE partmaster_autopilot_items SET status = $status, confidence = $confidence,
+             evidence_url = $evidenceUrl, message = $message, fields_updated = $fields,
+             compatibility_added = $compatibilityAdded, processed_at = current_timestamp WHERE id = $id`,
+            { id: state.item.id, status, confidence: checked.confidence || 0, evidenceUrl: checked.evidenceUrl || null, message, fields: checked.fieldsUpdated?.join(", ") || null, compatibilityAdded: compatibility.added || 0 },
+          );
+          await refreshAutopilotJob(connection, jobId);
+        });
+        if (!checked.cacheHit) await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.max(100, Number(process.env.PARTMASTER_AUTOPILOT_DELAY_MS) || 350)));
+      } catch (error) {
+        await withConnection(async (connection) => {
+          await connection.run("UPDATE partmaster_autopilot_items SET status = 'failed', message = $message, processed_at = current_timestamp WHERE id = $id", { id: state.item.id, message: error.message });
+          await refreshAutopilotJob(connection, jobId);
+        });
+      }
+    }
+    await refreshPartIntelligence();
+  } catch (error) {
+    await withConnection((connection) => connection.run(
+      "UPDATE partmaster_autopilot_jobs SET status = 'failed', last_error = $error, completed_at = current_timestamp WHERE id = $jobId",
+      { jobId, error: error.message },
+    )).catch(() => {});
+  } finally {
+    activeAutopilotJobs.delete(jobId);
+  }
+}
+
+function scheduleAutopilotJob(jobId) {
+  setImmediate(() => runAutopilotJob(jobId));
 }
 
 async function runEnrichmentJob(jobId) {
@@ -3254,6 +3437,100 @@ app.get("/api/local/intelligence/categories", (_request, response) => {
   response.json({ categories: CATEGORY_ATTRIBUTE_SCHEMAS });
 });
 
+app.get("/api/local/intelligence/autopilot/jobs", asyncRoute(async (_request, response) => {
+  const jobs = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll("SELECT * FROM partmaster_autopilot_jobs ORDER BY created_at DESC LIMIT 50");
+    return reader.getRowObjectsJson();
+  });
+  response.json({ jobs });
+}));
+
+app.post("/api/local/intelligence/autopilot/jobs", asyncRoute(async (request, response) => {
+  const requestedParts = Math.max(1, Math.min(1000, Number(request.body.requestedParts) || 25));
+  const maxOnlineRequests = Math.max(1, Math.min(2000, Number(request.body.maxOnlineRequests) || requestedParts * 2));
+  const minConfidence = Math.max(0.8, Math.min(1, Number(request.body.minConfidence) || 0.94));
+  const manufacturers = String(request.body.manufacturers || "").split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
+  const categories = String(request.body.categories || "").split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
+  const job = await withConnection(async (connection) => {
+    const activeReader = await connection.runAndReadAll("SELECT id FROM partmaster_autopilot_jobs WHERE status IN ('queued', 'running', 'paused') LIMIT 1");
+    if (activeReader.getRowObjectsJson().length) { const error = new Error("Finish or resume the existing Autopilot job before starting another."); error.status = 409; throw error; }
+    const partsReader = await connection.runAndReadAll(
+      `SELECT parts.id, parts.manufacturer, parts.part_number, parts.description, families.family_name,
+       scores.overall_score, scores.conflict_risk, scores.missing_fields,
+       (100 - scores.overall_score) + scores.conflict_risk * .5
+        + CASE WHEN scores.missing_fields LIKE '%evidence%' THEN 15 ELSE 0 END
+        + CASE WHEN scores.missing_fields LIKE '%fitment%' THEN 5 ELSE 0 END AS priority_score,
+       date_diff('day', coalesce(parts.verified_at, parts.updated_at), current_timestamp) AS age_days
+       FROM partmaster_quality_scores scores JOIN partmaster_canonical_parts parts ON parts.id = scores.part_id
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       ORDER BY priority_score DESC, parts.manufacturer, parts.part_number LIMIT 5000`,
+    );
+    const recheckOlder = Boolean(request.body.recheckOlder);
+    const selected = partsReader.getRowObjectsJson().filter((part) => {
+      if (manufacturers.length && !manufacturers.some((name) => String(part.manufacturer || "").toLowerCase().includes(name))) return false;
+      if (categories.length && !categories.some((name) => `${part.family_name || ""} ${part.description || ""}`.toLowerCase().includes(name))) return false;
+      return recheckOlder || part.missing_fields || Number(part.conflict_risk || 0) > 0 || Number(part.age_days || 0) > 180;
+    }).slice(0, requestedParts);
+    if (!selected.length) throw new Error("No canonical parts match the selected Autopilot filters.");
+    const id = randomUUID();
+    await connection.run("BEGIN TRANSACTION");
+    try {
+      await connection.run(
+        `INSERT INTO partmaster_autopilot_jobs
+         (id, name, status, requested_parts, max_online_requests, min_confidence, manufacturers,
+          categories, discover_compatibility, recheck_older, queued_count)
+         VALUES ($id, $name, 'queued', $requestedParts, $maxOnlineRequests, $minConfidence,
+          $manufacturers, $categories, $discoverCompatibility, $recheckOlder, $queuedCount)`,
+        { id, name: String(request.body.name || "Smart master enrichment").trim(), requestedParts, maxOnlineRequests, minConfidence, manufacturers: manufacturers.join(", ") || null, categories: categories.join(", ") || null, discoverCompatibility: request.body.discoverCompatibility !== false, recheckOlder, queuedCount: selected.length },
+      );
+      for (const part of selected) {
+        await connection.run(
+          "INSERT INTO partmaster_autopilot_items (id, job_id, part_id, priority_score) VALUES ($id, $jobId, $partId, $priorityScore)",
+          { id: randomUUID(), jobId: id, partId: part.id, priorityScore: Number(part.priority_score || 0) },
+        );
+      }
+      await connection.run("COMMIT");
+    } catch (error) { await connection.run("ROLLBACK"); throw error; }
+    return { id, status: "queued", queuedCount: selected.length };
+  });
+  scheduleAutopilotJob(job.id);
+  response.status(202).json({ job });
+}));
+
+app.get("/api/local/intelligence/autopilot/jobs/:id", asyncRoute(async (request, response) => {
+  const result = await withConnection(async (connection) => {
+    const jobReader = await connection.runAndReadAll("SELECT * FROM partmaster_autopilot_jobs WHERE id = $id", { id: request.params.id });
+    const job = jobReader.getRowObjectsJson()[0];
+    if (!job) { const error = new Error("Autopilot job not found."); error.status = 404; throw error; }
+    const itemsReader = await connection.runAndReadAll(
+      `SELECT items.*, parts.manufacturer, parts.part_number, parts.description, families.family_name
+       FROM partmaster_autopilot_items items JOIN partmaster_canonical_parts parts ON parts.id = items.part_id
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       WHERE items.job_id = $id ORDER BY coalesce(items.processed_at, items.started_at) DESC NULLS LAST,
+        items.priority_score DESC LIMIT 250`, { id: request.params.id },
+    );
+    return { job, items: itemsReader.getRowObjectsJson() };
+  });
+  response.json(result);
+}));
+
+app.post("/api/local/intelligence/autopilot/jobs/:id/pause", asyncRoute(async (request, response) => {
+  await withConnection((connection) => connection.run("UPDATE partmaster_autopilot_jobs SET status = 'paused' WHERE id = $id AND status IN ('queued', 'running')", { id: request.params.id }));
+  response.json({ ok: true });
+}));
+
+app.post("/api/local/intelligence/autopilot/jobs/:id/resume", asyncRoute(async (request, response) => {
+  const workerStillActive = activeAutopilotJobs.has(request.params.id);
+  const resumed = await withConnection(async (connection) => {
+    if (!workerStillActive) await connection.run("UPDATE partmaster_autopilot_items SET status = 'pending' WHERE job_id = $id AND status = 'processing'", { id: request.params.id });
+    await connection.run(`UPDATE partmaster_autopilot_jobs SET status = ${workerStillActive ? "'running'" : "'queued'"}, completed_at = NULL, last_error = NULL WHERE id = $id AND status IN ('paused', 'failed', 'queued')`, { id: request.params.id });
+    const reader = await connection.runAndReadAll("SELECT status FROM partmaster_autopilot_jobs WHERE id = $id", { id: request.params.id });
+    return ["queued", "running"].includes(reader.getRowObjectsJson()[0]?.status);
+  });
+  if (resumed && !workerStillActive) scheduleAutopilotJob(request.params.id);
+  response.json({ ok: true, resumed });
+}));
+
 app.post("/api/local/intelligence/refresh", asyncRoute(async (_request, response) => {
   response.json({ result: await refreshPartIntelligence() });
 }));
@@ -3576,6 +3853,8 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const evidenceFilename = `field-evidence-${stamp}.csv`;
     const aliasesFilename = `part-aliases-${stamp}.csv`;
     const conflictsFilename = `data-conflicts-${stamp}.csv`;
+    const autopilotJobsFilename = `autopilot-runs-${stamp}.csv`;
+    const autopilotItemsFilename = `autopilot-outcomes-${stamp}.csv`;
     const partsPath = join(EXPORT_ROOT, partsFilename);
     const applicationsPath = join(EXPORT_ROOT, applicationsFilename);
     const relationshipsPath = join(EXPORT_ROOT, relationshipsFilename);
@@ -3584,6 +3863,8 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const evidencePath = join(EXPORT_ROOT, evidenceFilename);
     const aliasesPath = join(EXPORT_ROOT, aliasesFilename);
     const conflictsPath = join(EXPORT_ROOT, conflictsFilename);
+    const autopilotJobsPath = join(EXPORT_ROOT, autopilotJobsFilename);
+    const autopilotItemsPath = join(EXPORT_ROOT, autopilotItemsFilename);
     await connection.run(
       `COPY (SELECT parts.manufacturer AS "Manufacturer", families.family_name AS "Part Family",
        parts.part_number AS "OEM Part Number", parts.description AS "Description",
@@ -3692,6 +3973,30 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
        ORDER BY conflicts.status, conflicts.severity, parts.manufacturer_norm, parts.part_number_norm)
        TO ${quoteString(conflictsPath)} (FORMAT CSV, HEADER true)`,
     );
+    await connection.run(
+      `COPY (SELECT name AS "Run Name", status AS "Status", requested_parts AS "Requested Parts",
+       max_online_requests AS "Source Check Budget", min_confidence AS "Minimum Confidence",
+       manufacturers AS "Manufacturer Filters", categories AS "Category Filters",
+       discover_compatibility AS "Discover Compatibility", recheck_older AS "Force Refresh",
+       queued_count AS "Queued", processed_count AS "Processed", verified_count AS "Verified",
+       review_count AS "Review", no_source_count AS "No Source", not_found_count AS "Not Found",
+       failed_count AS "Failed", online_checks AS "Source Checks", created_at AS "Created At",
+       started_at AS "Started At", completed_at AS "Completed At", last_error AS "Last Error"
+       FROM partmaster_autopilot_jobs ORDER BY created_at DESC)
+       TO ${quoteString(autopilotJobsPath)} (FORMAT CSV, HEADER true)`,
+    );
+    await connection.run(
+      `COPY (SELECT jobs.name AS "Run Name", parts.manufacturer AS "Manufacturer",
+       parts.part_number AS "OEM Part Number", parts.description AS "Description",
+       items.priority_score AS "Priority Score", items.status AS "Outcome", items.attempt_count AS "Attempts",
+       items.confidence AS "Confidence", items.fields_updated AS "Fields Updated",
+       items.compatibility_added AS "Compatibility Added", items.message AS "Message",
+       items.evidence_url AS "Evidence URL", items.processed_at AS "Processed At"
+       FROM partmaster_autopilot_items items JOIN partmaster_autopilot_jobs jobs ON jobs.id = items.job_id
+       JOIN partmaster_canonical_parts parts ON parts.id = items.part_id
+       ORDER BY jobs.created_at DESC, items.priority_score DESC)
+       TO ${quoteString(autopilotItemsPath)} (FORMAT CSV, HEADER true)`,
+    );
     return [
       { filename: partsFilename, path: partsPath, bytes: (await stat(partsPath)).size },
       { filename: applicationsFilename, path: applicationsPath, bytes: (await stat(applicationsPath)).size },
@@ -3701,6 +4006,8 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
       { filename: evidenceFilename, path: evidencePath, bytes: (await stat(evidencePath)).size },
       { filename: aliasesFilename, path: aliasesPath, bytes: (await stat(aliasesPath)).size },
       { filename: conflictsFilename, path: conflictsPath, bytes: (await stat(conflictsPath)).size },
+      { filename: autopilotJobsFilename, path: autopilotJobsPath, bytes: (await stat(autopilotJobsPath)).size },
+      { filename: autopilotItemsFilename, path: autopilotItemsPath, bytes: (await stat(autopilotItemsPath)).size },
     ];
   });
   response.json({ exports });
@@ -3731,6 +4038,13 @@ const resumableRowEnhancementJobIds = await withConnection(async (connection) =>
   return reader.getRowObjectsJson().map((job) => job.id);
 });
 
+const resumableAutopilotJobIds = await withConnection(async (connection) => {
+  await connection.run("UPDATE partmaster_autopilot_items SET status = 'pending' WHERE status = 'processing'");
+  await connection.run("UPDATE partmaster_autopilot_jobs SET status = 'queued' WHERE status = 'running'");
+  const reader = await connection.runAndReadAll("SELECT id FROM partmaster_autopilot_jobs WHERE status = 'queued'");
+  return reader.getRowObjectsJson().map((job) => job.id);
+});
+
 const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`Partmaster local data service: http://127.0.0.1:${PORT}`);
   console.log(`Local data directory: ${DATA_ROOT}`);
@@ -3745,6 +4059,7 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   else console.log(`Parts intelligence: ${Number(intelligenceBackfillResult.partsScored || 0).toLocaleString()} parts scored, ${Number(intelligenceBackfillResult.conflicts || 0).toLocaleString()} conflicts detected`);
   resumableJobIds.forEach(scheduleEnrichmentJob);
   resumableRowEnhancementJobIds.forEach(scheduleRowEnhancementJob);
+  resumableAutopilotJobIds.forEach(scheduleAutopilotJob);
 });
 
 async function shutdown(signal) {
@@ -3753,7 +4068,7 @@ async function shutdown(signal) {
   console.log(`Received ${signal}; checkpointing local data before shutdown…`);
   server.close();
   const deadline = Date.now() + 20_000;
-  while ((activeEnrichmentJobs.size || activeRowEnhancementJobs.size) && Date.now() < deadline) {
+  while ((activeEnrichmentJobs.size || activeRowEnhancementJobs.size || activeAutopilotJobs.size) && Date.now() < deadline) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
   try {
@@ -3761,6 +4076,8 @@ async function shutdown(signal) {
       await connection.run("UPDATE partmaster_enrichment_candidates SET status = 'pending' WHERE status = 'processing'");
       await connection.run("UPDATE partmaster_enrichment_jobs SET status = 'queued' WHERE status = 'running'");
       await connection.run("UPDATE partmaster_row_enhancement_jobs SET status = 'queued' WHERE status = 'running'");
+      await connection.run("UPDATE partmaster_autopilot_items SET status = 'pending' WHERE status = 'processing'");
+      await connection.run("UPDATE partmaster_autopilot_jobs SET status = 'queued' WHERE status = 'running'");
       await connection.run("CHECKPOINT");
     });
   } catch (error) {
