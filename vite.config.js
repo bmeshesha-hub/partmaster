@@ -6,6 +6,7 @@ export default defineConfig({
   // GitHub project pages are served from /<repository-name>/.
   base: process.env.VITE_BASE_PATH || "/partmaster/",
   server: {
+    strictPort: true,
     proxy: {
       "/api/local": "http://127.0.0.1:8787",
     },

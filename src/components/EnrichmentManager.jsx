@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { localDataApi } from "../utils/localDataApi.js";
+import LocalWorkspaceUnavailable from "./LocalWorkspaceUnavailable.jsx";
 
 const REVIEW_STATUSES = ["needs_review", "conflict", "not_found", "failed", "enriched", "rejected"];
 
@@ -409,7 +410,7 @@ export default function EnrichmentManager() {
   const allVisibleSelected = Boolean(eligibleCandidateIds.length) && eligibleCandidateIds.every((id) => selectedCandidateIds.includes(id));
 
   if (connected === null) return <div className="grid min-h-64 place-items-center rounded-2xl border border-slate-200 bg-white"><LoaderCircle className="animate-spin text-brand-600" size={28} /></div>;
-  if (!connected) return <section className="rounded-2xl border border-amber-200 bg-amber-50 p-6"><AlertTriangle className="text-amber-600" size={32} /><h3 className="mt-4 font-semibold text-amber-950">Local data service is not running</h3><p className="mt-2 text-sm text-amber-800">Start the local worker and web UI together:</p><pre className="mt-4 rounded-xl bg-slate-950 p-4 text-sm text-slate-100">npm run dev:local</pre><button type="button" onClick={refresh} className="mt-4 inline-flex items-center gap-2 rounded-xl bg-amber-700 px-4 py-2 text-sm font-semibold text-white"><RefreshCw size={16} />Check again</button></section>;
+  if (!connected) return <LocalWorkspaceUnavailable onRetry={refresh} />;
 
   return <div className="space-y-6">
     <EnrichmentJourney job={featuredJob} stats={stats} />

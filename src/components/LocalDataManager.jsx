@@ -1,5 +1,4 @@
 import {
-  AlertTriangle,
   ChevronLeft,
   ChevronRight,
   Database,
@@ -17,6 +16,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { localDataApi } from "../utils/localDataApi.js";
+import LocalWorkspaceUnavailable from "./LocalWorkspaceUnavailable.jsx";
 
 const PAGE_SIZE = 100;
 
@@ -170,7 +170,7 @@ export default function LocalDataManager() {
   const pageCount = Math.max(1, Math.ceil(Number(rowData.total) / PAGE_SIZE));
 
   if (connected === null) return <div className="grid min-h-64 place-items-center rounded-2xl border border-slate-200 bg-white"><LoaderCircle className="animate-spin text-brand-600" size={28} /></div>;
-  if (!connected) return <section className="rounded-2xl border border-amber-200 bg-amber-50 p-6 sm:p-8"><AlertTriangle className="text-amber-600" size={34} /><h3 className="mt-4 text-lg font-semibold text-amber-950">Local data service is not running</h3><p className="mt-2 max-w-2xl text-sm leading-6 text-amber-800">This feature runs only on your Mac because GitHub Pages cannot access local files. Stop the current development server, then start both services from the Partmaster directory:</p><pre className="mt-4 overflow-x-auto rounded-xl bg-slate-950 p-4 text-sm text-slate-100">npm run dev:local</pre><button type="button" onClick={refreshLocal} className="mt-4 inline-flex items-center gap-2 rounded-xl bg-amber-700 px-4 py-2 text-sm font-semibold text-white"><RefreshCw size={16} />Check again</button></section>;
+  if (!connected) return <LocalWorkspaceUnavailable onRetry={refreshLocal} />;
 
   return <div className="space-y-6">
     {error && <div className="flex items-start justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
