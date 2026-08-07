@@ -13,6 +13,7 @@ const DATABASE_PATH = resolve(process.env.PARTMASTER_DATABASE_PATH || join(DATA_
 const PORT = Number(process.env.PARTMASTER_DATA_PORT || 8787);
 const importJobs = new Map();
 const activeEnrichmentJobs = new Set();
+const activeRowEnhancementJobs = new Set();
 const compatibilityQueue = [];
 const queuedCompatibilityKeys = new Set();
 let compatibilityWorkerRunning = false;
@@ -225,6 +226,34 @@ await withConnection((connection) => connection.run(`
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp
   );
 
+  CREATE TABLE IF NOT EXISTS partmaster_row_enhancement_jobs (
+    id VARCHAR PRIMARY KEY,
+    dataset_id VARCHAR NOT NULL,
+    status VARCHAR NOT NULL,
+    total_count INTEGER NOT NULL,
+    processed_count INTEGER NOT NULL DEFAULT 0,
+    filled_count INTEGER NOT NULL DEFAULT 0,
+    review_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    last_error VARCHAR
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_row_enhancement_items (
+    id VARCHAR PRIMARY KEY,
+    job_id VARCHAR NOT NULL,
+    row_id BIGINT NOT NULL,
+    status VARCHAR NOT NULL DEFAULT 'pending',
+    suggested_changes VARCHAR,
+    confidence DOUBLE,
+    evidence_url VARCHAR,
+    notes VARCHAR,
+    processed_at TIMESTAMP,
+    UNIQUE (job_id, row_id)
+  );
+
   CREATE INDEX IF NOT EXISTS enrichment_candidates_job_status_idx
     ON partmaster_enrichment_candidates (job_id, status);
   CREATE INDEX IF NOT EXISTS canonical_parts_lookup_idx
@@ -234,7 +263,9 @@ await withConnection((connection) => connection.run(`
   CREATE INDEX IF NOT EXISTS variant_attributes_part_idx
     ON partmaster_variant_attributes (part_id);
   CREATE INDEX IF NOT EXISTS part_compatibility_part_idx
-    ON partmaster_part_compatibility (part_id)
+    ON partmaster_part_compatibility (part_id);
+  CREATE INDEX IF NOT EXISTS row_enhancement_items_job_idx
+    ON partmaster_row_enhancement_items (job_id, status)
 `));
 
 await withConnection((connection) => connection.run(`
@@ -552,6 +583,162 @@ function extractPageEvidence(html, knownPartNumber) {
   const exactNumberFound = Boolean(knownNorm && normalizePartNumber(visibleText).includes(knownNorm));
   const structuredExact = Boolean(knownNorm && [product?.mpn, product?.sku, product?.productID].map(normalizePartNumber).includes(knownNorm));
   return { title, productNumber, description, exactNumberFound, structuredExact, hasProductData: Boolean(product) };
+}
+
+function readHtmlAttribute(tag, name) {
+  return cleanText(tag.match(new RegExp(`\\b${name}=["']([^"']*)["']`, "i"))?.[1] || "");
+}
+
+function extractCatalogItems(html) {
+  const items = [];
+  const byPartNumber = new Set();
+  const analyticsPattern = /\{item_id:\s*"((?:\\.|[^"])*)",\s*item_name:\s*"((?:\\.|[^"])*)",\s*index:\s*(\d+),\s*item_brand:\s*"((?:\\.|[^"])*)",\s*item_category:\s*"((?:\\.|[^"])*)",\s*price:\s*([\d.]+),\s*quantity:\s*([\d.]+)\}/g;
+  for (const match of String(html || "").matchAll(analyticsPattern)) {
+    const partNumber = match[1].replace(/\\"/g, '"').trim();
+    if (!partNumber || byPartNumber.has(normalizePartNumber(partNumber))) continue;
+    byPartNumber.add(normalizePartNumber(partNumber));
+    items.push({
+      partNumber,
+      description: match[2].replace(/\\"/g, '"').trim(),
+      itemNumber: match[3],
+      brand: match[4].replace(/\\"/g, '"').trim(),
+      price: match[6],
+      quantity: match[7],
+    });
+  }
+  if (items.length) return items;
+  for (const match of String(html || "").matchAll(/<form\b[^>]*action=["'][^"']*\/cart\/addoempart["'][^>]*>/gi)) {
+    const tag = match[0];
+    const partNumber = readHtmlAttribute(tag, "data-sku");
+    if (!partNumber || byPartNumber.has(normalizePartNumber(partNumber))) continue;
+    byPartNumber.add(normalizePartNumber(partNumber));
+    items.push({
+      partNumber,
+      description: readHtmlAttribute(tag, "data-name"),
+      itemNumber: "",
+      brand: readHtmlAttribute(tag, "data-brand"),
+      price: readHtmlAttribute(tag, "data-retail"),
+      quantity: "",
+    });
+  }
+  return items;
+}
+
+function missingValue(value) {
+  return value == null || String(value).trim() === "";
+}
+
+function normalizedDescription(value) {
+  return String(value || "").toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim();
+}
+
+function numericValue(value) {
+  const parsed = Number(String(value || "").replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function matchCatalogItem(row, items) {
+  const partNumber = normalizePartNumber(row.part_number || row.oem_part_number || row.code);
+  if (partNumber) {
+    const exactPart = items.find((item) => normalizePartNumber(item.partNumber) === partNumber);
+    if (exactPart) return { item: exactPart, confidence: 0.99, reason: "Exact OEM part-number match on the source page." };
+  }
+  const description = normalizedDescription(row.part_name || row.description);
+  if (!description) return { item: null, confidence: 0, reason: "The row has no part name to match against its source page." };
+  const descriptionMatches = items.filter((item) => normalizedDescription(item.description) === description);
+  if (descriptionMatches.length === 1) {
+    const rowPrice = numericValue(row.msrp || row.price);
+    const itemPrice = numericValue(descriptionMatches[0].price);
+    const priceMatches = rowPrice == null || itemPrice == null || Math.abs(rowPrice - itemPrice) < 0.01;
+    return {
+      item: descriptionMatches[0],
+      confidence: priceMatches ? 0.98 : 0.94,
+      reason: priceMatches ? "Unique exact description match; price also agrees when available." : "Unique exact description match, but the price differs.",
+    };
+  }
+  if (descriptionMatches.length > 1) {
+    const rowPrice = numericValue(row.msrp || row.price);
+    const priceMatches = rowPrice == null ? [] : descriptionMatches.filter((item) => {
+      const itemPrice = numericValue(item.price);
+      return itemPrice != null && Math.abs(rowPrice - itemPrice) < 0.01;
+    });
+    if (priceMatches.length === 1) return { item: priceMatches[0], confidence: 0.96, reason: "Description and price uniquely identify this catalog item." };
+    return { item: null, confidence: 0.4, reason: `${descriptionMatches.length} catalog items share this description; manual review is required.` };
+  }
+  return { item: null, confidence: 0.2, reason: "No exact description or OEM-number match was found on the source page." };
+}
+
+function suggestedRowChanges(row, columns, item, sourceUrl) {
+  const changes = {};
+  const add = (column, value) => {
+    if (columns.includes(column) && missingValue(row[column]) && !missingValue(value)) changes[column] = String(value);
+  };
+  add("part_number", item.partNumber);
+  add("oem_part_number", item.partNumber);
+  add("code", item.partNumber);
+  add("part_name", item.description);
+  add("description", item.description);
+  add("brand", item.brand);
+  add("manufacturer", item.brand);
+  add("msrp", item.price ? `$${Number(item.price).toFixed(2)}` : "");
+  add("price", item.price);
+  add("quantity", item.quantity);
+  add("qty", item.quantity);
+  add("source", new URL(sourceUrl).hostname.replace(/^www\./, ""));
+  return changes;
+}
+
+async function previewRowEnhancement(datasetId, rowId) {
+  const context = await withConnection(async (connection) => {
+    const dataset = await getDataset(connection, datasetId);
+    const columns = await getColumns(connection, dataset.table_name);
+    const reader = await connection.runAndReadAll(
+      `SELECT * FROM ${quoteIdentifier(dataset.table_name)} WHERE _row_id = $rowId`,
+      { rowId },
+    );
+    const row = reader.getRowObjectsJson()[0];
+    if (!row) {
+      const error = new Error("Local dataset row not found.");
+      error.status = 404;
+      throw error;
+    }
+    return { dataset, columns, row };
+  });
+  const sourceUrl = String(context.row.url || context.row.source_url || "").trim();
+  if (!sourceUrl) return { ...context, sourceUrl: "", changes: {}, confidence: 0, reason: "This row has no source URL." };
+  if (!isSafeEvidenceUrl(sourceUrl)) return { ...context, sourceUrl, changes: {}, confidence: 0, reason: "This row does not contain a permitted public source URL." };
+  const page = await getEvidencePage(sourceUrl);
+  const items = extractCatalogItems(page.html);
+  const match = matchCatalogItem(context.row, items);
+  const changes = match.item ? suggestedRowChanges(context.row, context.columns, match.item, page.finalUrl || sourceUrl) : {};
+  return {
+    ...context,
+    sourceUrl: page.finalUrl || sourceUrl,
+    pageTitle: extractPageEvidence(page.html, context.row.part_number).title,
+    catalogItemCount: items.length,
+    matchedItem: match.item,
+    changes,
+    confidence: match.confidence,
+    reason: match.reason,
+  };
+}
+
+async function applyMissingRowChanges(dataset, columns, rowId, changes) {
+  const validChanges = Object.entries(changes || {}).filter(([column]) => column !== "_row_id" && columns.includes(column));
+  if (!validChanges.length) return 0;
+  await withConnection(async (connection) => {
+    const values = { rowId };
+    const assignments = validChanges.map(([column, value], index) => {
+      const key = `value${index}`;
+      values[key] = value;
+      return `${quoteIdentifier(column)} = CASE WHEN trim(coalesce(CAST(${quoteIdentifier(column)} AS VARCHAR), '')) = '' THEN $${key} ELSE ${quoteIdentifier(column)} END`;
+    });
+    await connection.run(
+      `UPDATE ${quoteIdentifier(dataset.table_name)} SET ${assignments.join(", ")} WHERE _row_id = $rowId`,
+      values,
+    );
+  });
+  return validChanges.length;
 }
 
 function pageTitleMatchesContext(candidate, title) {
@@ -1533,6 +1720,106 @@ function scheduleEnrichmentJob(jobId) {
   setImmediate(() => runEnrichmentJob(jobId));
 }
 
+async function refreshRowEnhancementJob(connection, jobId) {
+  const reader = await connection.runAndReadAll(
+    `SELECT count(*) FILTER (WHERE status != 'pending') AS processed,
+     count(*) FILTER (WHERE status IN ('filled', 'no_change')) AS filled,
+     count(*) FILTER (WHERE status = 'review') AS review,
+     count(*) FILTER (WHERE status = 'failed') AS failed,
+     count(*) FILTER (WHERE status = 'pending') AS remaining
+     FROM partmaster_row_enhancement_items WHERE job_id = $jobId`,
+    { jobId },
+  );
+  const stats = reader.getRowObjectsJson()[0];
+  await connection.run(
+    `UPDATE partmaster_row_enhancement_jobs SET processed_count = $processed,
+     filled_count = $filled, review_count = $review, failed_count = $failed
+     WHERE id = $jobId`,
+    { jobId, processed: stats.processed, filled: stats.filled, review: stats.review, failed: stats.failed },
+  );
+  return stats;
+}
+
+async function runRowEnhancementJob(jobId) {
+  if (activeRowEnhancementJobs.has(jobId)) return;
+  activeRowEnhancementJobs.add(jobId);
+  try {
+    await withConnection((connection) => connection.run(
+      `UPDATE partmaster_row_enhancement_jobs SET status = 'running', started_at = current_timestamp,
+       last_error = NULL WHERE id = $jobId AND status IN ('queued', 'running')`,
+      { jobId },
+    ));
+    while (!shuttingDown) {
+      const state = await withConnection(async (connection) => {
+        const jobReader = await connection.runAndReadAll(
+          "SELECT * FROM partmaster_row_enhancement_jobs WHERE id = $jobId",
+          { jobId },
+        );
+        const job = jobReader.getRowObjectsJson()[0];
+        if (!job || job.status !== "running") return null;
+        const itemReader = await connection.runAndReadAll(
+          `SELECT * FROM partmaster_row_enhancement_items
+           WHERE job_id = $jobId AND status = 'pending' ORDER BY row_id LIMIT 1`,
+          { jobId },
+        );
+        return { job, item: itemReader.getRowObjectsJson()[0] };
+      });
+      if (!state) break;
+      if (!state.item) {
+        await withConnection(async (connection) => {
+          await refreshRowEnhancementJob(connection, jobId);
+          await connection.run(
+            "UPDATE partmaster_row_enhancement_jobs SET status = 'completed', completed_at = current_timestamp WHERE id = $jobId",
+            { jobId },
+          );
+        });
+        break;
+      }
+      try {
+        const preview = await previewRowEnhancement(state.job.dataset_id, state.item.row_id);
+        const changeCount = Object.keys(preview.changes).length;
+        let status = "review";
+        if (preview.confidence >= 0.94 && changeCount) {
+          await applyMissingRowChanges(preview.dataset, preview.columns, state.item.row_id, preview.changes);
+          status = "filled";
+        } else if (preview.confidence >= 0.94 && !changeCount) status = "no_change";
+        await withConnection((connection) => connection.run(
+          `UPDATE partmaster_row_enhancement_items SET status = $status,
+           suggested_changes = $changes, confidence = $confidence, evidence_url = $evidenceUrl,
+           notes = $notes, processed_at = current_timestamp WHERE id = $id`,
+          {
+            id: state.item.id,
+            status,
+            changes: JSON.stringify(preview.changes),
+            confidence: preview.confidence,
+            evidenceUrl: preview.sourceUrl || null,
+            notes: preview.reason,
+          },
+        ));
+      } catch (error) {
+        await withConnection((connection) => connection.run(
+          `UPDATE partmaster_row_enhancement_items SET status = 'failed', notes = $notes,
+           processed_at = current_timestamp WHERE id = $id`,
+          { id: state.item.id, notes: error.message },
+        ));
+      }
+      await withConnection((connection) => refreshRowEnhancementJob(connection, jobId));
+    }
+  } catch (error) {
+    await withConnection((connection) => connection.run(
+      `UPDATE partmaster_row_enhancement_jobs SET status = 'failed', last_error = $error,
+       completed_at = current_timestamp WHERE id = $jobId`,
+      { jobId, error: error.message },
+    )).catch(() => {});
+  } finally {
+    activeRowEnhancementJobs.delete(jobId);
+  }
+}
+
+function scheduleRowEnhancementJob(jobId) {
+  setImmediate(() => runRowEnhancementJob(jobId));
+}
+
 async function backfillVariantIntelligence() {
   await withConnection(async (connection) => {
     const partsReader = await connection.runAndReadAll(
@@ -1710,6 +1997,70 @@ app.get("/api/local/datasets/:id/rows", asyncRoute(async (request, response) => 
       values,
     );
     return { dataset, columns, rows: rowsReader.getRowObjectsJson(), total: countReader.getRowObjectsJson()[0].count, page, pageSize };
+  });
+  response.json(result);
+}));
+
+app.post("/api/local/datasets/:id/rows/:rowId/enhance", asyncRoute(async (request, response) => {
+  const preview = await previewRowEnhancement(request.params.id, request.params.rowId);
+  if (request.body.apply && preview.confidence >= 0.94 && Object.keys(preview.changes).length) {
+    await applyMissingRowChanges(preview.dataset, preview.columns, request.params.rowId, preview.changes);
+  }
+  response.json({
+    rowId: request.params.rowId,
+    changes: preview.changes,
+    confidence: preview.confidence,
+    reason: preview.reason,
+    evidenceUrl: preview.sourceUrl || null,
+    evidenceTitle: preview.pageTitle || null,
+    matchedItem: preview.matchedItem || null,
+    catalogItemCount: preview.catalogItemCount || 0,
+    applied: Boolean(request.body.apply && preview.confidence >= 0.94 && Object.keys(preview.changes).length),
+  });
+}));
+
+app.post("/api/local/datasets/:id/row-enhancement-jobs", asyncRoute(async (request, response) => {
+  const rowIds = [...new Set((request.body.rowIds || []).map(Number).filter((value) => Number.isInteger(value) && value > 0))].slice(0, 200);
+  if (!rowIds.length) return response.status(400).json({ error: "Select at least one visible row to enhance." });
+  const job = await withConnection(async (connection) => {
+    await getDataset(connection, request.params.id);
+    const id = randomUUID();
+    await connection.run(
+      `INSERT INTO partmaster_row_enhancement_jobs
+       (id, dataset_id, status, total_count) VALUES ($id, $datasetId, 'queued', $total)`,
+      { id, datasetId: request.params.id, total: rowIds.length },
+    );
+    for (const rowId of rowIds) {
+      await connection.run(
+        `INSERT INTO partmaster_row_enhancement_items (id, job_id, row_id)
+         VALUES ($id, $jobId, $rowId)`,
+        { id: randomUUID(), jobId: id, rowId },
+      );
+    }
+    return { id, datasetId: request.params.id, status: "queued", totalCount: rowIds.length };
+  });
+  scheduleRowEnhancementJob(job.id);
+  response.status(202).json({ job });
+}));
+
+app.get("/api/local/row-enhancement-jobs/:id", asyncRoute(async (request, response) => {
+  const result = await withConnection(async (connection) => {
+    const jobReader = await connection.runAndReadAll(
+      "SELECT * FROM partmaster_row_enhancement_jobs WHERE id = $id",
+      { id: request.params.id },
+    );
+    const job = jobReader.getRowObjectsJson()[0];
+    if (!job) {
+      const error = new Error("Row enhancement job not found.");
+      error.status = 404;
+      throw error;
+    }
+    const itemReader = await connection.runAndReadAll(
+      `SELECT row_id, status, suggested_changes, confidence, evidence_url, notes
+       FROM partmaster_row_enhancement_items WHERE job_id = $id ORDER BY row_id`,
+      { id: request.params.id },
+    );
+    return { job, items: itemReader.getRowObjectsJson() };
   });
   response.json(result);
 }));
@@ -2225,10 +2576,17 @@ const resumableJobIds = await withConnection(async (connection) => {
   return reader.getRowObjectsJson().map((job) => job.id);
 });
 
+const resumableRowEnhancementJobIds = await withConnection(async (connection) => {
+  await connection.run("UPDATE partmaster_row_enhancement_jobs SET status = 'queued' WHERE status = 'running'");
+  const reader = await connection.runAndReadAll("SELECT id FROM partmaster_row_enhancement_jobs WHERE status = 'queued'");
+  return reader.getRowObjectsJson().map((job) => job.id);
+});
+
 const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`Partmaster local data service: http://127.0.0.1:${PORT}`);
   console.log(`Local data directory: ${DATA_ROOT}`);
   resumableJobIds.forEach(scheduleEnrichmentJob);
+  resumableRowEnhancementJobIds.forEach(scheduleRowEnhancementJob);
 });
 
 async function shutdown(signal) {
@@ -2237,13 +2595,14 @@ async function shutdown(signal) {
   console.log(`Received ${signal}; checkpointing local data before shutdown…`);
   server.close();
   const deadline = Date.now() + 20_000;
-  while (activeEnrichmentJobs.size && Date.now() < deadline) {
+  while ((activeEnrichmentJobs.size || activeRowEnhancementJobs.size) && Date.now() < deadline) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
   try {
     await withConnection(async (connection) => {
       await connection.run("UPDATE partmaster_enrichment_candidates SET status = 'pending' WHERE status = 'processing'");
       await connection.run("UPDATE partmaster_enrichment_jobs SET status = 'queued' WHERE status = 'running'");
+      await connection.run("UPDATE partmaster_row_enhancement_jobs SET status = 'queued' WHERE status = 'running'");
       await connection.run("CHECKPOINT");
     });
   } catch (error) {

@@ -23,6 +23,9 @@ export const localDataApi = {
     return request(`/datasets/${encodeURIComponent(datasetId)}/rows?${query}`);
   },
   updateRow: (datasetId, rowId, changes) => request(`/datasets/${encodeURIComponent(datasetId)}/rows/${encodeURIComponent(rowId)}`, { method: "PATCH", body: JSON.stringify({ changes }) }),
+  previewRowEnhancement: (datasetId, rowId) => request(`/datasets/${encodeURIComponent(datasetId)}/rows/${encodeURIComponent(rowId)}/enhance`, { method: "POST", body: JSON.stringify({ apply: false }) }),
+  startRowEnhancement: (datasetId, rowIds) => request(`/datasets/${encodeURIComponent(datasetId)}/row-enhancement-jobs`, { method: "POST", body: JSON.stringify({ rowIds }) }),
+  rowEnhancementJob: (jobId) => request(`/row-enhancement-jobs/${encodeURIComponent(jobId)}`),
   deleteRow: (datasetId, rowId) => request(`/datasets/${encodeURIComponent(datasetId)}/rows/${encodeURIComponent(rowId)}`, { method: "DELETE" }),
   exportRows: (datasetId, filters) => request(`/datasets/${encodeURIComponent(datasetId)}/exports`, { method: "POST", body: JSON.stringify(filters) }),
   deleteDataset: (datasetId) => request(`/datasets/${encodeURIComponent(datasetId)}`, { method: "DELETE" }),
