@@ -27,6 +27,7 @@ let compatibilityWorkerRunning = false;
 let shuttingDown = false;
 const ENRICHMENT_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.PARTMASTER_FETCH_TIMEOUT_MS) || 15000);
 const ENRICHMENT_MAX_PAGE_BYTES = Math.max(100000, Number(process.env.PARTMASTER_MAX_PAGE_BYTES) || 2_000_000);
+const PIPELINE_MAX_ONLINE_BUDGET = Math.max(5000, Number(process.env.PARTMASTER_MAX_ONLINE_BUDGET) || 500_000);
 
 await Promise.all([
   mkdir(INBOX_ROOT, { recursive: true }),
@@ -3868,7 +3869,7 @@ app.post("/api/local/pipeline/jobs", asyncRoute(async (request, response) => {
   const id = randomUUID();
   const datasetIds = Array.isArray(request.body.datasetIds) ? request.body.datasetIds.map(String).filter(Boolean) : [];
   const requestedBudget = Number(request.body.onlineBudget);
-  const onlineBudget = Math.max(0, Math.min(5000, Number.isFinite(requestedBudget) ? requestedBudget : 250));
+  const onlineBudget = Math.max(0, Math.min(PIPELINE_MAX_ONLINE_BUDGET, Number.isFinite(requestedBudget) ? requestedBudget : 250));
   const importMissing = request.body.importMissing !== false;
   const mode = request.body.continueOnline === true ? "online_only" : "full";
   await withConnection((connection) => connection.run(
