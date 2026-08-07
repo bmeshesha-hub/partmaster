@@ -12,12 +12,12 @@ const SOURCES = [
 ];
 
 const STEPS = [
-  ["1", "Ingest", "Read source CSVs from local_data/inbox and keep the original row and URL traceable."],
+  ["1", "Inventory and ingest", "Find every parts CSV in local_data/inbox or inbox/rawdata, flag unprocessed files, and keep each original row and URL traceable."],
   ["2", "Normalize", "Standardize manufacturers and OEM numbers so punctuation does not create false differences."],
   ["3", "Deduplicate", "Build one identity per manufacturer + normalized OEM number while preserving source occurrences."],
   ["4", "Understand", "Classify the family and extract category-aware facts such as side, dimensions, material or equipment."],
   ["5", "Map and verify", "Apply ePID mappings and check the highest-value linked supplier pages in controlled batches."],
-  ["6", "Review and publish", "Auto-accept only strong evidence; send uncertainty to a person; export with provenance."],
+  ["6", "Measure, review and publish", "Compare raw sources with master completion, auto-accept only strong evidence, send uncertainty to a person, and export with provenance."],
 ];
 
 const FIELDS = ["Normalized OEM identity", "Description", "Part family", "Component scope", "Side and position", "Dimensions and specifications", "Material, color and finish", "Mirror/electrical equipment", "Vehicle ePID and trim", "Fitment and assembly", "Aliases and relationships", "Evidence and confidence", "Duplicate counts", "Source traceability"];

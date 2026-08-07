@@ -2,12 +2,13 @@ import { DuckDBInstance } from "@duckdb/node-api";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readdir, stat } from "node:fs/promises";
-import { basename, extname, join, resolve } from "node:path";
+import { basename, extname, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 
 const APP_ROOT = resolve(import.meta.dirname, "..");
 const DATA_ROOT = join(APP_ROOT, "local_data");
 const INBOX_ROOT = join(DATA_ROOT, "inbox");
+const RAWDATA_ROOT = join(INBOX_ROOT, "rawdata");
 const EXPORT_ROOT = join(DATA_ROOT, "exports");
 const REFERENCE_ROOT = join(DATA_ROOT, "reference");
 const VEHICLE_MASTER_PATH = join(REFERENCE_ROOT, "vehicle_master.csv");
@@ -29,6 +30,7 @@ const ENRICHMENT_MAX_PAGE_BYTES = Math.max(100000, Number(process.env.PARTMASTER
 
 await Promise.all([
   mkdir(INBOX_ROOT, { recursive: true }),
+  mkdir(RAWDATA_ROOT, { recursive: true }),
   mkdir(EXPORT_ROOT, { recursive: true }),
   mkdir(REFERENCE_ROOT, { recursive: true }),
 ]);
@@ -240,6 +242,15 @@ await withConnection((connection) => connection.run(`
     source_url VARCHAR,
     occurrence_count BIGINT NOT NULL DEFAULT 1,
     PRIMARY KEY (part_key, dataset_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_source_processing (
+    dataset_id VARCHAR PRIMARY KEY,
+    raw_rows BIGINT NOT NULL DEFAULT 0,
+    usable_rows BIGINT NOT NULL DEFAULT 0,
+    invalid_rows BIGINT NOT NULL DEFAULT 0,
+    unique_parts BIGINT NOT NULL DEFAULT 0,
+    scanned_at TIMESTAMP NOT NULL DEFAULT current_timestamp
   );
 
   CREATE TABLE IF NOT EXISTS partmaster_offline_parts (
@@ -515,6 +526,17 @@ await withConnection((connection) => connection.run(`
 `));
 
 await withConnection((connection) => connection.run(`
+  INSERT OR IGNORE INTO partmaster_source_processing
+    (dataset_id, raw_rows, usable_rows, invalid_rows, unique_parts, scanned_at)
+  SELECT datasets.id, datasets.row_count, coalesce(sum(sources.occurrence_count), 0),
+    greatest(0, datasets.row_count - coalesce(sum(sources.occurrence_count), 0)), count(DISTINCT sources.part_key),
+    coalesce(max(datasets.imported_at), current_timestamp)
+  FROM partmaster_datasets datasets
+  JOIN partmaster_offline_part_sources sources ON sources.dataset_id = datasets.id
+  GROUP BY datasets.id, datasets.row_count;
+`));
+
+await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_pipeline_jobs ADD COLUMN IF NOT EXISTS attribute_processed BIGINT DEFAULT 0;
   ALTER TABLE partmaster_pipeline_jobs ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'full';
   ALTER TABLE partmaster_enrichment_jobs ADD COLUMN IF NOT EXISTS start_row_id BIGINT DEFAULT 0;
@@ -584,11 +606,39 @@ function quoteString(value) {
 }
 
 function safeInboxFile(filename) {
-  const cleanName = basename(String(filename || ""));
-  if (!cleanName || cleanName !== filename) throw new Error("Choose a file from the Partmaster inbox.");
+  const cleanName = String(filename || "").trim().replaceAll("\\", "/");
+  if (!cleanName || cleanName.startsWith("/") || cleanName.split("/").includes("..")) throw new Error("Choose a file from the Partmaster inbox.");
   const extension = extname(cleanName).toLowerCase();
   if (![".csv", ".tsv", ".txt"].includes(extension)) throw new Error("Only CSV, TSV, and text files can be imported.");
-  return join(INBOX_ROOT, cleanName);
+  const resolvedPath = resolve(INBOX_ROOT, cleanName);
+  if (!resolvedPath.startsWith(`${INBOX_ROOT}${sep}`)) throw new Error("Choose a file from the Partmaster inbox.");
+  return resolvedPath;
+}
+
+async function listInboxDataFiles({ partsOnly = false } = {}) {
+  const files = [];
+  async function walk(directory) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      const fullPath = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+        continue;
+      }
+      if (!entry.isFile() || ![".csv", ".tsv", ".txt"].includes(extname(entry.name).toLowerCase())) continue;
+      if (partsOnly && (/sample/i.test(entry.name) || /mpsov/i.test(entry.name) || /^vehicle_(master|source_aliases)\.csv$/i.test(entry.name))) continue;
+      const details = await stat(fullPath);
+      files.push({
+        name: relative(INBOX_ROOT, fullPath).split(sep).join("/"),
+        bytes: details.size,
+        modifiedAt: details.mtime.toISOString(),
+        kind: /^mpsov\.csv$/i.test(entry.name) ? "vehicle_reference" : "parts_source",
+      });
+    }
+  }
+  await walk(INBOX_ROOT);
+  return files;
 }
 
 async function detectDelimiter(filePath) {
@@ -2239,11 +2289,7 @@ function offlineDatasetExpressions(columns) {
 }
 
 async function ensurePipelineDatasets(importMissing) {
-  const entries = await readdir(INBOX_ROOT, { withFileTypes: true });
-  const sourceFiles = entries
-    .filter((entry) => entry.isFile() && [".csv", ".tsv", ".txt"].includes(extname(entry.name).toLowerCase()))
-    .map((entry) => entry.name)
-    .filter((name) => !/sample|^mpsov\.csv$|^vehicle_(master|source_aliases)\.csv$/i.test(name));
+  const sourceFiles = (await listInboxDataFiles({ partsOnly: true })).map((file) => file.name);
   if (importMissing) {
     const imported = await withConnection(async (connection) => {
       const reader = await connection.runAndReadAll("SELECT DISTINCT source_file FROM partmaster_datasets");
@@ -2308,6 +2354,22 @@ async function scanDatasetOffline(jobId, dataset) {
         arg_max(source_url, length(coalesce(source_url, ''))), count(*)
        FROM valid GROUP BY manufacturer_norm, part_number_norm`,
       { datasetId: dataset.id },
+    );
+    const uniqueReader = await connection.runAndReadAll(
+      "SELECT count(*) AS unique_parts FROM partmaster_offline_part_sources WHERE dataset_id = $datasetId",
+      { datasetId: dataset.id },
+    );
+    await connection.run(
+      `INSERT INTO partmaster_source_processing
+       (dataset_id, raw_rows, usable_rows, invalid_rows, unique_parts, scanned_at)
+       VALUES ($datasetId, $rawRows, $usableRows, $invalidRows, $uniqueParts, current_timestamp)
+       ON CONFLICT (dataset_id) DO UPDATE SET raw_rows = excluded.raw_rows, usable_rows = excluded.usable_rows,
+        invalid_rows = excluded.invalid_rows, unique_parts = excluded.unique_parts, scanned_at = current_timestamp`,
+      {
+        datasetId: dataset.id, rawRows: counts.rows,
+        usableRows: Math.max(0, Number(counts.rows) - Number(counts.invalid_rows)),
+        invalidRows: counts.invalid_rows, uniqueParts: uniqueReader.getRowObjectsJson()[0].unique_parts,
+      },
     );
     await connection.run(
       `UPDATE partmaster_pipeline_jobs SET scanned_rows = scanned_rows + $rows,
@@ -3746,15 +3808,9 @@ app.post("/api/local/open-folder", (_request, response) => {
 });
 
 app.get("/api/local/files", asyncRoute(async (_request, response) => {
-  const entries = await readdir(INBOX_ROOT, { withFileTypes: true });
-  const files = await Promise.all(entries
-    .filter((entry) => entry.isFile() && [".csv", ".tsv", ".txt"].includes(extname(entry.name).toLowerCase()))
-    .map(async (entry) => {
-      const details = await stat(join(INBOX_ROOT, entry.name));
-      return { name: entry.name, bytes: details.size, modifiedAt: details.mtime.toISOString(), kind: /^mpsov\.csv$/i.test(entry.name) ? "vehicle_reference" : "parts_source" };
-    }));
+  const files = await listInboxDataFiles();
   files.sort((left, right) => right.modifiedAt.localeCompare(left.modifiedAt));
-  response.json({ files, inboxPath: INBOX_ROOT });
+  response.json({ files, inboxPath: INBOX_ROOT, rawDataPath: RAWDATA_ROOT });
 }));
 
 app.get("/api/local/datasets", asyncRoute(async (_request, response) => {
@@ -3850,7 +3906,8 @@ app.get("/api/local/pipeline/catalog", asyncRoute(async (request, response) => {
 }));
 
 app.get("/api/local/pipeline/sources", asyncRoute(async (_request, response) => {
-  const sources = await withConnection(async (connection) => {
+  const discoveredFiles = await listInboxDataFiles({ partsOnly: true });
+  const databaseCoverage = await withConnection(async (connection) => {
     const reader = await connection.runAndReadAll(
       `WITH latest AS (
         SELECT * EXCLUDE (rank) FROM (
@@ -3861,9 +3918,12 @@ app.get("/api/local/pipeline/sources", asyncRoute(async (_request, response) => 
         ) ranked WHERE rank = 1
        )
        SELECT latest.id AS dataset_id, latest.name, latest.source_file, latest.row_count AS raw_rows,
-        coalesce(sum(sources.occurrence_count), 0) AS usable_rows,
-        greatest(0, latest.row_count - coalesce(sum(sources.occurrence_count), 0)) AS invalid_rows,
-        count(DISTINCT sources.part_key) AS unique_parts,
+        coalesce(processing.usable_rows, 0) AS usable_rows,
+        coalesce(processing.invalid_rows, 0) AS invalid_rows,
+        coalesce(processing.unique_parts, 0) AS unique_parts,
+        processing.dataset_id IS NOT NULL AS is_indexed,
+        processing.scanned_at,
+        count(DISTINCT sources.part_key) FILTER (WHERE parts.part_key IS NOT NULL) AS master_parts,
         count(DISTINCT sources.part_key) FILTER (WHERE parts.extracted_attribute_count > 0) AS parts_with_facts,
         coalesce(sum(parts.extracted_attribute_count), 0) AS product_facts,
         count(DISTINCT sources.part_key) FILTER (WHERE parts.online_status = 'verified') AS online_verified_parts,
@@ -3871,15 +3931,77 @@ app.get("/api/local/pipeline/sources", asyncRoute(async (_request, response) => 
         count(DISTINCT sources.source_url) FILTER (WHERE pages.status != 'pending') AS processed_source_pages,
         count(DISTINCT sources.source_url) FILTER (WHERE pages.status = 'pending') AS pending_source_pages
        FROM latest
+       LEFT JOIN partmaster_source_processing processing ON processing.dataset_id = latest.id
        LEFT JOIN partmaster_offline_part_sources sources ON sources.dataset_id = latest.id
        LEFT JOIN partmaster_offline_parts parts ON parts.part_key = sources.part_key
        LEFT JOIN partmaster_offline_source_pages pages ON pages.source_url = sources.source_url
-       GROUP BY latest.id, latest.name, latest.source_file, latest.row_count, latest.imported_at
+       GROUP BY latest.id, latest.name, latest.source_file, latest.row_count, latest.imported_at,
+        processing.dataset_id, processing.usable_rows, processing.invalid_rows, processing.unique_parts, processing.scanned_at
        ORDER BY latest.row_count DESC`,
     );
-    return reader.getRowObjectsJson();
+    const summaryReader = await connection.runAndReadAll(
+      `SELECT
+        count(DISTINCT sources.part_key) AS raw_unique_parts,
+        count(DISTINCT sources.part_key) FILTER (WHERE parts.part_key IS NOT NULL) AS master_parts,
+        count(DISTINCT sources.part_key) FILTER (WHERE parts.extracted_attribute_count > 0) AS parts_with_facts,
+        (SELECT coalesce(sum(extracted_attribute_count), 0) FROM partmaster_offline_parts) AS product_facts,
+        (SELECT count(*) FROM partmaster_offline_source_pages) AS source_pages,
+        (SELECT count(*) FROM partmaster_offline_source_pages WHERE status != 'pending') AS processed_source_pages,
+        (SELECT count(*) FROM partmaster_offline_source_pages WHERE status = 'pending') AS pending_source_pages
+       FROM partmaster_offline_part_sources sources
+       LEFT JOIN partmaster_offline_parts parts ON parts.part_key = sources.part_key`,
+    );
+    return { rows: reader.getRowObjectsJson(), summary: summaryReader.getRowObjectsJson()[0] };
   });
-  response.json({ sources });
+  const rowsBySource = new Map(databaseCoverage.rows.map((row) => [row.source_file, row]));
+  const sources = discoveredFiles.map((file) => {
+    const indexed = rowsBySource.get(file.name);
+    if (!indexed) return {
+      dataset_id: null, name: file.name.replace(/\.[^.]+$/, ""), source_file: file.name, source_bytes: file.bytes,
+      modified_at: file.modifiedAt, import_status: "not_imported", raw_rows: 0, usable_rows: 0, invalid_rows: 0,
+      unique_parts: 0, master_parts: 0, remaining_master_parts: null, parts_with_facts: 0,
+      remaining_fact_parts: null, product_facts: 0, online_verified_parts: 0, source_pages: 0,
+      processed_source_pages: 0, pending_source_pages: 0, master_coverage_percent: null,
+    };
+    const uniqueParts = Number(indexed.unique_parts || 0);
+    const masterParts = Number(indexed.master_parts || 0);
+    const partsWithFacts = Number(indexed.parts_with_facts || 0);
+    const isIndexed = Boolean(indexed.is_indexed);
+    return {
+      ...indexed, source_bytes: file.bytes, modified_at: file.modifiedAt,
+      import_status: isIndexed ? "indexed" : "imported_not_indexed",
+      remaining_master_parts: isIndexed ? Math.max(0, uniqueParts - masterParts) : null,
+      remaining_fact_parts: isIndexed ? Math.max(0, masterParts - partsWithFacts) : null,
+      master_coverage_percent: isIndexed ? (uniqueParts ? Math.round((masterParts / uniqueParts) * 1000) / 10 : 100) : null,
+    };
+  });
+  const importedFiles = sources.filter((source) => source.dataset_id).length;
+  const indexedFiles = sources.filter((source) => source.import_status === "indexed").length;
+  const knownRawRows = sources.reduce((sum, source) => sum + Number(source.raw_rows || 0), 0);
+  const indexedRawRows = sources.filter((source) => source.import_status === "indexed").reduce((sum, source) => sum + Number(source.raw_rows || 0), 0);
+  const usableRows = sources.reduce((sum, source) => sum + Number(source.usable_rows || 0), 0);
+  const invalidRows = sources.filter((source) => source.import_status === "indexed").reduce((sum, source) => sum + Number(source.invalid_rows || 0), 0);
+  const rawUniqueParts = Number(databaseCoverage.summary.raw_unique_parts || 0);
+  const masterParts = Number(databaseCoverage.summary.master_parts || 0);
+  const partsWithFacts = Number(databaseCoverage.summary.parts_with_facts || 0);
+  response.json({
+    sources: sources.sort((left, right) => Number(right.raw_rows || 0) - Number(left.raw_rows || 0) || left.source_file.localeCompare(right.source_file)),
+    rawDataPath: RAWDATA_ROOT,
+    summary: {
+      discovered_files: sources.length, imported_files: importedFiles, indexed_files: indexedFiles,
+      unimported_files: sources.length - importedFiles, unindexed_files: sources.length - indexedFiles,
+      known_raw_rows: knownRawRows, indexed_raw_rows: indexedRawRows,
+      pending_scan_rows: Math.max(0, knownRawRows - indexedRawRows), usable_rows: usableRows,
+      invalid_rows: invalidRows, raw_unique_parts: rawUniqueParts,
+      master_parts: masterParts, remaining_master_parts: Math.max(0, rawUniqueParts - masterParts),
+      master_coverage_percent: rawUniqueParts ? Math.round((masterParts / rawUniqueParts) * 1000) / 10 : 0,
+      parts_with_facts: partsWithFacts, remaining_fact_parts: Math.max(0, masterParts - partsWithFacts),
+      product_facts: Number(databaseCoverage.summary.product_facts || 0),
+      source_pages: Number(databaseCoverage.summary.source_pages || 0),
+      processed_source_pages: Number(databaseCoverage.summary.processed_source_pages || 0),
+      pending_source_pages: Number(databaseCoverage.summary.pending_source_pages || 0),
+    },
+  });
 }));
 
 app.get("/api/local/master-dashboard", asyncRoute(async (_request, response) => {
