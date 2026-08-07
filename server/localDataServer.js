@@ -18,6 +18,7 @@ const importJobs = new Map();
 const activeEnrichmentJobs = new Set();
 const activeRowEnhancementJobs = new Set();
 const activeAutopilotJobs = new Set();
+const activePipelineJobs = new Set();
 const compatibilityQueue = [];
 const queuedCompatibilityKeys = new Set();
 let compatibilityWorkerRunning = false;
@@ -192,6 +193,87 @@ await withConnection((connection) => connection.run(`
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     UNIQUE (part_id, attribute_name)
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_pipeline_jobs (
+    id VARCHAR PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    status VARCHAR NOT NULL,
+    phase VARCHAR NOT NULL,
+    dataset_ids VARCHAR,
+    import_missing BOOLEAN NOT NULL DEFAULT true,
+    total_rows BIGINT NOT NULL DEFAULT 0,
+    scanned_rows BIGINT NOT NULL DEFAULT 0,
+    invalid_rows BIGINT NOT NULL DEFAULT 0,
+    unique_parts BIGINT NOT NULL DEFAULT 0,
+    duplicates_removed BIGINT NOT NULL DEFAULT 0,
+    attribute_processed BIGINT NOT NULL DEFAULT 0,
+    attributed_parts BIGINT NOT NULL DEFAULT 0,
+    attribute_facts BIGINT NOT NULL DEFAULT 0,
+    source_pages BIGINT NOT NULL DEFAULT 0,
+    online_budget INTEGER NOT NULL DEFAULT 0,
+    online_checked BIGINT NOT NULL DEFAULT 0,
+    online_verified_parts BIGINT NOT NULL DEFAULT 0,
+    current_dataset VARCHAR,
+    last_error VARCHAR,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_offline_part_sources (
+    part_key VARCHAR NOT NULL,
+    dataset_id VARCHAR NOT NULL,
+    source_row_id BIGINT,
+    manufacturer VARCHAR,
+    manufacturer_norm VARCHAR NOT NULL,
+    part_number VARCHAR,
+    part_number_norm VARCHAR NOT NULL,
+    description VARCHAR,
+    year VARCHAR,
+    model VARCHAR,
+    assembly VARCHAR,
+    item_number VARCHAR,
+    quantity VARCHAR,
+    source_url VARCHAR,
+    occurrence_count BIGINT NOT NULL DEFAULT 1,
+    PRIMARY KEY (part_key, dataset_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_offline_parts (
+    part_key VARCHAR PRIMARY KEY,
+    manufacturer VARCHAR,
+    manufacturer_norm VARCHAR NOT NULL,
+    part_number VARCHAR,
+    part_number_norm VARCHAR NOT NULL,
+    description VARCHAR,
+    family_name VARCHAR,
+    component_scope VARCHAR,
+    side VARCHAR,
+    position VARCHAR,
+    extracted_attributes_json VARCHAR,
+    extracted_attribute_count INTEGER NOT NULL DEFAULT 0,
+    occurrence_count BIGINT NOT NULL DEFAULT 0,
+    dataset_count BIGINT NOT NULL DEFAULT 0,
+    application_count BIGINT NOT NULL DEFAULT 0,
+    source_page_count BIGINT NOT NULL DEFAULT 0,
+    best_source_url VARCHAR,
+    confidence DOUBLE NOT NULL DEFAULT 0,
+    attribute_status VARCHAR NOT NULL DEFAULT 'pending',
+    online_status VARCHAR NOT NULL DEFAULT 'queued',
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_offline_source_pages (
+    source_url VARCHAR PRIMARY KEY,
+    source_host VARCHAR,
+    part_count BIGINT NOT NULL DEFAULT 0,
+    occurrence_count BIGINT NOT NULL DEFAULT 0,
+    priority_score DOUBLE NOT NULL DEFAULT 0,
+    status VARCHAR NOT NULL DEFAULT 'pending',
+    verified_parts BIGINT NOT NULL DEFAULT 0,
+    error_message VARCHAR,
+    checked_at TIMESTAMP
   );
 
   CREATE TABLE IF NOT EXISTS partmaster_part_relationships (
@@ -401,6 +483,14 @@ await withConnection((connection) => connection.run(`
     ON partmaster_part_applications (part_id);
   CREATE INDEX IF NOT EXISTS variant_attributes_part_idx
     ON partmaster_variant_attributes (part_id);
+  CREATE INDEX IF NOT EXISTS offline_parts_status_idx
+    ON partmaster_offline_parts (attribute_status, online_status);
+  CREATE INDEX IF NOT EXISTS offline_sources_dataset_idx
+    ON partmaster_offline_part_sources (dataset_id);
+  CREATE INDEX IF NOT EXISTS offline_sources_url_idx
+    ON partmaster_offline_part_sources (source_url);
+  CREATE INDEX IF NOT EXISTS offline_pages_status_idx
+    ON partmaster_offline_source_pages (status, priority_score);
   CREATE INDEX IF NOT EXISTS part_aliases_lookup_idx
     ON partmaster_part_aliases (alias_norm);
   CREATE INDEX IF NOT EXISTS field_evidence_part_idx
@@ -422,6 +512,7 @@ await withConnection((connection) => connection.run(`
 `));
 
 await withConnection((connection) => connection.run(`
+  ALTER TABLE partmaster_pipeline_jobs ADD COLUMN IF NOT EXISTS attribute_processed BIGINT DEFAULT 0;
   ALTER TABLE partmaster_enrichment_jobs ADD COLUMN IF NOT EXISTS start_row_id BIGINT DEFAULT 0;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS application_key VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS family_name VARCHAR;
@@ -1020,8 +1111,10 @@ function inferFamilyName(description, assembly) {
   if (direct) return direct[0];
   const contextual = rules.find(([, pattern]) => pattern.test(assemblyText));
   if (contextual) return contextual[0];
-  const fallback = String(assembly || description || "Unclassified Part").split(/[|,]/, 1)[0].trim();
-  return titleCase(fallback).slice(0, 160) || "Unclassified Part";
+  // A complete product description is not a category. Preserve a concise catalog
+  // assembly when supplied; otherwise use an honest general bucket.
+  const fallback = String(assembly || "").split(/[|,]/, 1)[0].trim();
+  return fallback ? titleCase(fallback).slice(0, 160) : "General Part";
 }
 
 function extractOptionCodes(text) {
@@ -1213,6 +1306,17 @@ function extractCatalogItems(html) {
       price: match[6],
       quantity: match[7],
     });
+  }
+  if (items.length) return items;
+  // MAX BMW catalog pages expose each row through an AddToCart call rather
+  // than JSON-LD. One diagram page can therefore verify many OEM numbers.
+  for (const match of String(html || "").matchAll(/AddToCart\('([^']+)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\)/gi)) {
+    const partNumber = match[1].trim();
+    if (!partNumber || byPartNumber.has(normalizePartNumber(partNumber))) continue;
+    let description = match[3].replace(/\+/g, " ");
+    try { description = decodeURIComponent(description); } catch { /* Preserve readable source text. */ }
+    byPartNumber.add(normalizePartNumber(partNumber));
+    items.push({ partNumber, description: cleanText(description), itemNumber: "", brand: "BMW", price: "", quantity: match[2].trim(), weight: match[4].trim() });
   }
   if (items.length) return items;
   for (const match of String(html || "").matchAll(/<form\b[^>]*action=["'][^"']*\/cart\/addoempart["'][^>]*>/gi)) {
@@ -2020,6 +2124,314 @@ async function importDataset(jobId, options) {
       // Preserve the original import error; a partial table is not registered.
     }
   }
+}
+
+function offlineDatasetExpressions(columns) {
+  return {
+    manufacturer: firstColumnExpression(columns, ["brand", "make", "manufacturer"]),
+    year: firstColumnExpression(columns, ["year"]),
+    model: firstColumnExpression(columns, ["model", "model_name"]),
+    assembly: firstColumnExpression(columns, ["category", "part_category", "assembly_category", "diagram_title"]),
+    itemNumber: firstColumnExpression(columns, ["pos", "item_number", "reference_number"]),
+    partNumber: firstColumnExpression(columns, ["part_number", "code", "oem_part_number"]),
+    description: firstColumnExpression(columns, ["part_name", "description"]),
+    quantity: firstColumnExpression(columns, ["quantity", "qty", "quatity"]),
+    sourceUrl: firstColumnExpression(columns, ["url", "source_url"]),
+  };
+}
+
+async function ensurePipelineDatasets(importMissing) {
+  const entries = await readdir(INBOX_ROOT, { withFileTypes: true });
+  const sourceFiles = entries
+    .filter((entry) => entry.isFile() && [".csv", ".tsv", ".txt"].includes(extname(entry.name).toLowerCase()))
+    .map((entry) => entry.name)
+    .filter((name) => !/sample/i.test(name));
+  if (importMissing) {
+    const imported = await withConnection(async (connection) => {
+      const reader = await connection.runAndReadAll("SELECT DISTINCT source_file FROM partmaster_datasets");
+      return new Set(reader.getRowObjectsJson().map((row) => row.source_file));
+    });
+    for (const filename of sourceFiles) {
+      if (imported.has(filename)) continue;
+      const importJobId = randomUUID();
+      importJobs.set(importJobId, { id: importJobId, filename, status: "queued", createdAt: new Date().toISOString() });
+      await importDataset(importJobId, { filename, name: filename.replace(/\.[^.]+$/, "") });
+      const result = importJobs.get(importJobId);
+      if (result.status !== "complete") throw new Error(`Could not import ${filename}: ${result.error || "unknown import error"}`);
+    }
+  }
+  return withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT * EXCLUDE (rank) FROM (
+       SELECT datasets.*, row_number() OVER (PARTITION BY source_file ORDER BY imported_at DESC) AS rank
+       FROM partmaster_datasets datasets WHERE source_file IN (${sourceFiles.map(quoteString).join(", ") || "''"})
+      ) latest WHERE rank = 1 ORDER BY source_file`,
+    );
+    return reader.getRowObjectsJson();
+  });
+}
+
+async function scanDatasetOffline(jobId, dataset) {
+  return withConnection(async (connection) => {
+    const columns = await getColumns(connection, dataset.table_name);
+    const fields = offlineDatasetExpressions(columns);
+    const manufacturerKey = `upper(regexp_replace(coalesce(manufacturer_raw, ''), '[^A-Za-z0-9]', '', 'g'))`;
+    const manufacturerNorm = `CASE ${manufacturerKey}
+      WHEN 'HARVEYDAVISON' THEN 'HARLEYDAVIDSON' WHEN 'HARLEYDAVISON' THEN 'HARLEYDAVIDSON'
+      ELSE ${manufacturerKey} END`;
+    const partNorm = "upper(regexp_replace(coalesce(part_number, ''), '[^A-Za-z0-9]', '', 'g'))";
+    const sourceRows = `SELECT _row_id AS source_row_id, ${fields.manufacturer} AS manufacturer_raw,
+      ${fields.partNumber} AS part_number, ${fields.description} AS description, ${fields.year} AS year,
+      ${fields.model} AS model, ${fields.assembly} AS assembly, ${fields.itemNumber} AS item_number,
+      ${fields.quantity} AS quantity, ${fields.sourceUrl} AS source_url
+      FROM ${quoteIdentifier(dataset.table_name)}`;
+    const validCondition = `manufacturer_norm IN ('BMW','HONDA','KTM','KAWASAKI','SUZUKI','YAMAHA','HARLEYDAVIDSON')
+      AND length(part_number_norm) BETWEEN 3 AND 50`;
+    const countsReader = await connection.runAndReadAll(
+      `WITH source_rows AS (${sourceRows}), normalized AS (
+       SELECT *, ${manufacturerNorm} AS manufacturer_norm, ${partNorm} AS part_number_norm FROM source_rows)
+       SELECT count(*) AS rows, count(*) FILTER (WHERE NOT (${validCondition})) AS invalid_rows FROM normalized`,
+    );
+    const counts = countsReader.getRowObjectsJson()[0];
+    await connection.run("DELETE FROM partmaster_offline_part_sources WHERE dataset_id = $datasetId", { datasetId: dataset.id });
+    await connection.run(
+      `INSERT INTO partmaster_offline_part_sources
+       (part_key, dataset_id, source_row_id, manufacturer, manufacturer_norm, part_number, part_number_norm,
+        description, year, model, assembly, item_number, quantity, source_url, occurrence_count)
+       WITH source_rows AS (${sourceRows}), normalized AS (
+        SELECT *, ${manufacturerNorm} AS manufacturer_norm, ${partNorm} AS part_number_norm FROM source_rows
+       ), valid AS (SELECT * FROM normalized WHERE ${validCondition})
+       SELECT manufacturer_norm || ':' || part_number_norm AS part_key, $datasetId,
+        min(source_row_id), arg_max(manufacturer_raw, length(coalesce(manufacturer_raw, ''))),
+        manufacturer_norm, arg_max(part_number, length(coalesce(part_number, ''))), part_number_norm,
+        arg_max(description, length(coalesce(description, ''))), arg_max(year, length(coalesce(year, ''))),
+        arg_max(model, length(coalesce(model, ''))), arg_max(assembly, length(coalesce(assembly, ''))),
+        arg_max(item_number, length(coalesce(item_number, ''))), arg_max(quantity, length(coalesce(quantity, ''))),
+        arg_max(source_url, length(coalesce(source_url, ''))), count(*)
+       FROM valid GROUP BY manufacturer_norm, part_number_norm`,
+      { datasetId: dataset.id },
+    );
+    await connection.run(
+      `UPDATE partmaster_pipeline_jobs SET scanned_rows = scanned_rows + $rows,
+       invalid_rows = invalid_rows + $invalidRows, current_dataset = $dataset WHERE id = $jobId`,
+      { jobId, rows: counts.rows, invalidRows: counts.invalid_rows, dataset: dataset.name },
+    );
+    return counts;
+  });
+}
+
+async function rebuildOfflineCatalog(jobId) {
+  return withConnection(async (connection) => {
+    await connection.run("DELETE FROM partmaster_offline_parts");
+    await connection.run(
+      `INSERT INTO partmaster_offline_parts
+       (part_key, manufacturer, manufacturer_norm, part_number, part_number_norm, description,
+        occurrence_count, dataset_count, application_count, source_page_count, best_source_url)
+       SELECT part_key, arg_max(manufacturer, length(coalesce(manufacturer, ''))), manufacturer_norm,
+        arg_max(part_number, length(coalesce(part_number, ''))), part_number_norm,
+        arg_max(description, length(coalesce(description, ''))), sum(occurrence_count), count(*),
+        sum(occurrence_count), count(DISTINCT nullif(trim(source_url), '')),
+        arg_max(source_url, length(coalesce(source_url, '')))
+       FROM partmaster_offline_part_sources GROUP BY part_key, manufacturer_norm, part_number_norm`,
+    );
+    await connection.run("DELETE FROM partmaster_offline_source_pages");
+    await connection.run(
+      `INSERT INTO partmaster_offline_source_pages
+       (source_url, source_host, part_count, occurrence_count, priority_score)
+       SELECT source_url, lower(regexp_extract(source_url, '^https?://([^/]+)', 1)), count(DISTINCT part_key),
+        sum(occurrence_count), ln(1 + sum(occurrence_count)) * count(DISTINCT part_key)
+       FROM partmaster_offline_part_sources
+       WHERE source_url IS NOT NULL AND trim(source_url) != '' AND regexp_matches(source_url, '^https?://')
+       GROUP BY source_url`,
+    );
+    const reader = await connection.runAndReadAll(
+      `SELECT (SELECT count(*) FROM partmaster_offline_parts) AS unique_parts,
+       (SELECT count(*) FROM partmaster_offline_source_pages) AS source_pages,
+       (SELECT coalesce(sum(occurrence_count), 0) FROM partmaster_offline_parts) AS occurrences`,
+    );
+    const stats = reader.getRowObjectsJson()[0];
+    await connection.run(
+      `UPDATE partmaster_pipeline_jobs SET unique_parts = $uniqueParts, source_pages = $sourcePages,
+       duplicates_removed = greatest(0, total_rows - invalid_rows - $uniqueParts), phase = 'extracting_attributes'
+       WHERE id = $jobId`,
+      { jobId, uniqueParts: stats.unique_parts, sourcePages: stats.source_pages },
+    );
+    return stats;
+  });
+}
+
+async function extractOfflineAttributes(jobId) {
+  while (!shuttingDown) {
+    const state = await withConnection(async (connection) => {
+      const jobReader = await connection.runAndReadAll("SELECT status FROM partmaster_pipeline_jobs WHERE id = $jobId", { jobId });
+      if (jobReader.getRowObjectsJson()[0]?.status !== "running") return null;
+      const reader = await connection.runAndReadAll(
+        "SELECT * FROM partmaster_offline_parts WHERE attribute_status = 'pending' ORDER BY occurrence_count DESC LIMIT 1000",
+      );
+      return reader.getRowObjectsJson();
+    });
+    if (!state?.length) break;
+    await withConnection(async (connection) => {
+      await connection.run("BEGIN TRANSACTION");
+      try {
+        for (const part of state) {
+          const candidate = { description_raw: part.description, assembly: "", part_number_raw: part.part_number, manufacturer_raw: part.manufacturer };
+          const intelligence = inferVariantIntelligence(candidate);
+          const attributes = inferCategoryAttributes({ ...candidate, family_name: intelligence.familyName }, part.description);
+          await connection.run(
+            `UPDATE partmaster_offline_parts SET family_name = $familyName, component_scope = $componentScope,
+             side = $side, position = $position, extracted_attributes_json = $attributes,
+             extracted_attribute_count = $attributeCount, confidence = $confidence,
+             attribute_status = 'complete', updated_at = current_timestamp WHERE part_key = $partKey`,
+            {
+              partKey: part.part_key, familyName: intelligence.familyName, componentScope: intelligence.componentScope,
+              side: intelligence.side, position: intelligence.position || null, attributes: JSON.stringify(attributes),
+              attributeCount: Object.keys(attributes).length, confidence: part.description ? 0.7 : 0.5,
+            },
+          );
+        }
+        await connection.run("COMMIT");
+      } catch (error) {
+        await connection.run("ROLLBACK"); throw error;
+      }
+      await connection.run(
+        `UPDATE partmaster_pipeline_jobs SET
+         attribute_processed = (SELECT count(*) FROM partmaster_offline_parts WHERE attribute_status = 'complete'),
+         attributed_parts = (SELECT count(*) FROM partmaster_offline_parts WHERE extracted_attribute_count > 0),
+         attribute_facts = (SELECT coalesce(sum(extracted_attribute_count), 0) FROM partmaster_offline_parts)
+         WHERE id = $jobId`, { jobId },
+      );
+    });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+  }
+}
+
+async function checkOfflineSourcePages(jobId, budget) {
+  await withConnection((connection) => connection.run(
+    "UPDATE partmaster_pipeline_jobs SET phase = 'checking_shared_sources' WHERE id = $jobId", { jobId },
+  ));
+  for (let index = 0; index < budget && !shuttingDown; index += 1) {
+    const context = await withConnection(async (connection) => {
+      const jobReader = await connection.runAndReadAll("SELECT status FROM partmaster_pipeline_jobs WHERE id = $jobId", { jobId });
+      if (jobReader.getRowObjectsJson()[0]?.status !== "running") return null;
+      const pageReader = await connection.runAndReadAll(
+        "SELECT * FROM partmaster_offline_source_pages WHERE status = 'pending' ORDER BY priority_score DESC LIMIT 1",
+      );
+      const page = pageReader.getRowObjectsJson()[0];
+      if (!page) return null;
+      await connection.run("UPDATE partmaster_offline_source_pages SET status = 'checking' WHERE source_url = $url", { url: page.source_url });
+      return page;
+    });
+    if (!context) break;
+    try {
+      const page = await getEvidencePage(context.source_url);
+      const items = extractCatalogItems(page.html);
+      const byNumber = new Map(items.map((item) => [normalizePartNumber(item.partNumber), item]));
+      const parts = await withConnection(async (connection) => {
+        const reader = await connection.runAndReadAll(
+          `SELECT DISTINCT parts.* FROM partmaster_offline_parts parts
+           JOIN partmaster_offline_part_sources sources ON sources.part_key = parts.part_key
+           WHERE sources.source_url = $url LIMIT 10000`, { url: context.source_url },
+        );
+        return reader.getRowObjectsJson();
+      });
+      let verified = 0;
+      await withConnection(async (connection) => {
+        await connection.run("BEGIN TRANSACTION");
+        try {
+          for (const part of parts) {
+            const item = byNumber.get(part.part_number_norm);
+            if (!item) continue;
+            const description = item.description || part.description;
+            const candidate = { description_raw: description, part_number_raw: part.part_number, manufacturer_raw: part.manufacturer };
+            const familyName = inferFamilyName(description, "");
+            const attributes = inferCategoryAttributes({ ...candidate, family_name: familyName }, description);
+            await connection.run(
+              `UPDATE partmaster_offline_parts SET description = coalesce(nullif($description, ''), description),
+               family_name = $familyName, extracted_attributes_json = $attributes,
+               extracted_attribute_count = $attributeCount, confidence = .98, online_status = 'verified',
+               updated_at = current_timestamp WHERE part_key = $partKey`,
+              { partKey: part.part_key, description, familyName, attributes: JSON.stringify(attributes), attributeCount: Object.keys(attributes).length },
+            );
+            verified += 1;
+          }
+          await connection.run("COMMIT");
+        } catch (error) { await connection.run("ROLLBACK"); throw error; }
+        await connection.run(
+          `UPDATE partmaster_offline_source_pages SET status = $status, verified_parts = $verified,
+           checked_at = current_timestamp, error_message = NULL WHERE source_url = $url`,
+          { url: context.source_url, status: items.length ? "checked" : "no_structured_items", verified },
+        );
+        await connection.run(
+          `UPDATE partmaster_pipeline_jobs SET online_checked = online_checked + 1,
+           online_verified_parts = online_verified_parts + $verified WHERE id = $jobId`, { jobId, verified },
+        );
+      });
+      if (!page.cacheHit) await new Promise((resolvePromise) => setTimeout(resolvePromise, 350));
+    } catch (error) {
+      await withConnection(async (connection) => {
+        await connection.run(
+          `UPDATE partmaster_offline_source_pages SET status = 'failed', error_message = $error,
+           checked_at = current_timestamp WHERE source_url = $url`,
+          { url: context.source_url, error: error.message },
+        );
+        await connection.run("UPDATE partmaster_pipeline_jobs SET online_checked = online_checked + 1 WHERE id = $jobId", { jobId });
+      });
+    }
+  }
+}
+
+async function runFullPipeline(jobId) {
+  if (activePipelineJobs.has(jobId)) return;
+  activePipelineJobs.add(jobId);
+  try {
+    const job = await withConnection(async (connection) => {
+      await connection.run(
+        `UPDATE partmaster_pipeline_jobs SET status = 'running', phase = 'importing_sources',
+         started_at = coalesce(started_at, current_timestamp), completed_at = NULL, last_error = NULL WHERE id = $jobId`, { jobId },
+      );
+      const reader = await connection.runAndReadAll("SELECT * FROM partmaster_pipeline_jobs WHERE id = $jobId", { jobId });
+      return reader.getRowObjectsJson()[0];
+    });
+    let datasets = await ensurePipelineDatasets(Boolean(job.import_missing));
+    const selectedIds = new Set(String(job.dataset_ids || "").split(",").filter(Boolean));
+    if (selectedIds.size) datasets = datasets.filter((dataset) => selectedIds.has(dataset.id));
+    if (!datasets.length) throw new Error("No imported source datasets are available for the full pipeline.");
+    const totalRows = datasets.reduce((sum, dataset) => sum + Number(dataset.row_count || 0), 0);
+    await withConnection((connection) => connection.run(
+      `UPDATE partmaster_pipeline_jobs SET phase = 'normalizing_and_deduplicating', total_rows = $totalRows,
+       scanned_rows = 0, invalid_rows = 0, attributed_parts = 0, attribute_facts = 0,
+       online_checked = 0, online_verified_parts = 0 WHERE id = $jobId`, { jobId, totalRows },
+    ));
+    for (const dataset of datasets) {
+      const running = await withConnection(async (connection) => {
+        const reader = await connection.runAndReadAll("SELECT status FROM partmaster_pipeline_jobs WHERE id = $jobId", { jobId });
+        return reader.getRowObjectsJson()[0]?.status === "running";
+      });
+      if (!running) return;
+      await scanDatasetOffline(jobId, dataset);
+    }
+    await rebuildOfflineCatalog(jobId);
+    await extractOfflineAttributes(jobId);
+    await checkOfflineSourcePages(jobId, Number(job.online_budget || 0));
+    await withConnection((connection) => connection.run(
+      `UPDATE partmaster_pipeline_jobs SET status = 'completed', phase = 'completed', current_dataset = NULL,
+       attributed_parts = (SELECT count(*) FROM partmaster_offline_parts WHERE extracted_attribute_count > 0),
+       attribute_facts = (SELECT coalesce(sum(extracted_attribute_count), 0) FROM partmaster_offline_parts),
+       completed_at = current_timestamp WHERE id = $jobId AND status = 'running'`, { jobId },
+    ));
+  } catch (error) {
+    await withConnection((connection) => connection.run(
+      "UPDATE partmaster_pipeline_jobs SET status = 'failed', phase = 'failed', last_error = $error, completed_at = current_timestamp WHERE id = $jobId",
+      { jobId, error: error.message },
+    )).catch(() => {});
+  } finally {
+    activePipelineJobs.delete(jobId);
+  }
+}
+
+function scheduleFullPipeline(jobId) {
+  setImmediate(() => runFullPipeline(jobId));
 }
 
 async function refreshEnrichmentJobStats(connection, jobId) {
@@ -3199,6 +3611,146 @@ app.get("/api/local/datasets", asyncRoute(async (_request, response) => {
   response.json({ datasets, databasePath: DATABASE_PATH });
 }));
 
+app.get("/api/local/pipeline/jobs", asyncRoute(async (_request, response) => {
+  const jobs = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll("SELECT * FROM partmaster_pipeline_jobs ORDER BY created_at DESC LIMIT 20");
+    return reader.getRowObjectsJson();
+  });
+  response.json({ jobs });
+}));
+
+app.post("/api/local/pipeline/jobs", asyncRoute(async (request, response) => {
+  const active = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll("SELECT id FROM partmaster_pipeline_jobs WHERE status IN ('queued', 'running') LIMIT 1");
+    return reader.getRowObjectsJson()[0];
+  });
+  if (active) return response.status(409).json({ error: "A full-dataset pipeline is already running." });
+  const id = randomUUID();
+  const datasetIds = Array.isArray(request.body.datasetIds) ? request.body.datasetIds.map(String).filter(Boolean) : [];
+  const onlineBudget = Math.max(0, Math.min(5000, Number(request.body.onlineBudget) || 250));
+  const importMissing = request.body.importMissing !== false;
+  await withConnection((connection) => connection.run(
+    `INSERT INTO partmaster_pipeline_jobs
+     (id, name, status, phase, dataset_ids, import_missing, online_budget)
+     VALUES ($id, $name, 'queued', 'queued', $datasetIds, $importMissing, $onlineBudget)`,
+    {
+      id,
+      name: String(request.body.name || "Full local parts pipeline").slice(0, 200),
+      datasetIds: datasetIds.join(",") || null,
+      importMissing,
+      onlineBudget,
+    },
+  ));
+  scheduleFullPipeline(id);
+  response.status(202).json({ jobId: id });
+}));
+
+app.post("/api/local/pipeline/jobs/:id/pause", asyncRoute(async (request, response) => {
+  await withConnection((connection) => connection.run(
+    "UPDATE partmaster_pipeline_jobs SET status = 'paused' WHERE id = $id AND status IN ('queued', 'running')", { id: request.params.id },
+  ));
+  response.json({ ok: true });
+}));
+
+app.post("/api/local/pipeline/jobs/:id/resume", asyncRoute(async (request, response) => {
+  const resumed = await withConnection(async (connection) => {
+    await connection.run(
+      "UPDATE partmaster_pipeline_jobs SET status = 'queued', phase = 'queued', completed_at = NULL, last_error = NULL WHERE id = $id AND status IN ('paused', 'failed')",
+      { id: request.params.id },
+    );
+    const reader = await connection.runAndReadAll("SELECT status FROM partmaster_pipeline_jobs WHERE id = $id", { id: request.params.id });
+    return reader.getRowObjectsJson()[0]?.status === "queued";
+  });
+  if (resumed) scheduleFullPipeline(request.params.id);
+  response.json({ ok: true, resumed });
+}));
+
+app.get("/api/local/pipeline/catalog", asyncRoute(async (request, response) => {
+  const query = String(request.query.q || "").trim().toLowerCase();
+  const limit = Math.max(10, Math.min(200, Number(request.query.limit) || 50));
+  const result = await withConnection(async (connection) => {
+    const values = {};
+    let condition = "";
+    if (query) {
+      condition = "WHERE lower(concat_ws(' ', manufacturer, part_number, description, family_name, extracted_attributes_json)) LIKE $query";
+      values.query = `%${query}%`;
+    }
+    const rowsReader = await connection.runAndReadAll(
+      `SELECT * FROM partmaster_offline_parts ${condition} ORDER BY occurrence_count DESC LIMIT ${limit}`, values,
+    );
+    const statsReader = await connection.runAndReadAll(
+      `SELECT count(*) AS unique_parts, coalesce(sum(occurrence_count), 0) AS raw_occurrences,
+       count(*) FILTER (WHERE extracted_attribute_count > 0) AS attributed_parts,
+       coalesce(sum(extracted_attribute_count), 0) AS attribute_facts,
+       count(*) FILTER (WHERE online_status = 'verified') AS online_verified_parts
+       FROM partmaster_offline_parts`,
+    );
+    return { rows: rowsReader.getRowObjectsJson(), stats: statsReader.getRowObjectsJson()[0] };
+  });
+  response.json(result);
+}));
+
+app.post("/api/local/pipeline/exports", asyncRoute(async (_request, response) => {
+  const attributeKeys = [...new Set(CATEGORY_ATTRIBUTE_SCHEMAS.flatMap((schema) => schema.attributes.map((attribute) => attribute.key)))]
+    .filter((key) => !["side", "position"].includes(key));
+  const attributeColumns = attributeKeys.map((key) =>
+    `json_extract_string(extracted_attributes_json, '$.${key}') AS ${quoteIdentifier(key)}`).join(",\n       ");
+  const exports = await withConnection(async (connection) => {
+    const stamp = Date.now();
+    const catalogFilename = `full-enriched-parts-${stamp}.csv`;
+    const sourcesFilename = `full-part-source-traceability-${stamp}.csv`;
+    const pagesFilename = `full-source-page-quality-${stamp}.csv`;
+    const catalogPath = join(EXPORT_ROOT, catalogFilename);
+    const sourcesPath = join(EXPORT_ROOT, sourcesFilename);
+    const pagesPath = join(EXPORT_ROOT, pagesFilename);
+    await connection.run(
+      `COPY (SELECT manufacturer AS "Manufacturer", part_number AS "OEM Part Number",
+       description AS "Description", family_name AS "Part Family", component_scope AS "Component Scope",
+       side AS "Side", position AS "Position", ${attributeColumns},
+       occurrence_count AS "Raw Occurrences", dataset_count AS "Source Datasets",
+       application_count AS "Applications", source_page_count AS "Source Pages",
+       extracted_attribute_count AS "Extracted Facts", confidence AS "Confidence",
+       attribute_status AS "Attribute Status", online_status AS "Online Evidence Status",
+       best_source_url AS "Best Source URL", manufacturer_norm AS "Normalized Manufacturer",
+       part_number_norm AS "Normalized OEM Number", part_key AS "Global Part Key"
+       FROM partmaster_offline_parts ORDER BY manufacturer_norm, part_number_norm)
+       TO ${quoteString(catalogPath)} (FORMAT CSV, HEADER true)`,
+    );
+    await connection.run(
+      `COPY (SELECT sources.manufacturer AS "Manufacturer", sources.part_number AS "OEM Part Number",
+       datasets.name AS "Dataset", datasets.source_file AS "Source File", sources.source_row_id AS "Representative Row",
+       sources.description AS "Source Description", sources.year AS "Year", sources.model AS "Model",
+       sources.assembly AS "Assembly", sources.item_number AS "Item Number", sources.quantity AS "Quantity",
+       sources.occurrence_count AS "Occurrences", sources.source_url AS "Source URL", sources.part_key AS "Global Part Key"
+       FROM partmaster_offline_part_sources sources
+       LEFT JOIN partmaster_datasets datasets ON datasets.id = sources.dataset_id
+       ORDER BY sources.manufacturer_norm, sources.part_number_norm, datasets.name)
+       TO ${quoteString(sourcesPath)} (FORMAT CSV, HEADER true)`,
+    );
+    await connection.run(
+      `COPY (SELECT source_host AS "Source Host", source_url AS "Source URL", part_count AS "Unique Parts",
+       occurrence_count AS "Raw Occurrences", priority_score AS "Priority Score", status AS "Check Status",
+       verified_parts AS "Verified Parts", error_message AS "Error", checked_at AS "Checked At"
+       FROM partmaster_offline_source_pages ORDER BY priority_score DESC)
+       TO ${quoteString(pagesPath)} (FORMAT CSV, HEADER true)`,
+    );
+    return Promise.all([
+      { filename: catalogFilename, path: catalogPath },
+      { filename: sourcesFilename, path: sourcesPath },
+      { filename: pagesFilename, path: pagesPath },
+    ].map(async (item) => ({ ...item, bytes: (await stat(item.path)).size, downloadUrl: `/api/local/exports/${encodeURIComponent(item.filename)}` })));
+  });
+  response.json({ exports });
+}));
+
+app.get("/api/local/exports/:filename", asyncRoute(async (request, response) => {
+  const filename = basename(String(request.params.filename || ""));
+  if (!filename.toLowerCase().endsWith(".csv")) return response.status(400).json({ error: "Only CSV exports can be downloaded." });
+  const exportPath = join(EXPORT_ROOT, filename);
+  await stat(exportPath);
+  response.download(exportPath, filename);
+}));
+
 app.post("/api/local/imports", asyncRoute(async (request, response) => {
   const filename = String(request.body.filename || "");
   const sourcePath = safeInboxFile(filename);
@@ -4325,6 +4877,12 @@ const resumableAutopilotJobIds = await withConnection(async (connection) => {
   return reader.getRowObjectsJson().map((job) => job.id);
 });
 
+const resumablePipelineJobIds = await withConnection(async (connection) => {
+  await connection.run("UPDATE partmaster_pipeline_jobs SET status = 'queued', phase = 'queued' WHERE status = 'running'");
+  const reader = await connection.runAndReadAll("SELECT id FROM partmaster_pipeline_jobs WHERE status = 'queued'");
+  return reader.getRowObjectsJson().map((job) => job.id);
+});
+
 const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`Partmaster local data service: http://127.0.0.1:${PORT}`);
   console.log(`Local data directory: ${DATA_ROOT}`);
@@ -4340,6 +4898,7 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   resumableJobIds.forEach(scheduleEnrichmentJob);
   resumableRowEnhancementJobIds.forEach(scheduleRowEnhancementJob);
   resumableAutopilotJobIds.forEach(scheduleAutopilotJob);
+  resumablePipelineJobIds.forEach(scheduleFullPipeline);
 });
 
 async function shutdown(signal) {
@@ -4348,7 +4907,7 @@ async function shutdown(signal) {
   console.log(`Received ${signal}; checkpointing local data before shutdown…`);
   server.close();
   const deadline = Date.now() + 20_000;
-  while ((activeEnrichmentJobs.size || activeRowEnhancementJobs.size || activeAutopilotJobs.size) && Date.now() < deadline) {
+  while ((activeEnrichmentJobs.size || activeRowEnhancementJobs.size || activeAutopilotJobs.size || activePipelineJobs.size) && Date.now() < deadline) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
   try {
