@@ -30,6 +30,11 @@ export default function MasterDataPage() {
 
   useEffect(() => {
     fetch(`${import.meta.env.BASE_URL}data/master-metrics.json`).then((response) => response.json()).then(setMetrics).catch(() => null);
+    const localHostname = ["127.0.0.1", "localhost", "::1"].includes(window.location.hostname);
+    if (!localHostname) {
+      setConnected(false);
+      return;
+    }
     Promise.all([localDataApi.masterDashboard(), localDataApi.masterCatalogFilters()])
       .then(([dashboard, availableFilters]) => { setMetrics(dashboard); setMetricSource("live"); setFilters(availableFilters); setConnected(true); })
       .catch(() => setConnected(false));
