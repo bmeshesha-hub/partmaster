@@ -48,19 +48,30 @@ but the local-data screen can only connect when the Mac service is running.
 The **Enrichment** workspace creates persistent, resumable jobs in DuckDB. A
 job takes a bounded set of deduplicated part-application candidates from an imported dataset,
 normalizes manufacturer and OEM numbers, checks each public source URL, and
-extracts product evidence from structured page metadata. High-confidence exact
-matches are promoted automatically; missing, conflicting, blocked, and weaker
-results stay in an evidence-review queue.
+extracts product evidence from structured page metadata. Source pages are cached
+for seven days, so parts from the same diagram reuse one online request instead
+of downloading the page for every row. High-confidence exact matches are
+promoted automatically; missing, conflicting, blocked, and weaker results stay
+in an evidence-review queue.
 
 Approved records are stored at two levels:
 
 - `partmaster_canonical_parts`: one row per manufacturer and normalized OEM
   part number.
 - `partmaster_part_applications`: vehicle, assembly, item number, side,
-  position, quantity, and source relationships for each part.
+  position, quantity, required/excluded option codes, fitment explanation, and
+  source relationships for each part.
+- `partmaster_part_families` and `partmaster_variant_attributes`: groups related
+  parts while preserving differences such as heated, auto-dimming, power-fold,
+  memory, blind-spot, camera, turn signal, connector pins, and component scope.
+- `partmaster_part_relationships`: explicit supersession and interchange rules,
+  including conditional and not-interchangeable relationships.
 
-Use **Export master CSVs** to create separate part-master and application files
-in `local_data/exports/`. The original imported rows are never overwritten.
+The evidence-review screen compares a candidate with existing variants in its
+family before approval and makes unknown features visible instead of assuming
+two similar part numbers are interchangeable. Use **Export master CSVs** to
+create part-master, application, and relationship files in
+`local_data/exports/`. The original imported rows are never overwritten.
 
 Start with 1,000 candidates. The worker is deliberately conservative and
 currently verifies the source URLs already present in imported catalogs; it

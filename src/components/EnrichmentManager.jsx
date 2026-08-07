@@ -85,8 +85,24 @@ function EnrichmentJourney({ job, stats }) {
       <div><p className="font-bold">{running ? `Actively checking record ${Math.min(processed + 1, total).toLocaleString()}` : completed ? "This batch has completed its journey" : "Ready when you are"}</p><p className="mt-1 text-sm text-slate-400">{job ? `${processed.toLocaleString()} of ${total.toLocaleString()} candidates processed. Online checks use the source URL already stored in each CSV row.` : "Start a small batch below to see records move through every stage."}</p><div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-cyan-400 via-blue-400 to-violet-400 transition-all duration-700" style={{ width: `${percent}%` }} /></div></div>
       <div className="grid grid-cols-3 gap-2 text-center"><div className="rounded-xl bg-emerald-400/10 px-3 py-2"><p className="text-lg font-black text-emerald-300">{accepted.toLocaleString()}</p><p className="text-[10px] font-bold uppercase tracking-wide text-emerald-200/70">Accepted</p></div><div className="rounded-xl bg-amber-400/10 px-3 py-2"><p className="text-lg font-black text-amber-300">{review.toLocaleString()}</p><p className="text-[10px] font-bold uppercase tracking-wide text-amber-200/70">Review</p></div><div className="rounded-xl bg-rose-400/10 px-3 py-2"><p className="text-lg font-black text-rose-300">{unresolved.toLocaleString()}</p><p className="text-[10px] font-bold uppercase tracking-wide text-rose-200/70">Unresolved</p></div></div>
     </div>
-    <p className="relative z-10 mt-4 text-center text-xs text-slate-500">Master database now contains {Number(stats.parts || 0).toLocaleString()} unique parts and {Number(stats.applications || 0).toLocaleString()} verified applications.</p>
+    <p className="relative z-10 mt-4 text-center text-xs text-slate-500">Master database now contains {Number(stats.parts || 0).toLocaleString()} unique parts across {Number(stats.families || 0).toLocaleString()} variant families, with {Number(stats.applications || 0).toLocaleString()} verified applications and {Number(stats.cached_pages || 0).toLocaleString()} reusable source pages.</p>
   </section>;
+}
+
+function FeedbackDialog({ type, message, onClose }) {
+  if (!message) return null;
+  const isError = type === "error";
+  return <div className="fixed inset-0 z-[70] grid place-items-center bg-slate-950/60 p-4 backdrop-blur-sm" role={isError ? "alertdialog" : "dialog"} aria-modal="true">
+    <div className={`w-full max-w-lg overflow-hidden rounded-3xl border bg-white shadow-2xl ${isError ? "border-red-200" : "border-emerald-200"}`}>
+      <div className={`grid place-items-center px-6 pb-5 pt-8 text-center ${isError ? "bg-red-50" : "bg-emerald-50"}`}><span className={`grid h-16 w-16 place-items-center rounded-2xl text-white shadow-lg ${isError ? "bg-red-600" : "bg-emerald-600"}`}>{isError ? <AlertTriangle size={30} /> : <Check size={30} />}</span><h3 className={`mt-4 text-xl font-bold ${isError ? "text-red-950" : "text-emerald-950"}`}>{isError ? "Action needs attention" : "Success"}</h3><p className={`mt-2 max-w-md text-sm leading-6 ${isError ? "text-red-800" : "text-emerald-800"}`}>{message}</p></div>
+      <div className="flex justify-center bg-white px-6 py-5"><button type="button" onClick={onClose} autoFocus className={`min-w-32 rounded-xl px-5 py-2.5 text-sm font-bold text-white ${isError ? "bg-red-600 hover:bg-red-700" : "bg-emerald-600 hover:bg-emerald-700"}`}>{isError ? "Return to review" : "Continue"}</button></div>
+    </div>
+  </div>;
+}
+
+function FeatureSelect({ label, value, onChange }) {
+  const tone = value === "yes" ? "border-emerald-300 bg-emerald-50 text-emerald-800" : value === "no" ? "border-red-200 bg-red-50 text-red-800" : "border-slate-300 bg-white text-slate-700";
+  return <label className="text-xs font-bold uppercase tracking-wide text-slate-500">{label}<select value={value || "unknown"} onChange={(event) => onChange(event.target.value)} className={`mt-1.5 w-full rounded-xl border px-3 py-2.5 text-sm font-semibold normal-case tracking-normal ${tone}`}><option value="unknown">Unknown</option><option value="yes">Yes</option><option value="no">No</option></select></label>;
 }
 
 function ReviewModal({ candidate, onClose, onDecision }) {
@@ -96,14 +112,45 @@ function ReviewModal({ candidate, onClose, onDecision }) {
     side: candidate.side || "Unknown",
     position: candidate.position || "",
     locationNotes: candidate.location_notes || "",
+    familyName: candidate.family_name || "",
+    componentScope: candidate.component_scope || "component",
+    heatedState: candidate.heated_state || "unknown",
+    autoDimmingState: candidate.auto_dimming_state || "unknown",
+    powerFoldingState: candidate.power_folding_state || "unknown",
+    memoryState: candidate.memory_state || "unknown",
+    blindSpotState: candidate.blind_spot_state || "unknown",
+    cameraState: candidate.camera_state || "unknown",
+    turnSignalState: candidate.turn_signal_state || "unknown",
+    connectorPins: candidate.connector_pins || "",
+    requiredOptions: candidate.required_options || "",
+    excludedOptions: candidate.excluded_options || "",
+    variantSummary: candidate.variant_summary || "",
+    fitmentExplanation: candidate.fitment_explanation || "",
     notes: candidate.decision_notes || "",
   });
   const [saving, setSaving] = useState(false);
+  const [reviewError, setReviewError] = useState("");
+  const [comparison, setComparison] = useState({ familyName: "", variants: [] });
+  const [comparisonLoading, setComparisonLoading] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    setComparisonLoading(true);
+    localDataApi.candidateVariants(candidate.id).then((result) => {
+      if (active) setComparison(result);
+    }).catch(() => {
+      if (active) setComparison({ familyName: candidate.family_name || "", variants: [] });
+    }).finally(() => { if (active) setComparisonLoading(false); });
+    return () => { active = false; };
+  }, [candidate.family_name, candidate.id]);
 
   async function decide(decision) {
     setSaving(true);
+    setReviewError("");
     try {
       await onDecision(decision, values);
+    } catch (requestError) {
+      setReviewError(requestError.message || "The review decision could not be saved.");
     } finally {
       setSaving(false);
     }
@@ -115,12 +162,40 @@ function ReviewModal({ candidate, onClose, onDecision }) {
         <div><h3 className="font-semibold">Review enrichment evidence</h3><p className="mt-1 text-xs text-slate-500">Source row {candidate.source_row_id} · Confidence {Math.round(Number(candidate.confidence || 0) * 100)}%</p></div>
         <button type="button" onClick={onClose} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"><X size={18} /></button>
       </header>
+      {reviewError && <div className="mx-5 mt-5 flex items-start gap-3 rounded-2xl border-2 border-red-300 bg-red-50 p-4 text-red-900" role="alert"><AlertTriangle className="mt-0.5 shrink-0 text-red-600" size={22} /><div><p className="font-bold">Could not save this review</p><p className="mt-1 text-sm leading-5">{reviewError}</p><p className="mt-2 text-xs font-semibold text-red-700">Your edits are still here. Correct the issue and try again.</p></div></div>}
       <div className="grid gap-4 p-5 sm:grid-cols-2">
         <label className="text-sm font-medium text-slate-700">OEM Part Number<input value={values.partNumber} onChange={(event) => setValues((current) => ({ ...current, partNumber: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-mono font-normal" /></label>
         <label className="text-sm font-medium text-slate-700">Side<select value={values.side} onChange={(event) => setValues((current) => ({ ...current, side: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 font-normal">{["Unknown", "Left", "Right", "Center", "Universal"].map((side) => <option key={side}>{side}</option>)}</select></label>
         <label className="text-sm font-medium text-slate-700 sm:col-span-2">Description<input value={values.description} onChange={(event) => setValues((current) => ({ ...current, description: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
         <label className="text-sm font-medium text-slate-700">Position<input value={values.position} onChange={(event) => setValues((current) => ({ ...current, position: event.target.value }))} placeholder="Position 1, Front Upper…" className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
         <label className="text-sm font-medium text-slate-700">Location notes<input value={values.locationNotes} onChange={(event) => setValues((current) => ({ ...current, locationNotes: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
+        <section className="rounded-2xl border border-violet-200 bg-violet-50/60 p-4 sm:col-span-2">
+          <div className="flex items-start gap-3"><span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-violet-600 text-white"><Sparkles size={19} /></span><div><h4 className="font-bold text-violet-950">Variant configuration</h4><p className="mt-1 text-xs leading-5 text-violet-700">These attributes prevent similar-looking part numbers from being treated as interchangeable when their equipment differs.</p></div></div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <label className="text-xs font-bold uppercase tracking-wide text-slate-500">Part family<input value={values.familyName} onChange={(event) => setValues((current) => ({ ...current, familyName: event.target.value }))} placeholder="Exterior Mirror" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label>
+            <label className="text-xs font-bold uppercase tracking-wide text-slate-500">Component scope<select value={values.componentScope} onChange={(event) => setValues((current) => ({ ...current, componentScope: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal"><option value="assembly">Complete assembly</option><option value="component">Component</option><option value="kit">Kit</option><option value="unknown">Unknown</option></select></label>
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <FeatureSelect label="Heated" value={values.heatedState} onChange={(value) => setValues((current) => ({ ...current, heatedState: value }))} />
+            <FeatureSelect label="Auto dimming" value={values.autoDimmingState} onChange={(value) => setValues((current) => ({ ...current, autoDimmingState: value }))} />
+            <FeatureSelect label="Power folding" value={values.powerFoldingState} onChange={(value) => setValues((current) => ({ ...current, powerFoldingState: value }))} />
+            <FeatureSelect label="Memory" value={values.memoryState} onChange={(value) => setValues((current) => ({ ...current, memoryState: value }))} />
+            <FeatureSelect label="Blind spot" value={values.blindSpotState} onChange={(value) => setValues((current) => ({ ...current, blindSpotState: value }))} />
+            <FeatureSelect label="Camera" value={values.cameraState} onChange={(value) => setValues((current) => ({ ...current, cameraState: value }))} />
+            <FeatureSelect label="Turn signal" value={values.turnSignalState} onChange={(value) => setValues((current) => ({ ...current, turnSignalState: value }))} />
+            <label className="text-xs font-bold uppercase tracking-wide text-slate-500">Connector pins<input value={values.connectorPins} onChange={(event) => setValues((current) => ({ ...current, connectorPins: event.target.value }))} placeholder="e.g. 5" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label>
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <label className="text-xs font-bold uppercase tracking-wide text-slate-500">Required vehicle options<input value={values.requiredOptions} onChange={(event) => setValues((current) => ({ ...current, requiredOptions: event.target.value }))} placeholder="BMW S430A, S5DFA…" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label>
+            <label className="text-xs font-bold uppercase tracking-wide text-slate-500">Excluded vehicle options<input value={values.excludedOptions} onChange={(event) => setValues((current) => ({ ...current, excludedOptions: event.target.value }))} placeholder="Not with S5DLA…" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label>
+            <label className="text-xs font-bold uppercase tracking-wide text-slate-500 sm:col-span-2">Variant summary<input value={values.variantSummary} onChange={(event) => setValues((current) => ({ ...current, variantSummary: event.target.value }))} placeholder="Heated · Power-fold · 5-pin" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label>
+            <label className="text-xs font-bold uppercase tracking-wide text-slate-500 sm:col-span-2">Why it fits<textarea value={values.fitmentExplanation} onChange={(event) => setValues((current) => ({ ...current, fitmentExplanation: event.target.value }))} rows="2" placeholder="Explain the fitment evidence and any uncertainty." className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label>
+          </div>
+        </section>
+        <section className="overflow-hidden rounded-2xl border border-slate-200 sm:col-span-2">
+          <header className="flex items-center justify-between bg-slate-50 px-4 py-3"><div><h4 className="text-sm font-bold text-slate-800">Compare related variants</h4><p className="mt-0.5 text-xs text-slate-500">Existing {comparison.familyName || values.familyName || "part family"} records</p></div>{comparisonLoading && <LoaderCircle className="animate-spin text-brand-600" size={17} />}</header>
+          {!comparisonLoading && comparison.variants?.length ? <div className="overflow-x-auto"><table className="min-w-full text-xs"><thead className="border-y border-slate-200 bg-white text-left uppercase tracking-wide text-slate-500"><tr>{["Part number", "Side", "Heated", "Auto dim", "Folding", "Memory", "Blind spot", "Camera", "Pins"].map((heading) => <th key={heading} className="whitespace-nowrap px-3 py-2">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{comparison.variants.map((variant) => <tr key={variant.id} className="text-slate-700"><td className="whitespace-nowrap px-3 py-2 font-mono font-bold text-brand-700">{variant.part_number}</td><td className="whitespace-nowrap px-3 py-2">{variant.side || "—"}</td>{["heated", "auto_dimming", "power_folding", "memory", "blind_spot", "camera"].map((key) => <td key={key} className="px-3 py-2 capitalize">{variant[key] || "—"}</td>)}<td className="px-3 py-2">{variant.connector_pins || "—"}</td></tr>)}</tbody></table></div> : !comparisonLoading && <p className="px-4 py-5 text-sm text-slate-500">No related master variants yet. Approving this record will begin the family.</p>}
+        </section>
         <label className="text-sm font-medium text-slate-700 sm:col-span-2">Review notes<textarea value={values.notes} onChange={(event) => setValues((current) => ({ ...current, notes: event.target.value }))} rows="3" className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
         <div className="rounded-xl bg-slate-50 p-4 text-sm sm:col-span-2"><p className="font-semibold text-slate-700">Raw source</p><p className="mt-1 text-slate-600">{candidate.description_raw || "No description"}</p><p className="mt-2 text-xs text-slate-500">{[candidate.year, candidate.manufacturer_raw, candidate.model, candidate.assembly].filter(Boolean).join(" · ")}</p>{candidate.evidence_url && <a href={candidate.evidence_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-sm font-semibold text-brand-700">Open evidence <ExternalLink size={14} /></a>}</div>
       </div>
@@ -136,7 +211,7 @@ export default function EnrichmentManager() {
   const [connected, setConnected] = useState(null);
   const [datasets, setDatasets] = useState([]);
   const [jobs, setJobs] = useState([]);
-  const [stats, setStats] = useState({ parts: 0, applications: 0, awaiting_review: 0, enriched_candidates: 0 });
+  const [stats, setStats] = useState({ parts: 0, families: 0, applications: 0, attributed_variants: 0, cached_pages: 0, awaiting_review: 0, enriched_candidates: 0 });
   const [selectedJobId, setSelectedJobId] = useState("");
   const [statusFilter, setStatusFilter] = useState("needs_review");
   const [candidates, setCandidates] = useState([]);
@@ -231,7 +306,9 @@ export default function EnrichmentManager() {
       setReviewing(null);
       setMessage(decision === "approve" ? "Candidate promoted to the canonical master database." : "Candidate rejected; raw source data was preserved.");
       await refresh(); await loadCandidates();
-    } catch (requestError) { setError(requestError.message); }
+    } catch (requestError) {
+      throw new Error(requestError.message || "The review decision could not be saved.");
+    }
   }
 
   async function exportMaster() {
@@ -247,13 +324,10 @@ export default function EnrichmentManager() {
   if (!connected) return <section className="rounded-2xl border border-amber-200 bg-amber-50 p-6"><AlertTriangle className="text-amber-600" size={32} /><h3 className="mt-4 font-semibold text-amber-950">Local data service is not running</h3><p className="mt-2 text-sm text-amber-800">Start the local worker and web UI together:</p><pre className="mt-4 rounded-xl bg-slate-950 p-4 text-sm text-slate-100">npm run dev:local</pre><button type="button" onClick={refresh} className="mt-4 inline-flex items-center gap-2 rounded-xl bg-amber-700 px-4 py-2 text-sm font-semibold text-white"><RefreshCw size={16} />Check again</button></section>;
 
   return <div className="space-y-6">
-    {error && <div className="flex justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
-    {message && <div className="flex justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800"><span className="break-all">{message}</span><button onClick={() => setMessage("")}><X size={16} /></button></div>}
-
     <EnrichmentJourney job={featuredJob} stats={stats} />
 
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-      {[{ label: "Canonical parts", value: stats.parts }, { label: "Part applications", value: stats.applications }, { label: "Awaiting review", value: stats.awaiting_review }, { label: "Enriched candidates", value: stats.enriched_candidates }].map((metric) => <article key={metric.label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel"><p className="text-sm font-medium text-slate-500">{metric.label}</p><p className="mt-2 text-3xl font-bold">{Number(metric.value || 0).toLocaleString()}</p></article>)}
+      {[{ label: "Canonical parts", value: stats.parts }, { label: "Variant families", value: stats.families }, { label: "Attributed variants", value: stats.attributed_variants }, { label: "Part applications", value: stats.applications }].map((metric) => <article key={metric.label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel"><p className="text-sm font-medium text-slate-500">{metric.label}</p><p className="mt-2 text-3xl font-bold">{Number(metric.value || 0).toLocaleString()}</p></article>)}
     </section>
 
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel sm:p-6">
@@ -278,8 +352,10 @@ export default function EnrichmentManager() {
 
     <section className="rounded-2xl border border-slate-200 bg-white shadow-panel">
       <header className="flex flex-wrap items-end justify-between gap-3 border-b border-slate-200 px-5 py-4"><div><h3 className="font-semibold">Evidence review</h3><p className="mt-1 text-sm text-slate-500">{Number(candidateTotal).toLocaleString()} matching candidates; showing up to 200.</p></div><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"><option value="">All statuses</option>{REVIEW_STATUSES.map((status) => <option key={status} value={status}>{status.replaceAll("_", " ")}</option>)}</select></header>
-      <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-200 text-sm"><thead className="bg-slate-50"><tr>{["Status", "OEM Part Number", "Description", "Side / Position", "Vehicle / Assembly", "Confidence", ""].map((heading) => <th key={heading} className="whitespace-nowrap px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{candidates.map((candidate) => <tr key={candidate.id} className="hover:bg-slate-50"><td className="px-4 py-3"><span className={`whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-semibold ${statusTone(candidate.status)}`}>{candidate.status.replaceAll("_", " ")}</span></td><td className="whitespace-nowrap px-4 py-3 font-mono font-semibold text-brand-700">{candidate.enriched_part_number || candidate.part_number_raw || "Missing"}</td><td className="max-w-80 truncate px-4 py-3 text-slate-600" title={candidate.enriched_description || candidate.description_raw || ""}>{candidate.enriched_description || candidate.description_raw || "—"}</td><td className="whitespace-nowrap px-4 py-3 text-slate-600">{[candidate.side, candidate.position].filter(Boolean).join(" · ") || "—"}</td><td className="max-w-72 truncate px-4 py-3 text-slate-500" title={[candidate.year, candidate.model, candidate.assembly].filter(Boolean).join(" · ")}>{[candidate.year, candidate.model, candidate.assembly].filter(Boolean).join(" · ") || "—"}</td><td className="px-4 py-3 font-semibold">{Math.round(Number(candidate.confidence || 0) * 100)}%</td><td className="px-4 py-3"><button type="button" onClick={() => setReviewing(candidate)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold">Review</button></td></tr>)}</tbody></table>{!candidates.length && <div className="px-6 py-12 text-center text-sm text-slate-500">No candidates match this job and status.</div>}</div>
+      <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-200 text-sm"><thead className="bg-slate-50"><tr>{["Status", "OEM Part Number", "Description / Variant", "Side / Position", "Vehicle / Assembly", "Confidence", ""].map((heading) => <th key={heading} className="whitespace-nowrap px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{candidates.map((candidate) => <tr key={candidate.id} className="hover:bg-slate-50"><td className="px-4 py-3"><span className={`whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-semibold ${statusTone(candidate.status)}`}>{candidate.status.replaceAll("_", " ")}</span></td><td className="whitespace-nowrap px-4 py-3 font-mono font-semibold text-brand-700">{candidate.enriched_part_number || candidate.part_number_raw || "Missing"}</td><td className="max-w-96 px-4 py-3 text-slate-600"><p className="truncate" title={candidate.enriched_description || candidate.description_raw || ""}>{candidate.enriched_description || candidate.description_raw || "—"}</p>{(candidate.family_name || candidate.variant_summary) && <p className="mt-1 truncate text-xs font-semibold text-violet-700" title={[candidate.family_name, candidate.variant_summary].filter(Boolean).join(" · ")}>{[candidate.family_name, candidate.variant_summary].filter(Boolean).join(" · ")}</p>}</td><td className="whitespace-nowrap px-4 py-3 text-slate-600">{[candidate.side, candidate.position].filter(Boolean).join(" · ") || "—"}</td><td className="max-w-72 truncate px-4 py-3 text-slate-500" title={[candidate.year, candidate.model, candidate.assembly].filter(Boolean).join(" · ")}>{[candidate.year, candidate.model, candidate.assembly].filter(Boolean).join(" · ") || "—"}</td><td className="px-4 py-3 font-semibold">{Math.round(Number(candidate.confidence || 0) * 100)}%</td><td className="px-4 py-3"><button type="button" onClick={() => setReviewing(candidate)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold">Review</button></td></tr>)}</tbody></table>{!candidates.length && <div className="px-6 py-12 text-center text-sm text-slate-500">No candidates match this job and status.</div>}</div>
     </section>
     {reviewing && <ReviewModal candidate={reviewing} onClose={() => setReviewing(null)} onDecision={decideCandidate} />}
+    <FeedbackDialog type="error" message={error} onClose={() => setError("")} />
+    {!error && <FeedbackDialog type="success" message={message} onClose={() => setMessage("")} />}
   </div>;
 }

@@ -94,6 +94,20 @@ await withConnection((connection) => connection.run(`
     evidence_url VARCHAR,
     evidence_title VARCHAR,
     confidence DOUBLE,
+    family_name VARCHAR,
+    component_scope VARCHAR,
+    heated_state VARCHAR,
+    auto_dimming_state VARCHAR,
+    power_folding_state VARCHAR,
+    memory_state VARCHAR,
+    blind_spot_state VARCHAR,
+    camera_state VARCHAR,
+    turn_signal_state VARCHAR,
+    connector_pins VARCHAR,
+    required_options VARCHAR,
+    excluded_options VARCHAR,
+    variant_summary VARCHAR,
+    fitment_explanation VARCHAR,
     status VARCHAR NOT NULL DEFAULT 'pending',
     decision VARCHAR,
     decision_notes VARCHAR,
@@ -109,6 +123,9 @@ await withConnection((connection) => connection.run(`
     manufacturer_norm VARCHAR NOT NULL,
     part_number VARCHAR NOT NULL,
     part_number_norm VARCHAR NOT NULL,
+    family_id VARCHAR,
+    component_scope VARCHAR,
+    variant_summary VARCHAR,
     description VARCHAR,
     confidence DOUBLE,
     verification_status VARCHAR NOT NULL,
@@ -135,10 +152,59 @@ await withConnection((connection) => connection.run(`
     quantity VARCHAR,
     source_url VARCHAR,
     evidence_url VARCHAR,
+    required_options VARCHAR,
+    excluded_options VARCHAR,
+    fitment_explanation VARCHAR,
     confidence DOUBLE,
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     UNIQUE (part_id, dataset_id, source_row_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_part_families (
+    id VARCHAR PRIMARY KEY,
+    manufacturer_norm VARCHAR NOT NULL,
+    family_key VARCHAR NOT NULL,
+    family_name VARCHAR NOT NULL,
+    category VARCHAR,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (manufacturer_norm, family_key)
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_variant_attributes (
+    id VARCHAR PRIMARY KEY,
+    part_id VARCHAR NOT NULL,
+    attribute_name VARCHAR NOT NULL,
+    attribute_value VARCHAR NOT NULL,
+    confidence DOUBLE,
+    evidence_url VARCHAR,
+    source_method VARCHAR,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (part_id, attribute_name)
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_part_relationships (
+    id VARCHAR PRIMARY KEY,
+    source_part_id VARCHAR NOT NULL,
+    target_part_id VARCHAR NOT NULL,
+    relationship_type VARCHAR NOT NULL,
+    conditions VARCHAR,
+    confidence DOUBLE,
+    evidence_url VARCHAR,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    UNIQUE (source_part_id, target_part_id, relationship_type)
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_page_cache (
+    source_url VARCHAR PRIMARY KEY,
+    final_url VARCHAR,
+    page_title VARCHAR,
+    content_html VARCHAR,
+    success BOOLEAN NOT NULL,
+    error_message VARCHAR,
+    fetched_at TIMESTAMP NOT NULL DEFAULT current_timestamp
   );
 
   CREATE INDEX IF NOT EXISTS enrichment_candidates_job_status_idx
@@ -146,14 +212,38 @@ await withConnection((connection) => connection.run(`
   CREATE INDEX IF NOT EXISTS canonical_parts_lookup_idx
     ON partmaster_canonical_parts (manufacturer_norm, part_number_norm);
   CREATE INDEX IF NOT EXISTS part_applications_part_idx
-    ON partmaster_part_applications (part_id)
+    ON partmaster_part_applications (part_id);
+  CREATE INDEX IF NOT EXISTS variant_attributes_part_idx
+    ON partmaster_variant_attributes (part_id)
 `));
 
 await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_enrichment_jobs ADD COLUMN IF NOT EXISTS start_row_id BIGINT DEFAULT 0;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS application_key VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS family_name VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS component_scope VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS heated_state VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS auto_dimming_state VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS power_folding_state VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS memory_state VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS blind_spot_state VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS camera_state VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS turn_signal_state VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS connector_pins VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS required_options VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS excluded_options VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS variant_summary VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS fitment_explanation VARCHAR;
+  ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS family_id VARCHAR;
+  ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS component_scope VARCHAR;
+  ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS variant_summary VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS required_options VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS excluded_options VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS fitment_explanation VARCHAR;
   CREATE UNIQUE INDEX IF NOT EXISTS part_applications_key_idx
-    ON partmaster_part_applications (application_key)
+    ON partmaster_part_applications (application_key);
+  CREATE INDEX IF NOT EXISTS canonical_parts_family_idx
+    ON partmaster_canonical_parts (family_id)
 `));
 
 function asyncRoute(handler) {
@@ -253,6 +343,127 @@ function normalizePartNumber(value) {
 
 function normalizeApplicationValue(value) {
   return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function titleCase(value) {
+  return String(value || "").toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function featureState(text, positivePattern, negativePattern) {
+  if (negativePattern?.test(text)) return "no";
+  if (positivePattern.test(text)) return "yes";
+  return "unknown";
+}
+
+function safeFeatureState(value, fallback = "unknown") {
+  const normalized = String(value || fallback).toLowerCase();
+  return ["yes", "no", "unknown"].includes(normalized) ? normalized : fallback;
+}
+
+function inferComponentScope(description, assembly) {
+  const text = `${description || ""} ${assembly || ""}`.toUpperCase();
+  if (/\b(MIRROR )?GLASS\b|MIRROR LENS/.test(text)) return "mirror_glass";
+  if (/\b(COVER|CAP)\b/.test(text) && /MIRROR/.test(text)) return "mirror_cover";
+  if (/\b(HOUSING|FRAME|BRACKET)\b/.test(text) && /MIRROR/.test(text)) return "mirror_housing";
+  if (/\b(MOTOR|ACTUATOR)\b/.test(text)) return "motor_or_actuator";
+  if (/\b(ASSY|ASSEMBLY|COMPLETE|COMP)\b/.test(text)) return "complete_assembly";
+  return "component";
+}
+
+function inferFamilyName(description, assembly) {
+  const text = `${description || ""} ${assembly || ""}`.toUpperCase();
+  if (/\b(MIRROR|REARVIEW|REAR VIEW)\b/.test(text)) return "Exterior Mirror";
+  if (/\b(BRAKE|CALIPER|ROTOR|DISC)\b/.test(text)) return "Brake System";
+  if (/\b(HEADLAMP|HEADLIGHT)\b/.test(text)) return "Headlight";
+  if (/\b(TAILLAMP|TAIL LIGHT|TAILLIGHT)\b/.test(text)) return "Tail Light";
+  if (/\b(BUMPER)\b/.test(text)) return "Bumper";
+  if (/\b(DOOR)\b/.test(text)) return "Door";
+  if (/\b(WHEEL|RIM)\b/.test(text)) return "Wheel";
+  const fallback = String(assembly || description || "Unclassified Part").split(/[|,]/, 1)[0].trim();
+  return titleCase(fallback).slice(0, 160) || "Unclassified Part";
+}
+
+function extractOptionCodes(text) {
+  const required = new Set();
+  const excluded = new Set();
+  for (const match of String(text || "").matchAll(/\b(?:OPTION|OPT|SA)\s*[:#-]?\s*([0-9][A-Z0-9]{2})\b/gi)) required.add(match[1].toUpperCase());
+  for (const match of String(text || "").matchAll(/\b(?:WITHOUT|EXCEPT|NOT WITH)\s+(?:OPTION|OPT|SA)?\s*[:#-]?\s*([0-9][A-Z0-9]{2})\b/gi)) {
+    required.delete(match[1].toUpperCase());
+    excluded.add(match[1].toUpperCase());
+  }
+  return { required: [...required].join(", "), excluded: [...excluded].join(", ") };
+}
+
+function inferVariantIntelligence(candidate, onlineDescription = "") {
+  const combined = `${candidate.description_raw || ""} ${onlineDescription || ""}`.toUpperCase();
+  const location = inferLocation(candidate.description_raw, onlineDescription, candidate.assembly, candidate.item_number);
+  const heated = featureState(combined, /\b(HEATED|HEATABLE|HTD)\b/, /\b(NON[- ]?HEATED|WITHOUT HEAT(?:ING)?)\b/);
+  const autoDimming = featureState(combined, /\b(AUTO(?:MATIC)?[- ]?(?:DIM|DIMMING)|ANTI[- ]?DAZZLE|ELECTROCHROMIC)\b/, /\b(NON[- ]?(?:DIMMING|ELECTROCHROMIC)|WITHOUT AUTO[- ]?DIM)\b/);
+  const powerFolding = featureState(combined, /\b(POWER|ELECTRIC)[- ]?(?:FOLD|FOLDING|FOLDABLE)|POWERFOLD\b/, /\b(MANUAL[- ]?FOLD|WITHOUT (?:POWER|ELECTRIC)[- ]?FOLD)\b/);
+  const memory = featureState(combined, /\b(MEMORY|MEM)\b/, /\b(NO|WITHOUT|NON[- ]?)\s*MEMORY\b/);
+  const blindSpot = featureState(combined, /\b(BLIND[- ]?SPOT|BSM|LANE[- ]?CHANGE WARNING)\b/, /\b(WITHOUT|NO)\s+(?:BLIND[- ]?SPOT|BSM|LANE[- ]?CHANGE WARNING)\b/);
+  const camera = featureState(combined, /\b(CAMERA|SURROUND VIEW|360(?:°| DEGREE)?)\b/, /\b(WITHOUT|NO)\s+(?:CAMERA|SURROUND VIEW)\b/);
+  const turnSignal = featureState(combined, /\b(TURN SIGNAL|INDICATOR|REPEATER)\b/, /\b(WITHOUT|NO)\s+(?:TURN SIGNAL|INDICATOR|REPEATER)\b/);
+  const connector = combined.match(/\b(\d{1,2})[- ]?PIN\b/)?.[1] || "";
+  const options = extractOptionCodes(combined);
+  const componentScope = inferComponentScope(candidate.description_raw, candidate.assembly);
+  const familyName = inferFamilyName(candidate.description_raw, candidate.assembly);
+  const features = [
+    location.side !== "Unknown" ? location.side : "",
+    heated === "yes" ? "Heated" : heated === "no" ? "Non-heated" : "",
+    autoDimming === "yes" ? "Auto-dimming" : autoDimming === "no" ? "Non-dimming" : "",
+    powerFolding === "yes" ? "Power-folding" : "",
+    memory === "yes" ? "Memory" : "",
+    blindSpot === "yes" ? "Blind-spot" : "",
+    camera === "yes" ? "Camera" : "",
+    turnSignal === "yes" ? "Turn signal" : "",
+    connector ? `${connector}-pin` : "",
+  ].filter(Boolean);
+  const variantSummary = features.length ? features.join(" · ") : titleCase(componentScope.replaceAll("_", " "));
+  return {
+    familyName,
+    componentScope,
+    side: location.side,
+    position: location.position,
+    heated,
+    autoDimming,
+    powerFolding,
+    memory,
+    blindSpot,
+    camera,
+    turnSignal,
+    connectorPins: connector,
+    requiredOptions: options.required,
+    excludedOptions: options.excluded,
+    variantSummary,
+  };
+}
+
+function applyVariantIntelligence(update, intelligence, candidate) {
+  const optionNote = intelligence.requiredOptions ? ` Requires options ${intelligence.requiredOptions}.` : "";
+  const unknownMirrorFeatures = intelligence.familyName === "Exterior Mirror"
+    ? [intelligence.heated, intelligence.autoDimming, intelligence.powerFolding, intelligence.memory, intelligence.blindSpot, intelligence.camera].filter((state) => state === "unknown").length
+    : 0;
+  const uncertaintyNote = unknownMirrorFeatures ? ` ${unknownMirrorFeatures} mirror feature${unknownMirrorFeatures === 1 ? " is" : "s are"} still unknown.` : "";
+  return {
+    ...update,
+    familyName: intelligence.familyName,
+    componentScope: intelligence.componentScope,
+    side: intelligence.side !== "Unknown" ? intelligence.side : update.side,
+    position: intelligence.position || update.position,
+    heatedState: intelligence.heated,
+    autoDimmingState: intelligence.autoDimming,
+    powerFoldingState: intelligence.powerFolding,
+    memoryState: intelligence.memory,
+    blindSpotState: intelligence.blindSpot,
+    cameraState: intelligence.camera,
+    turnSignalState: intelligence.turnSignal,
+    connectorPins: intelligence.connectorPins,
+    requiredOptions: intelligence.requiredOptions,
+    excludedOptions: intelligence.excludedOptions,
+    variantSummary: intelligence.variantSummary,
+    fitmentExplanation: `OEM ${candidate.part_number_raw || "number pending"} is associated with ${[candidate.year, candidate.manufacturer_raw, candidate.model, candidate.assembly].filter(Boolean).join(" · ")}.${optionNote}${uncertaintyNote}`,
+  };
 }
 
 function cleanText(value) {
@@ -384,10 +595,156 @@ async function fetchEvidence(url) {
   }
 }
 
+async function getEvidencePage(url) {
+  const cached = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT final_url, page_title, content_html, success, error_message
+       FROM partmaster_page_cache
+       WHERE source_url = $sourceUrl AND fetched_at >= current_timestamp - INTERVAL '7 days'`,
+      { sourceUrl: url },
+    );
+    return reader.getRowObjectsJson()[0];
+  });
+  if (cached) {
+    if (!cached.success) throw new Error(cached.error_message || "The cached source request failed.");
+    return { html: cached.content_html || "", finalUrl: cached.final_url || url, cacheHit: true };
+  }
+
+  try {
+    const page = await fetchEvidence(url);
+    const title = extractPageEvidence(page.html, "").title;
+    await withConnection(async (connection) => {
+      const existingReader = await connection.runAndReadAll(
+        "SELECT source_url FROM partmaster_page_cache WHERE source_url = $sourceUrl",
+        { sourceUrl: url },
+      );
+      if (existingReader.getRowObjectsJson().length) {
+        await connection.run(
+          `UPDATE partmaster_page_cache SET final_url = $finalUrl, page_title = $title,
+           content_html = $html, success = true, error_message = NULL, fetched_at = current_timestamp
+           WHERE source_url = $sourceUrl`,
+          { sourceUrl: url, finalUrl: page.finalUrl, title, html: page.html },
+        );
+      } else {
+        await connection.run(
+          `INSERT INTO partmaster_page_cache
+           (source_url, final_url, page_title, content_html, success)
+           VALUES ($sourceUrl, $finalUrl, $title, $html, true)`,
+          { sourceUrl: url, finalUrl: page.finalUrl, title, html: page.html },
+        );
+      }
+    });
+    return { ...page, cacheHit: false };
+  } catch (error) {
+    await withConnection(async (connection) => {
+      const existingReader = await connection.runAndReadAll(
+        "SELECT source_url FROM partmaster_page_cache WHERE source_url = $sourceUrl",
+        { sourceUrl: url },
+      );
+      if (existingReader.getRowObjectsJson().length) {
+        await connection.run(
+          `UPDATE partmaster_page_cache SET success = false, error_message = $error,
+           content_html = NULL, fetched_at = current_timestamp WHERE source_url = $sourceUrl`,
+          { sourceUrl: url, error: error.message },
+        );
+      } else {
+        await connection.run(
+          `INSERT INTO partmaster_page_cache (source_url, success, error_message)
+           VALUES ($sourceUrl, false, $error)`,
+          { sourceUrl: url, error: error.message },
+        );
+      }
+    }).catch(() => {});
+    throw error;
+  }
+}
+
+async function ensurePartFamily(connection, candidate) {
+  const familyName = candidate.family_name || inferFamilyName(candidate.enriched_description || candidate.description_raw, candidate.assembly);
+  const familyKey = normalizeApplicationValue(familyName);
+  const reader = await connection.runAndReadAll(
+    `SELECT id FROM partmaster_part_families
+     WHERE manufacturer_norm = $manufacturer AND family_key = $familyKey`,
+    { manufacturer: candidate.manufacturer_norm, familyKey },
+  );
+  let familyId = reader.getRowObjectsJson()[0]?.id;
+  if (!familyId) {
+    familyId = randomUUID();
+    await connection.run(
+      `INSERT INTO partmaster_part_families
+       (id, manufacturer_norm, family_key, family_name, category)
+       VALUES ($id, $manufacturer, $familyKey, $familyName, $category)`,
+      {
+        id: familyId,
+        manufacturer: candidate.manufacturer_norm,
+        familyKey,
+        familyName,
+        category: candidate.assembly || null,
+      },
+    );
+  }
+  return { familyId, familyName };
+}
+
+async function syncVariantAttributes(connection, partId, candidate) {
+  const attributes = {
+    side: candidate.side || "Unknown",
+    component_scope: candidate.component_scope || "component",
+    heated: candidate.heated_state || "unknown",
+    auto_dimming: candidate.auto_dimming_state || "unknown",
+    power_folding: candidate.power_folding_state || "unknown",
+    memory: candidate.memory_state || "unknown",
+    blind_spot: candidate.blind_spot_state || "unknown",
+    camera: candidate.camera_state || "unknown",
+    turn_signal: candidate.turn_signal_state || "unknown",
+    connector_pins: candidate.connector_pins || "unknown",
+    required_options: candidate.required_options || "none_known",
+    excluded_options: candidate.excluded_options || "none_known",
+  };
+  for (const [name, value] of Object.entries(attributes)) {
+    const reader = await connection.runAndReadAll(
+      "SELECT id, confidence FROM partmaster_variant_attributes WHERE part_id = $partId AND attribute_name = $name",
+      { partId, name },
+    );
+    const existing = reader.getRowObjectsJson()[0];
+    if (existing) {
+      if (Number(candidate.confidence || 0) >= Number(existing.confidence || 0)) {
+        await connection.run(
+          `UPDATE partmaster_variant_attributes SET attribute_value = $value, confidence = $confidence,
+           evidence_url = $evidenceUrl, source_method = $method, updated_at = current_timestamp WHERE id = $id`,
+          {
+            id: existing.id,
+            value,
+            confidence: candidate.confidence || 0,
+            evidenceUrl: candidate.evidence_url || candidate.source_url || null,
+            method: candidate.decision === "approve" ? "human_review" : "deterministic_and_online",
+          },
+        );
+      }
+    } else {
+      await connection.run(
+        `INSERT INTO partmaster_variant_attributes
+         (id, part_id, attribute_name, attribute_value, confidence, evidence_url, source_method)
+         VALUES ($id, $partId, $name, $value, $confidence, $evidenceUrl, $method)`,
+        {
+          id: randomUUID(),
+          partId,
+          name,
+          value,
+          confidence: candidate.confidence || 0,
+          evidenceUrl: candidate.evidence_url || candidate.source_url || null,
+          method: candidate.decision === "approve" ? "human_review" : "deterministic_and_online",
+        },
+      );
+    }
+  }
+}
+
 async function promoteCandidate(connection, candidate, verificationStatus) {
   const partNumber = candidate.enriched_part_number || candidate.part_number_raw;
   const partNumberNorm = normalizePartNumber(partNumber);
   if (!partNumberNorm || !candidate.manufacturer_norm) return null;
+  const { familyId } = await ensurePartFamily(connection, candidate);
   const existingReader = await connection.runAndReadAll(
     `SELECT id, confidence FROM partmaster_canonical_parts
      WHERE manufacturer_norm = $manufacturer AND part_number_norm = $partNumber`,
@@ -398,14 +755,19 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
     partId = randomUUID();
     await connection.run(
       `INSERT INTO partmaster_canonical_parts
-       (id, manufacturer, manufacturer_norm, part_number, part_number_norm, description, confidence, verification_status, evidence_url, verified_at)
-       VALUES ($id, $manufacturer, $manufacturerNorm, $partNumber, $partNumberNorm, $description, $confidence, $status, $evidenceUrl, current_timestamp)`,
+       (id, manufacturer, manufacturer_norm, part_number, part_number_norm, family_id, component_scope,
+        variant_summary, description, confidence, verification_status, evidence_url, verified_at)
+       VALUES ($id, $manufacturer, $manufacturerNorm, $partNumber, $partNumberNorm, $familyId, $componentScope,
+        $variantSummary, $description, $confidence, $status, $evidenceUrl, current_timestamp)`,
       {
         id: partId,
         manufacturer: candidate.manufacturer_raw || candidate.manufacturer_norm,
         manufacturerNorm: candidate.manufacturer_norm,
         partNumber,
         partNumberNorm,
+        familyId,
+        componentScope: candidate.component_scope || "component",
+        variantSummary: candidate.variant_summary || null,
         description: candidate.enriched_description || candidate.description_raw || null,
         confidence: candidate.confidence || 0,
         status: verificationStatus,
@@ -415,6 +777,9 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
   } else {
     await connection.run(
       `UPDATE partmaster_canonical_parts SET
+         family_id = coalesce($familyId, family_id),
+         component_scope = coalesce($componentScope, component_scope),
+         variant_summary = CASE WHEN $confidence >= coalesce(confidence, 0) THEN coalesce($variantSummary, variant_summary) ELSE variant_summary END,
          description = CASE WHEN $confidence >= coalesce(confidence, 0) THEN coalesce($description, description) ELSE description END,
          confidence = greatest(coalesce(confidence, 0), $confidence),
          verification_status = CASE WHEN $confidence >= coalesce(confidence, 0) THEN $status ELSE verification_status END,
@@ -424,6 +789,9 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
        WHERE id = $id`,
       {
         id: partId,
+        familyId,
+        componentScope: candidate.component_scope || null,
+        variantSummary: candidate.variant_summary || null,
         confidence: candidate.confidence || 0,
         description: candidate.enriched_description || candidate.description_raw || null,
         status: verificationStatus,
@@ -431,6 +799,7 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
       },
     );
   }
+  await syncVariantAttributes(connection, partId, candidate);
 
   const applicationKey = [
     partId,
@@ -462,6 +831,9 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
     quantity: candidate.quantity || null,
     sourceUrl: candidate.source_url || null,
     evidenceUrl: candidate.evidence_url || null,
+    requiredOptions: candidate.required_options || null,
+    excludedOptions: candidate.excluded_options || null,
+    fitmentExplanation: candidate.fitment_explanation || null,
     confidence: candidate.confidence || 0,
   };
   if (applicationId) {
@@ -469,17 +841,35 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
       `UPDATE partmaster_part_applications SET
        year = $year, model = $model, assembly = $assembly, item_number = $itemNumber,
        side = $side, position = $position, location_notes = $locationNotes, quantity = $quantity,
-       source_url = $sourceUrl, evidence_url = $evidenceUrl, confidence = $confidence,
+       source_url = $sourceUrl, evidence_url = $evidenceUrl, required_options = $requiredOptions,
+       excluded_options = $excludedOptions, fitment_explanation = $fitmentExplanation, confidence = $confidence,
        updated_at = current_timestamp WHERE id = $id`,
-      applicationValues,
+      {
+        id: applicationValues.id,
+        year: applicationValues.year,
+        model: applicationValues.model,
+        assembly: applicationValues.assembly,
+        itemNumber: applicationValues.itemNumber,
+        side: applicationValues.side,
+        position: applicationValues.position,
+        locationNotes: applicationValues.locationNotes,
+        quantity: applicationValues.quantity,
+        sourceUrl: applicationValues.sourceUrl,
+        evidenceUrl: applicationValues.evidenceUrl,
+        requiredOptions: applicationValues.requiredOptions,
+        excludedOptions: applicationValues.excludedOptions,
+        fitmentExplanation: applicationValues.fitmentExplanation,
+        confidence: applicationValues.confidence,
+      },
     );
   } else {
     await connection.run(
       `INSERT INTO partmaster_part_applications
        (id, application_key, part_id, dataset_id, source_row_id, year, model, assembly, item_number, side, position,
-        location_notes, quantity, source_url, evidence_url, confidence)
+        location_notes, quantity, source_url, evidence_url, required_options, excluded_options, fitment_explanation, confidence)
        VALUES ($id, $applicationKey, $partId, $datasetId, $sourceRowId, $year, $model, $assembly, $itemNumber, $side,
-        $position, $locationNotes, $quantity, $sourceUrl, $evidenceUrl, $confidence)`,
+        $position, $locationNotes, $quantity, $sourceUrl, $evidenceUrl, $requiredOptions, $excludedOptions,
+        $fitmentExplanation, $confidence)`,
       applicationValues,
     );
   }
@@ -715,9 +1105,51 @@ async function createEnrichmentJob(options) {
   });
 }
 
+async function findExistingVariantConflicts(candidate, result) {
+  if (!candidate.manufacturer_norm || !candidate.part_number_norm) return [];
+  const existing = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT attributes.attribute_name, attributes.attribute_value
+       FROM partmaster_canonical_parts parts
+       JOIN partmaster_variant_attributes attributes ON attributes.part_id = parts.id
+       WHERE parts.manufacturer_norm = $manufacturer AND parts.part_number_norm = $partNumber
+         AND attributes.attribute_name IN
+           ('heated', 'auto_dimming', 'power_folding', 'memory', 'blind_spot', 'camera', 'turn_signal', 'connector_pins')`,
+      { manufacturer: candidate.manufacturer_norm, partNumber: candidate.part_number_norm },
+    );
+    return Object.fromEntries(reader.getRowObjectsJson().map((row) => [row.attribute_name, row.attribute_value]));
+  });
+  const proposed = {
+    heated: result.heatedState,
+    auto_dimming: result.autoDimmingState,
+    power_folding: result.powerFoldingState,
+    memory: result.memoryState,
+    blind_spot: result.blindSpotState,
+    camera: result.cameraState,
+    turn_signal: result.turnSignalState,
+    connector_pins: result.connectorPins,
+  };
+  const labels = {
+    heated: "heated",
+    auto_dimming: "auto-dimming",
+    power_folding: "power-folding",
+    memory: "memory",
+    blind_spot: "blind-spot",
+    camera: "camera",
+    turn_signal: "turn-signal",
+    connector_pins: "connector-pin",
+  };
+  return Object.entries(proposed).flatMap(([name, value]) => {
+    const current = String(existing[name] || "unknown");
+    const next = String(value || "unknown");
+    if (["", "unknown", "none_known"].includes(current) || ["", "unknown", "none_known"].includes(next) || current === next) return [];
+    return [`${labels[name]} is already ${current}, but this source indicates ${next}`];
+  });
+}
+
 async function processEnrichmentCandidate(candidate, threshold) {
   const localLocation = inferLocation(candidate.description_raw, candidate.assembly, candidate.item_number);
-  let update = {
+  let update = applyVariantIntelligence({
     enrichedPartNumber: candidate.part_number_raw || null,
     enrichedDescription: candidate.description_raw || null,
     side: localLocation.side,
@@ -728,17 +1160,17 @@ async function processEnrichmentCandidate(candidate, threshold) {
     confidence: candidate.part_number_norm && candidate.description_raw ? 0.6 : 0.35,
     status: "needs_review",
     decision: null,
-  };
+  }, inferVariantIntelligence(candidate), candidate);
 
   if (!candidate.source_url) {
     if (!candidate.part_number_norm) update.status = "not_found";
     return update;
   }
 
-  const { html, finalUrl } = await fetchEvidence(candidate.source_url);
+  const { html, finalUrl } = await getEvidencePage(candidate.source_url);
   const evidence = extractPageEvidence(html, candidate.part_number_raw);
   const evidenceLocation = inferLocation(evidence.description, evidence.title);
-  update = {
+  update = applyVariantIntelligence({
     ...update,
     enrichedPartNumber: candidate.part_number_raw || evidence.productNumber || null,
     enrichedDescription: evidence.description || candidate.description_raw || null,
@@ -746,7 +1178,7 @@ async function processEnrichmentCandidate(candidate, threshold) {
     position: evidenceLocation.position || localLocation.position || (candidate.item_number ? `Position ${candidate.item_number}` : null),
     evidenceUrl: finalUrl,
     evidenceTitle: evidence.title || null,
-  };
+  }, inferVariantIntelligence(candidate, evidence.description), candidate);
 
   const onlinePartNorm = normalizePartNumber(evidence.productNumber);
   if (candidate.part_number_norm && onlinePartNorm && onlinePartNorm !== candidate.part_number_norm) {
@@ -775,6 +1207,14 @@ async function processEnrichmentCandidate(candidate, threshold) {
 
   if (update.status !== "not_found") {
     update.status = update.confidence >= threshold && Boolean(normalizePartNumber(update.enrichedPartNumber)) ? "enriched" : "needs_review";
+  }
+  if (update.status === "enriched") {
+    const variantConflicts = await findExistingVariantConflicts(candidate, update);
+    if (variantConflicts.length) {
+      update.status = "conflict";
+      update.confidence = Math.min(update.confidence, 0.4);
+      update.decision = `Variant conflict for this exact OEM number: ${variantConflicts.join("; ")}. Confirm the equipment before promotion.`;
+    }
   }
   return update;
 }
@@ -834,6 +1274,13 @@ async function runEnrichmentJob(jobId) {
                enriched_part_number = $partNumber, enriched_description = $description,
                side = $side, position = $position, location_notes = $locationNotes,
                evidence_url = $evidenceUrl, evidence_title = $evidenceTitle,
+               family_name = $familyName, component_scope = $componentScope,
+               heated_state = $heatedState, auto_dimming_state = $autoDimmingState,
+               power_folding_state = $powerFoldingState, memory_state = $memoryState,
+               blind_spot_state = $blindSpotState, camera_state = $cameraState,
+               turn_signal_state = $turnSignalState, connector_pins = $connectorPins,
+               required_options = $requiredOptions, excluded_options = $excludedOptions,
+               variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation,
                confidence = $confidence, status = $status, decision_notes = $decision,
                processed_at = current_timestamp
                WHERE id = $id`,
@@ -846,6 +1293,20 @@ async function runEnrichmentJob(jobId) {
                 locationNotes: result.locationNotes,
                 evidenceUrl: result.evidenceUrl,
                 evidenceTitle: result.evidenceTitle,
+                familyName: result.familyName,
+                componentScope: result.componentScope,
+                heatedState: result.heatedState,
+                autoDimmingState: result.autoDimmingState,
+                powerFoldingState: result.powerFoldingState,
+                memoryState: result.memoryState,
+                blindSpotState: result.blindSpotState,
+                cameraState: result.cameraState,
+                turnSignalState: result.turnSignalState,
+                connectorPins: result.connectorPins,
+                requiredOptions: result.requiredOptions,
+                excludedOptions: result.excludedOptions,
+                variantSummary: result.variantSummary,
+                fitmentExplanation: result.fitmentExplanation,
                 confidence: result.confidence,
                 status: result.status,
                 decision: result.decision,
@@ -859,6 +1320,20 @@ async function runEnrichmentJob(jobId) {
                 position: result.position,
                 location_notes: result.locationNotes,
                 evidence_url: result.evidenceUrl,
+                family_name: result.familyName,
+                component_scope: result.componentScope,
+                heated_state: result.heatedState,
+                auto_dimming_state: result.autoDimmingState,
+                power_folding_state: result.powerFoldingState,
+                memory_state: result.memoryState,
+                blind_spot_state: result.blindSpotState,
+                camera_state: result.cameraState,
+                turn_signal_state: result.turnSignalState,
+                connector_pins: result.connectorPins,
+                required_options: result.requiredOptions,
+                excluded_options: result.excludedOptions,
+                variant_summary: result.variantSummary,
+                fitment_explanation: result.fitmentExplanation,
                 confidence: result.confidence,
               } }, "online_verified");
             }
@@ -887,6 +1362,96 @@ async function runEnrichmentJob(jobId) {
 
 function scheduleEnrichmentJob(jobId) {
   setImmediate(() => runEnrichmentJob(jobId));
+}
+
+async function backfillVariantIntelligence() {
+  await withConnection(async (connection) => {
+    const partsReader = await connection.runAndReadAll(
+      `SELECT parts.id, parts.manufacturer, parts.manufacturer_norm, parts.part_number, parts.description,
+       parts.confidence, parts.evidence_url, applications.year, applications.model, applications.assembly,
+       applications.item_number, applications.side, applications.position, applications.source_url
+       FROM partmaster_canonical_parts parts
+       LEFT JOIN partmaster_part_applications applications ON applications.part_id = parts.id
+       WHERE parts.family_id IS NULL
+       QUALIFY row_number() OVER (PARTITION BY parts.id ORDER BY applications.confidence DESC NULLS LAST) = 1
+       LIMIT 10000`,
+    );
+    for (const part of partsReader.getRowObjectsJson()) {
+      const candidate = {
+        manufacturer_raw: part.manufacturer,
+        manufacturer_norm: part.manufacturer_norm,
+        part_number_raw: part.part_number,
+        description_raw: part.description,
+        assembly: part.assembly,
+        item_number: part.item_number,
+        year: part.year,
+        model: part.model,
+        source_url: part.source_url,
+        evidence_url: part.evidence_url,
+        confidence: Number(part.confidence || 0),
+      };
+      const intelligence = inferVariantIntelligence(candidate);
+      if (part.side && part.side !== "Unknown") intelligence.side = part.side;
+      const enriched = applyVariantIntelligence({}, intelligence, candidate);
+      const { familyId } = await ensurePartFamily(connection, { ...candidate, family_name: enriched.familyName });
+      await connection.run(
+        `UPDATE partmaster_canonical_parts SET family_id = $familyId, component_scope = $componentScope,
+         variant_summary = $variantSummary, updated_at = current_timestamp WHERE id = $id`,
+        { id: part.id, familyId, componentScope: enriched.componentScope, variantSummary: enriched.variantSummary },
+      );
+      await syncVariantAttributes(connection, part.id, {
+        ...candidate,
+        family_name: enriched.familyName,
+        component_scope: enriched.componentScope,
+        side: enriched.side,
+        heated_state: enriched.heatedState,
+        auto_dimming_state: enriched.autoDimmingState,
+        power_folding_state: enriched.powerFoldingState,
+        memory_state: enriched.memoryState,
+        blind_spot_state: enriched.blindSpotState,
+        camera_state: enriched.cameraState,
+        turn_signal_state: enriched.turnSignalState,
+        connector_pins: enriched.connectorPins,
+        required_options: enriched.requiredOptions,
+        excluded_options: enriched.excludedOptions,
+      });
+    }
+
+    const candidatesReader = await connection.runAndReadAll(
+      `SELECT * FROM partmaster_enrichment_candidates
+       WHERE family_name IS NULL AND status IN ('needs_review', 'conflict', 'not_found', 'failed') LIMIT 10000`,
+    );
+    for (const candidate of candidatesReader.getRowObjectsJson()) {
+      const intelligence = applyVariantIntelligence({}, inferVariantIntelligence(candidate), candidate);
+      await connection.run(
+        `UPDATE partmaster_enrichment_candidates SET family_name = $familyName,
+         component_scope = $componentScope, heated_state = $heatedState,
+         auto_dimming_state = $autoDimmingState, power_folding_state = $powerFoldingState,
+         memory_state = $memoryState, blind_spot_state = $blindSpotState, camera_state = $cameraState,
+         turn_signal_state = $turnSignalState, connector_pins = $connectorPins,
+         required_options = $requiredOptions, excluded_options = $excludedOptions,
+         variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation
+         WHERE id = $id`,
+        {
+          id: candidate.id,
+          familyName: intelligence.familyName,
+          componentScope: intelligence.componentScope,
+          heatedState: intelligence.heatedState,
+          autoDimmingState: intelligence.autoDimmingState,
+          powerFoldingState: intelligence.powerFoldingState,
+          memoryState: intelligence.memoryState,
+          blindSpotState: intelligence.blindSpotState,
+          cameraState: intelligence.cameraState,
+          turnSignalState: intelligence.turnSignalState,
+          connectorPins: intelligence.connectorPins,
+          requiredOptions: intelligence.requiredOptions,
+          excludedOptions: intelligence.excludedOptions,
+          variantSummary: intelligence.variantSummary,
+          fitmentExplanation: intelligence.fitmentExplanation,
+        },
+      );
+    }
+  });
 }
 
 const app = express();
@@ -1162,6 +1727,91 @@ app.get("/api/local/enrichment/candidates", asyncRoute(async (request, response)
   response.json(result);
 }));
 
+app.get("/api/local/enrichment/candidates/:id/variants", asyncRoute(async (request, response) => {
+  const result = await withConnection(async (connection) => {
+    const candidateReader = await connection.runAndReadAll(
+      "SELECT * FROM partmaster_enrichment_candidates WHERE id = $id",
+      { id: request.params.id },
+    );
+    const candidate = candidateReader.getRowObjectsJson()[0];
+    if (!candidate) {
+      const error = new Error("Enrichment candidate not found.");
+      error.status = 404;
+      throw error;
+    }
+    const familyName = candidate.family_name || inferFamilyName(candidate.description_raw, candidate.assembly);
+    const familyKey = normalizeApplicationValue(familyName);
+    const reader = await connection.runAndReadAll(
+      `SELECT parts.id, parts.part_number, parts.description, parts.component_scope, parts.variant_summary,
+       max(CASE WHEN attributes.attribute_name = 'side' THEN attributes.attribute_value END) AS side,
+       max(CASE WHEN attributes.attribute_name = 'heated' THEN attributes.attribute_value END) AS heated,
+       max(CASE WHEN attributes.attribute_name = 'auto_dimming' THEN attributes.attribute_value END) AS auto_dimming,
+       max(CASE WHEN attributes.attribute_name = 'power_folding' THEN attributes.attribute_value END) AS power_folding,
+       max(CASE WHEN attributes.attribute_name = 'memory' THEN attributes.attribute_value END) AS memory,
+       max(CASE WHEN attributes.attribute_name = 'blind_spot' THEN attributes.attribute_value END) AS blind_spot,
+       max(CASE WHEN attributes.attribute_name = 'camera' THEN attributes.attribute_value END) AS camera,
+       max(CASE WHEN attributes.attribute_name = 'connector_pins' THEN attributes.attribute_value END) AS connector_pins
+       FROM partmaster_canonical_parts parts
+       JOIN partmaster_part_families families ON families.id = parts.family_id
+       LEFT JOIN partmaster_variant_attributes attributes ON attributes.part_id = parts.id
+       WHERE parts.manufacturer_norm = $manufacturer AND families.family_key = $familyKey
+       GROUP BY parts.id, parts.part_number, parts.description, parts.component_scope, parts.variant_summary
+       ORDER BY parts.part_number LIMIT 20`,
+      { manufacturer: candidate.manufacturer_norm, familyKey },
+    );
+    return { familyName, variants: reader.getRowObjectsJson() };
+  });
+  response.json(result);
+}));
+
+app.post("/api/local/master/relationships", asyncRoute(async (request, response) => {
+  const relationshipType = String(request.body.relationshipType || "");
+  if (!["same_family", "supersedes", "superseded_by", "interchangeable", "interchangeable_if", "not_interchangeable", "component_of"].includes(relationshipType)) {
+    return response.status(400).json({ error: "Choose a supported part relationship type." });
+  }
+  const relationship = await withConnection(async (connection) => {
+    const sourcePartId = String(request.body.sourcePartId || "");
+    const targetPartId = String(request.body.targetPartId || "");
+    if (!sourcePartId || !targetPartId || sourcePartId === targetPartId) throw new Error("Choose two different canonical parts.");
+    const reader = await connection.runAndReadAll(
+      `SELECT id FROM partmaster_part_relationships
+       WHERE source_part_id = $sourcePartId AND target_part_id = $targetPartId AND relationship_type = $relationshipType`,
+      { sourcePartId, targetPartId, relationshipType },
+    );
+    let id = reader.getRowObjectsJson()[0]?.id;
+    if (id) {
+      await connection.run(
+        `UPDATE partmaster_part_relationships SET conditions = $conditions, confidence = $confidence,
+         evidence_url = $evidenceUrl WHERE id = $id`,
+        {
+          id,
+          conditions: String(request.body.conditions || "").trim() || null,
+          confidence: Math.max(0, Math.min(1, Number(request.body.confidence) || 0.9)),
+          evidenceUrl: String(request.body.evidenceUrl || "").trim() || null,
+        },
+      );
+    } else {
+      id = randomUUID();
+      await connection.run(
+        `INSERT INTO partmaster_part_relationships
+         (id, source_part_id, target_part_id, relationship_type, conditions, confidence, evidence_url)
+         VALUES ($id, $sourcePartId, $targetPartId, $relationshipType, $conditions, $confidence, $evidenceUrl)`,
+        {
+          id,
+          sourcePartId,
+          targetPartId,
+          relationshipType,
+          conditions: String(request.body.conditions || "").trim() || null,
+          confidence: Math.max(0, Math.min(1, Number(request.body.confidence) || 0.9)),
+          evidenceUrl: String(request.body.evidenceUrl || "").trim() || null,
+        },
+      );
+    }
+    return { id };
+  });
+  response.json({ relationship });
+}));
+
 app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, response) => {
   const decision = String(request.body.decision || "");
   if (!["approve", "reject"].includes(decision)) {
@@ -1185,7 +1835,22 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
       side: String(request.body.side || candidate.side || "Unknown").trim(),
       position: String(request.body.position || candidate.position || "").trim() || null,
       location_notes: String(request.body.locationNotes || candidate.location_notes || "").trim() || null,
+      family_name: String(request.body.familyName || candidate.family_name || inferFamilyName(candidate.description_raw, candidate.assembly)).trim(),
+      component_scope: String(request.body.componentScope || candidate.component_scope || "component").trim(),
+      heated_state: safeFeatureState(request.body.heatedState, candidate.heated_state || "unknown"),
+      auto_dimming_state: safeFeatureState(request.body.autoDimmingState, candidate.auto_dimming_state || "unknown"),
+      power_folding_state: safeFeatureState(request.body.powerFoldingState, candidate.power_folding_state || "unknown"),
+      memory_state: safeFeatureState(request.body.memoryState, candidate.memory_state || "unknown"),
+      blind_spot_state: safeFeatureState(request.body.blindSpotState, candidate.blind_spot_state || "unknown"),
+      camera_state: safeFeatureState(request.body.cameraState, candidate.camera_state || "unknown"),
+      turn_signal_state: safeFeatureState(request.body.turnSignalState, candidate.turn_signal_state || "unknown"),
+      connector_pins: String(request.body.connectorPins || candidate.connector_pins || "").trim() || null,
+      required_options: String(request.body.requiredOptions || candidate.required_options || "").trim() || null,
+      excluded_options: String(request.body.excludedOptions || candidate.excluded_options || "").trim() || null,
+      variant_summary: String(request.body.variantSummary || candidate.variant_summary || "").trim() || null,
+      fitment_explanation: String(request.body.fitmentExplanation || candidate.fitment_explanation || "").trim() || null,
       confidence: decision === "approve" ? Math.max(Number(candidate.confidence) || 0, 0.9) : Number(candidate.confidence) || 0,
+      decision,
     };
     if (decision === "approve") {
       if (!normalizePartNumber(edited.enriched_part_number)) throw new Error("An OEM part number is required before approval.");
@@ -1195,6 +1860,12 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
       `UPDATE partmaster_enrichment_candidates SET
        enriched_part_number = $partNumber, enriched_description = $description, side = $side,
        position = $position, location_notes = $locationNotes, confidence = $confidence,
+       family_name = $familyName, component_scope = $componentScope, heated_state = $heatedState,
+       auto_dimming_state = $autoDimmingState, power_folding_state = $powerFoldingState,
+       memory_state = $memoryState, blind_spot_state = $blindSpotState, camera_state = $cameraState,
+       turn_signal_state = $turnSignalState, connector_pins = $connectorPins,
+       required_options = $requiredOptions, excluded_options = $excludedOptions,
+       variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation,
        status = $status, decision = $decision, decision_notes = $notes, reviewed_at = current_timestamp
        WHERE id = $id`,
       {
@@ -1205,6 +1876,20 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
         position: edited.position,
         locationNotes: edited.location_notes,
         confidence: edited.confidence,
+        familyName: edited.family_name,
+        componentScope: edited.component_scope,
+        heatedState: edited.heated_state,
+        autoDimmingState: edited.auto_dimming_state,
+        powerFoldingState: edited.power_folding_state,
+        memoryState: edited.memory_state,
+        blindSpotState: edited.blind_spot_state,
+        cameraState: edited.camera_state,
+        turnSignalState: edited.turn_signal_state,
+        connectorPins: edited.connector_pins,
+        requiredOptions: edited.required_options,
+        excludedOptions: edited.excluded_options,
+        variantSummary: edited.variant_summary,
+        fitmentExplanation: edited.fitment_explanation,
         status: decision === "approve" ? "enriched" : "rejected",
         decision,
         notes: String(request.body.notes || "").trim() || null,
@@ -1221,6 +1906,9 @@ app.get("/api/local/master/stats", asyncRoute(async (_request, response) => {
       `SELECT
        (SELECT count(*) FROM partmaster_canonical_parts) AS parts,
        (SELECT count(*) FROM partmaster_part_applications) AS applications,
+       (SELECT count(*) FROM partmaster_part_families) AS families,
+       (SELECT count(DISTINCT part_id) FROM partmaster_variant_attributes) AS attributed_variants,
+       (SELECT count(*) FROM partmaster_page_cache WHERE success) AS cached_pages,
        (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status IN ('needs_review', 'conflict')) AS awaiting_review,
        (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status = 'enriched') AS enriched_candidates`,
     );
@@ -1234,13 +1922,32 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const stamp = Date.now();
     const partsFilename = `parts-master-${stamp}.csv`;
     const applicationsFilename = `part-applications-${stamp}.csv`;
+    const relationshipsFilename = `part-relationships-${stamp}.csv`;
     const partsPath = join(EXPORT_ROOT, partsFilename);
     const applicationsPath = join(EXPORT_ROOT, applicationsFilename);
+    const relationshipsPath = join(EXPORT_ROOT, relationshipsFilename);
     await connection.run(
-      `COPY (SELECT manufacturer AS "Manufacturer", part_number AS "OEM Part Number",
-       description AS "Description", verification_status AS "Verification Status",
-       confidence AS "Confidence", evidence_url AS "Evidence URL", verified_at AS "Verified At"
-       FROM partmaster_canonical_parts ORDER BY manufacturer_norm, part_number_norm)
+      `COPY (SELECT parts.manufacturer AS "Manufacturer", families.family_name AS "Part Family",
+       parts.part_number AS "OEM Part Number", parts.description AS "Description",
+       parts.component_scope AS "Component Scope", parts.variant_summary AS "Variant Summary",
+       max(CASE WHEN attributes.attribute_name = 'side' THEN attributes.attribute_value END) AS "Side",
+       max(CASE WHEN attributes.attribute_name = 'heated' THEN attributes.attribute_value END) AS "Heated",
+       max(CASE WHEN attributes.attribute_name = 'auto_dimming' THEN attributes.attribute_value END) AS "Auto Dimming",
+       max(CASE WHEN attributes.attribute_name = 'power_folding' THEN attributes.attribute_value END) AS "Power Folding",
+       max(CASE WHEN attributes.attribute_name = 'memory' THEN attributes.attribute_value END) AS "Memory",
+       max(CASE WHEN attributes.attribute_name = 'blind_spot' THEN attributes.attribute_value END) AS "Blind Spot",
+       max(CASE WHEN attributes.attribute_name = 'camera' THEN attributes.attribute_value END) AS "Camera",
+       max(CASE WHEN attributes.attribute_name = 'turn_signal' THEN attributes.attribute_value END) AS "Turn Signal",
+       max(CASE WHEN attributes.attribute_name = 'connector_pins' THEN attributes.attribute_value END) AS "Connector Pins",
+       parts.verification_status AS "Verification Status", parts.confidence AS "Confidence",
+       parts.evidence_url AS "Evidence URL", parts.verified_at AS "Verified At"
+       FROM partmaster_canonical_parts parts
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       LEFT JOIN partmaster_variant_attributes attributes ON attributes.part_id = parts.id
+       GROUP BY parts.id, parts.manufacturer, families.family_name, parts.part_number, parts.description,
+        parts.component_scope, parts.variant_summary, parts.verification_status, parts.confidence,
+        parts.evidence_url, parts.verified_at, parts.manufacturer_norm, parts.part_number_norm
+       ORDER BY parts.manufacturer_norm, parts.part_number_norm)
        TO ${quoteString(partsPath)} (FORMAT CSV, HEADER true)`,
     );
     await connection.run(
@@ -1250,15 +1957,29 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
        applications.location_notes AS "Location Notes", applications.year AS "Year",
        applications.model AS "Model", applications.assembly AS "Assembly",
        applications.quantity AS "Quantity", applications.source_url AS "Source URL",
-       applications.evidence_url AS "Evidence URL", applications.confidence AS "Confidence"
+       applications.required_options AS "Required Options", applications.excluded_options AS "Excluded Options",
+       applications.fitment_explanation AS "Why It Fits", applications.evidence_url AS "Evidence URL",
+       applications.confidence AS "Confidence"
        FROM partmaster_part_applications applications
        JOIN partmaster_canonical_parts parts ON parts.id = applications.part_id
        ORDER BY parts.manufacturer_norm, parts.part_number_norm, applications.year, applications.model)
        TO ${quoteString(applicationsPath)} (FORMAT CSV, HEADER true)`,
     );
+    await connection.run(
+      `COPY (SELECT source.manufacturer AS "Manufacturer", source.part_number AS "Source Part Number",
+       relationships.relationship_type AS "Relationship", target.part_number AS "Target Part Number",
+       relationships.conditions AS "Conditions", relationships.confidence AS "Confidence",
+       relationships.evidence_url AS "Evidence URL"
+       FROM partmaster_part_relationships relationships
+       JOIN partmaster_canonical_parts source ON source.id = relationships.source_part_id
+       JOIN partmaster_canonical_parts target ON target.id = relationships.target_part_id
+       ORDER BY source.manufacturer_norm, source.part_number_norm)
+       TO ${quoteString(relationshipsPath)} (FORMAT CSV, HEADER true)`,
+    );
     return [
       { filename: partsFilename, path: partsPath, bytes: (await stat(partsPath)).size },
       { filename: applicationsFilename, path: applicationsPath, bytes: (await stat(applicationsPath)).size },
+      { filename: relationshipsFilename, path: relationshipsPath, bytes: (await stat(relationshipsPath)).size },
     ];
   });
   response.json({ exports });
@@ -1268,6 +1989,8 @@ app.use((error, _request, response, _next) => {
   console.error(error);
   response.status(error.status || 500).json({ error: error.message || "Local data service error." });
 });
+
+await backfillVariantIntelligence();
 
 const resumableJobIds = await withConnection(async (connection) => {
   await connection.run("UPDATE partmaster_enrichment_candidates SET status = 'pending' WHERE status = 'processing'");
