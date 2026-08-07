@@ -446,6 +446,8 @@ await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_type VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_mapping_method VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_mapping_confidence DOUBLE;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS extracted_attributes_json VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS extracted_attribute_count INTEGER DEFAULT 0;
   ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS family_id VARCHAR;
   ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS component_scope VARCHAR;
   ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS variant_summary VARCHAR;
@@ -582,7 +584,8 @@ const CATEGORY_ATTRIBUTE_SCHEMAS = [
   ] },
   { key: "brake_system", label: "Brake System", match: ["brake", "caliper", "rotor"], attributes: [
     ["axle", "Front / rear", "enum"], ["side", "Side", "enum"], ["rotor_diameter_mm", "Rotor diameter (mm)", "number"],
-    ["caliper_type", "Caliper type", "text"], ["piston_count", "Piston count", "number"], ["wear_sensor", "Wear sensor", "boolean"],
+    ["rotor_thickness_mm", "Rotor thickness (mm)", "number"], ["caliper_type", "Caliper type", "text"],
+    ["piston_count", "Piston count", "number"], ["wear_sensor", "Wear sensor", "boolean"], ["rotor_style", "Rotor style", "enum"],
   ] },
   { key: "lighting", label: "Lighting", match: ["headlight", "headlamp", "tail light", "taillight", "lamp"], attributes: [
     ["side", "Side", "enum"], ["light_technology", "LED / HID / Halogen", "enum"], ["adaptive", "Adaptive", "boolean"],
@@ -598,24 +601,111 @@ const CATEGORY_ATTRIBUTE_SCHEMAS = [
   ] },
   { key: "wheel", label: "Wheel / Tire", match: ["wheel", "rim", "tire"], attributes: [
     ["diameter_in", "Diameter (in)", "number"], ["width_in", "Width (in)", "number"], ["bolt_pattern", "Bolt pattern", "text"],
-    ["offset_mm", "Offset (mm)", "number"], ["finish", "Finish", "text"], ["tpms", "TPMS", "boolean"],
+    ["offset_mm", "Offset (mm)", "number"], ["construction", "Construction", "enum"], ["material", "Material", "text"],
+    ["color", "Color", "text"], ["finish", "Finish", "text"], ["tpms", "TPMS", "boolean"], ["tooth_count", "Tooth count", "number"],
+  ] },
+  { key: "fastener", label: "Fastener / Hardware", match: ["fastener", "screw", "bolt", "nut", "washer", "rivet", "clip"], attributes: [
+    ["fastener_type", "Fastener type", "enum"], ["thread_diameter_mm", "Thread diameter (mm)", "number"],
+    ["thread_pitch_mm", "Thread pitch (mm)", "number"], ["length_mm", "Length (mm)", "number"],
+    ["strength_grade", "Strength grade", "text"], ["material_grade", "Material grade", "text"],
+    ["coating", "Coating", "text"], ["head_style", "Head style", "text"], ["drive_type", "Drive type", "text"],
+  ] },
+  { key: "bearing", label: "Bearing / Bushing", match: ["bearing", "bushing", "bush"], attributes: [
+    ["component_type", "Component type", "enum"], ["inner_diameter_mm", "Inner diameter (mm)", "number"],
+    ["outer_diameter_mm", "Outer diameter (mm)", "number"], ["width_mm", "Width (mm)", "number"],
+    ["sealed", "Sealed", "boolean"], ["material", "Material", "text"],
+  ] },
+  { key: "seal", label: "Seal / Gasket", match: ["seal", "gasket", "o-ring", "oring"], attributes: [
+    ["seal_type", "Seal type", "enum"], ["inner_diameter_mm", "Inner diameter (mm)", "number"],
+    ["outer_diameter_mm", "Outer diameter (mm)", "number"], ["thickness_mm", "Thickness (mm)", "number"],
+    ["material", "Material", "text"],
+  ] },
+  { key: "filter", label: "Filter", match: ["filter", "strainer"], attributes: [
+    ["filter_type", "Filter type", "enum"], ["media_material", "Media material", "text"],
+    ["outer_diameter_mm", "Outer diameter (mm)", "number"], ["height_mm", "Height (mm)", "number"],
+    ["thread_size", "Thread size", "text"],
+  ] },
+  { key: "electrical", label: "Electrical / Sensor", match: ["sensor", "switch", "relay", "module", "alternator", "regulator", "electrical"], attributes: [
+    ["component_type", "Component type", "enum"], ["voltage_v", "Voltage (V)", "number"], ["current_a", "Current (A)", "number"],
+    ["power_w", "Power (W)", "number"], ["resistance_ohm", "Resistance (ohm)", "number"],
+    ["connector_pins", "Connector pins", "number"], ["tooth_count", "Tooth count", "number"],
+  ] },
+  { key: "suspension", label: "Suspension / Steering", match: ["suspension", "steering", "shock", "strut", "fork", "swingarm", "tie rod"], attributes: [
+    ["component_type", "Component type", "enum"], ["side", "Side", "enum"], ["position", "Position", "text"],
+    ["length_mm", "Length (mm)", "number"], ["diameter_mm", "Diameter (mm)", "number"], ["adjustable", "Adjustable", "boolean"],
+  ] },
+  { key: "cooling", label: "Cooling / HVAC", match: ["radiator", "cooling", "thermostat", "hose", "heater", "air conditioning", "hvac"], attributes: [
+    ["component_type", "Component type", "enum"], ["diameter_mm", "Diameter (mm)", "number"], ["length_mm", "Length (mm)", "number"],
+    ["temperature_c", "Temperature (C)", "number"], ["pressure_bar", "Pressure (bar)", "number"], ["material", "Material", "text"],
+  ] },
+  { key: "paint_chemical", label: "Paint / Chemical", match: ["paint", "touch up", "adhesive", "sealant", "thread lock", "chemical"], attributes: [
+    ["product_type", "Product type", "enum"], ["color", "Color", "text"], ["color_code", "Color code", "text"],
+    ["volume_ml", "Volume (ml)", "number"], ["strength", "Strength", "text"], ["finish", "Finish", "text"],
   ] },
   { key: "general", label: "General Part", match: [], attributes: [
     ["side", "Side", "enum"], ["position", "Position", "text"], ["material", "Material", "text"],
-    ["dimensions", "Dimensions", "text"], ["color", "Color", "text"], ["connector_pins", "Connector pins", "number"],
+    ["dimensions", "Dimensions", "text"], ["diameter_mm", "Diameter (mm)", "number"], ["length_mm", "Length (mm)", "number"],
+    ["width_mm", "Width (mm)", "number"], ["height_mm", "Height (mm)", "number"], ["thickness_mm", "Thickness (mm)", "number"],
+    ["color", "Color", "text"], ["finish", "Finish", "text"], ["voltage_v", "Voltage (V)", "number"],
+    ["connector_pins", "Connector pins", "number"], ["quantity_in_assembly", "Quantity in assembly", "number"],
   ] },
 ].map((schema) => ({ ...schema, attributes: schema.attributes.map(([key, label, type]) => ({ key, label, type })) }));
 
 function categorySchemaFor(familyName, description = "") {
-  const text = `${familyName || ""} ${description || ""}`.toLowerCase();
+  const familyText = String(familyName || "").toLowerCase();
+  const familySchema = CATEGORY_ATTRIBUTE_SCHEMAS.find((schema) => schema.key === familyText.replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "")
+    || schema.label.toLowerCase() === familyText
+    || schema.match.some((term) => familyText.includes(term)));
+  if (familySchema) return familySchema;
+  const text = String(description || "").toLowerCase();
   return CATEGORY_ATTRIBUTE_SCHEMAS.find((schema) => schema.match.some((term) => text.includes(term)))
     || CATEGORY_ATTRIBUTE_SCHEMAS.at(-1);
 }
 
 function inferCategoryAttributes(candidate, description = "") {
-  const text = `${description || candidate.enriched_description || candidate.description_raw || ""} ${candidate.assembly || ""}`.toUpperCase();
+  const text = `${description || candidate.enriched_description || candidate.description_raw || ""} ${candidate.assembly || ""}`
+    .toUpperCase().replace(/(\d),(\d)/g, "$1.$2");
   const schema = categorySchemaFor(candidate.family_name || candidate.familyName || candidate.assembly, text);
   const attributes = {};
+  const set = (name, value) => { if (value != null && String(value).trim()) attributes[name] = String(value).trim(); };
+  const dimension = text.match(/\b(\d+(?:\.\d+)?)\s*X\s*(\d+(?:\.\d+)?)(?:\s*X\s*(\d+(?:\.\d+)?))?\s*(MM|CM|IN(?:CH)?)?\b/);
+  if (dimension) set("dimensions", `${dimension[1]} x ${dimension[2]}${dimension[3] ? ` x ${dimension[3]}` : ""}${dimension[4] ? ` ${dimension[4].toLowerCase()}` : ""}`);
+  const color = ["BLACK", "WHITE", "SILVER", "CHROME", "RED", "BLUE", "GREEN", "GRAY", "GREY", "BEIGE", "BROWN", "ORANGE", "YELLOW"].find((item) => new RegExp(`\\b${item}\\b`).test(text));
+  if (color) set("color", color === "GREY" ? "Gray" : titleCase(color));
+  const material = [
+    ["STAINLESS STEEL", /\bSTAINLESS(?: STEEL)?|\bINOX\b/], ["Aluminum", /\bALUM(?:INUM|INIUM)?\b/],
+    ["Steel", /\bSTEEL\b/], ["Carbon fiber", /\bCARBON(?: FIBER| FIBRE)?\b/], ["Rubber", /\bRUBBER\b/],
+    ["Plastic", /\bPLASTIC\b/], ["Nylon", /\bNYLON\b/], ["Copper", /\bCOPPER\b/], ["Brass", /\bBRASS\b/],
+  ].find(([, pattern]) => pattern.test(text))?.[0];
+  if (material) set("material", material);
+  const finish = [
+    ["Primed", /\bPRIMED\b/], ["Polished", /\bPOLISHED\b/], ["Matte", /\bMATT(?:E)?\b/],
+    ["Gloss", /\bGLOSS(?:Y)?\b/], ["Chrome", /\bCHROME(?:D)?\b/], ["Painted", /\bPAINTED\b/],
+  ].find(([, pattern]) => pattern.test(text))?.[0];
+  if (finish) set("finish", finish);
+  const labeledDiameter = text.match(/\b(?:D|DIA|DIAMETER|Ø)\s*[:=]\s*(\d+(?:\.\d+)?)\s*MM\b/)?.[1];
+  const labeledThickness = text.match(/\b(?:T|THK|THICKNESS)\s*[:=]\s*(\d+(?:\.\d+)?)\s*MM\b/)?.[1];
+  const labeledLength = text.match(/\b(?:L|LENGTH)\s*[:=]\s*(\d+(?:\.\d+)?)\s*MM\b/)?.[1];
+  if (labeledDiameter) set("diameter_mm", labeledDiameter);
+  if (labeledThickness) set("thickness_mm", labeledThickness);
+  if (labeledLength) set("length_mm", labeledLength);
+  const connector = text.match(/\b(\d{1,2})[- ]?PIN\b/)?.[1];
+  if (connector) set("connector_pins", connector);
+  const voltage = text.match(/\b(\d+(?:\.\d+)?)\s*V(?:OLT)?S?\b/)?.[1];
+  if (voltage) set("voltage_v", voltage);
+  const current = text.match(/\b(\d+(?:\.\d+)?)\s*A(?:MP)?S?\b/)?.[1];
+  if (current) set("current_a", current);
+  const power = text.match(/\b(\d+(?:\.\d+)?)\s*W(?:ATT)?S?\b/)?.[1];
+  if (power) set("power_w", power);
+  const volume = text.match(/\b(\d+(?:\.\d+)?)\s*ML\b/)?.[1];
+  if (volume) set("volume_ml", volume);
+  set("source_brand", text.match(/\bBRAND:\s*([^;|]+)/)?.[1]);
+  set("online_price", text.match(/\bONLINE PRICE:\s*([0-9.,]+)/)?.[1]);
+  set("currency", text.match(/\bCURRENCY:\s*([A-Z]{3})\b/)?.[1]);
+  set("availability", text.match(/\bAVAILABILITY:\s*([^;|]+)/)?.[1]);
+  const toothCount = text.match(/\bZ\s*=\s*(\d+)\b/)?.[1] || text.match(/\b(\d+)[ -]?TOOTH\b/)?.[1];
+  if (toothCount) set("tooth_count", toothCount);
+  if (candidate.quantity && Number(candidate.quantity) > 0) set("quantity_in_assembly", String(Number(candidate.quantity)));
   if (schema.key === "clutch") {
     if (/FRICTION/.test(text)) attributes.plate_type = "friction";
     else if (/\b(STEEL|SEPARATOR)\b/.test(text)) attributes.plate_type = "steel";
@@ -632,11 +722,17 @@ function inferCategoryAttributes(candidate, description = "") {
   } else if (schema.key === "brake_system") {
     if (/\bFRONT\b/.test(text)) attributes.axle = "front";
     else if (/\bREAR\b/.test(text)) attributes.axle = "rear";
-    const diameter = text.match(/(?:DIA(?:METER)?|Ø)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*MM/)?.[1];
+    const rotorDimensions = text.match(/\bD\s*=\s*(\d+(?:\.\d+)?)(?:\s*[-X]\s*(\d+(?:\.\d+)?))?\s*MM\b/);
+    const diameter = rotorDimensions?.[1] || text.match(/(?:DIA(?:METER)?|Ø)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*MM/)?.[1];
     if (diameter) attributes.rotor_diameter_mm = diameter;
+    if (rotorDimensions?.[2]) attributes.rotor_thickness_mm = rotorDimensions[2];
     const pistons = text.match(/\b(\d+)[ -]?PISTON\b/)?.[1];
     if (pistons) attributes.piston_count = pistons;
     if (/WEAR SENSOR/.test(text)) attributes.wear_sensor = "yes";
+    if (/\bVENT(?:ED|ILATED)\b/.test(text)) attributes.rotor_style = "vented";
+    else if (/\bSOLID\b/.test(text)) attributes.rotor_style = "solid";
+    if (/\bDRILLED\b/.test(text)) attributes.rotor_style = `${attributes.rotor_style ? `${attributes.rotor_style}, ` : ""}drilled`;
+    if (/\bSLOTTED\b/.test(text)) attributes.rotor_style = `${attributes.rotor_style ? `${attributes.rotor_style}, ` : ""}slotted`;
   } else if (schema.key === "lighting") {
     if (/\bLED\b/.test(text)) attributes.light_technology = "LED";
     else if (/\bHID|XENON\b/.test(text)) attributes.light_technology = "HID/Xenon";
@@ -648,9 +744,60 @@ function inferCategoryAttributes(candidate, description = "") {
   } else if (schema.key === "wheel") {
     const size = text.match(/\b(\d+(?:\.\d+)?)\s*X\s*(\d+(?:\.\d+)?)\b/);
     if (size) { attributes.width_in = size[1]; attributes.diameter_in = size[2]; }
+    if (/\bFORGED\b/.test(text)) attributes.construction = "forged";
+    else if (/\bCAST\b/.test(text)) attributes.construction = "cast";
     if (/\bTPMS\b/.test(text)) attributes.tpms = "yes";
+  } else if (schema.key === "fastener") {
+    const type = ["SCREW", "BOLT", "NUT", "WASHER", "RIVET", "CLIP", "STUD"].find((item) => new RegExp(`\\b${item}\\b`).test(text));
+    if (type) attributes.fastener_type = titleCase(type);
+    const metric = text.match(/\bM(\d+(?:\.\d+)?)(?:\s*X\s*(\d+(?:\.\d+)?))?(?:\s*X\s*(\d+(?:\.\d+)?))?/);
+    if (metric) {
+      attributes.thread_diameter_mm = metric[1];
+      if (metric[3]) { attributes.thread_pitch_mm = metric[2]; attributes.length_mm = metric[3]; }
+      else if (metric[2]) attributes.length_mm = metric[2];
+    }
+    const strength = text.match(/(?:^|[- ])(\d+\.\d+)(?:[- ]|$)/)?.[1];
+    if (strength) attributes.strength_grade = strength;
+    const materialGrade = text.match(/\b(A[24]-\d{2})\b/)?.[1];
+    if (materialGrade) attributes.material_grade = materialGrade;
+    if (/\bZNNIV\b|ZINC[- ]?NICKEL/.test(text)) attributes.coating = "Zinc-nickel";
+    else if (/\bZINC(?:ED)?\b/.test(text)) attributes.coating = "Zinc";
+    if (/FILLISTER/.test(text)) attributes.head_style = "Fillister";
+    else if (/\bHEX\b/.test(text)) attributes.head_style = "Hex";
+    else if (/\bFLANGE/.test(text)) attributes.head_style = "Flanged";
+    if (/\bTORX\b/.test(text)) attributes.drive_type = "Torx";
+    else if (/\bPHILLIPS\b/.test(text)) attributes.drive_type = "Phillips";
+  } else if (["bearing", "seal"].includes(schema.key)) {
+    if (dimension?.[3]) {
+      attributes.inner_diameter_mm = dimension[1]; attributes.outer_diameter_mm = dimension[2];
+      attributes[schema.key === "bearing" ? "width_mm" : "thickness_mm"] = dimension[3];
+    }
+    if (schema.key === "bearing") attributes.component_type = /BUSH/.test(text) ? "bushing" : "bearing";
+    if (schema.key === "seal") attributes.seal_type = /O[- ]?RING/.test(text) ? "O-ring" : /GASKET/.test(text) ? "gasket" : "seal";
+    if (/\bSEALED\b/.test(text)) attributes.sealed = "yes";
+  } else if (schema.key === "filter") {
+    attributes.filter_type = /\bOIL\b/.test(text) ? "oil" : /\bAIR\b/.test(text) ? "air" : /\bFUEL\b/.test(text) ? "fuel" : /CABIN|POLLEN/.test(text) ? "cabin" : "general";
+  } else if (schema.key === "electrical") {
+    attributes.component_type = /SENSOR/.test(text) ? "sensor" : /SWITCH/.test(text) ? "switch" : /RELAY/.test(text) ? "relay" : /REGULATOR/.test(text) ? "regulator" : /MODULE|CONTROL UNIT/.test(text) ? "module" : "electrical component";
+  } else if (schema.key === "paint_chemical") {
+    attributes.product_type = /TOUCH[- ]?UP|PENCIL|PAINT/.test(text) ? "touch-up paint" : /THREAD LOCK/.test(text) ? "thread locker" : /ADHESIVE/.test(text) ? "adhesive" : /SEALANT/.test(text) ? "sealant" : "chemical";
+    const colorCode = text.match(/(?:^|[- ])(\d{3})(?:\b|$)/)?.[1];
+    if (colorCode) attributes.color_code = colorCode;
+    if (/MEDIUM[- ]?STRENGTH/.test(text)) attributes.strength = "medium";
   }
   return attributes;
+}
+
+function applyExtractedAttributes(update, candidate, evidenceDescription = "") {
+  const attributes = inferCategoryAttributes(
+    { ...candidate, family_name: update.familyName || candidate.family_name },
+    [candidate.description_raw, evidenceDescription].filter(Boolean).join(" "),
+  );
+  return {
+    ...update,
+    extractedAttributesJson: JSON.stringify(attributes),
+    extractedAttributeCount: Object.keys(attributes).length,
+  };
 }
 
 async function loadVehicleMappingReferences() {
@@ -847,14 +994,32 @@ function inferComponentScope(description, assembly) {
 }
 
 function inferFamilyName(description, assembly) {
-  const text = `${description || ""} ${assembly || ""}`.toUpperCase();
-  if (/\b(MIRROR|REARVIEW|REAR VIEW)\b/.test(text)) return "Exterior Mirror";
-  if (/\b(BRAKE|CALIPER|ROTOR|DISC)\b/.test(text)) return "Brake System";
-  if (/\b(HEADLAMP|HEADLIGHT)\b/.test(text)) return "Headlight";
-  if (/\b(TAILLAMP|TAIL LIGHT|TAILLIGHT)\b/.test(text)) return "Tail Light";
-  if (/\b(BUMPER)\b/.test(text)) return "Bumper";
-  if (/\b(DOOR)\b/.test(text)) return "Door";
-  if (/\b(WHEEL|RIM)\b/.test(text)) return "Wheel";
+  const descriptionText = String(description || "").toUpperCase();
+  const assemblyText = String(assembly || "").toUpperCase();
+  const rules = [
+    ["Exterior Mirror", /\b(MIRROR|REARVIEW|REAR VIEW)\b/],
+    ["Brake System", /\b(BRAKE|CALIPER|ROTOR|BRAKE DISC)\b/],
+    ["Fastener / Hardware", /\b(SCREW|BOLT|NUT|WASHER|RIVET|CLIP|STUD|FASTENER)\b/],
+    ["Bearing / Bushing", /\b(BEARING|BUSHING|BUSH)\b/],
+    ["Seal / Gasket", /\b(SEAL|GASKET|O[- ]?RING)\b/],
+    ["Filter", /\b(FILTER|STRAINER)\b/],
+    ["Electrical / Sensor", /\b(SENSOR|SWITCH|RELAY|CONTROL UNIT|MODULE|ALTERNATOR|REGULATOR|CONDENSER)\b/],
+    ["Headlight", /\b(HEADLAMP|HEADLIGHT)\b/],
+    ["Tail Light", /\b(TAILLAMP|TAIL LIGHT|TAILLIGHT)\b/],
+    ["Wheel", /\b(WHEEL|RIM|TIRE|TYRE)\b/],
+    ["Clutch", /\bCLUTCH\b/],
+    ["Suspension / Steering", /\b(SHOCK|STRUT|FORK|SWINGARM|STEERING|TIE ROD)\b/],
+    ["Cooling / HVAC", /\b(RADIATOR|THERMOSTAT|COOLANT|COOLING|HEATER|HVAC|AIR CONDITION)\b/],
+    ["Paint / Chemical", /\b(TOUCH[- ]?UP|PAINT|ADHESIVE|SEALANT|THREAD LOCK)\b/],
+    ["Bumper", /\bBUMPER\b/], ["Door", /\bDOOR\b/],
+    ["Engine", /\b(ENGINE|CYLINDER|PISTON|CRANKSHAFT|CAMSHAFT)\b/],
+  ];
+  // The item itself is more specific than the diagram it happens to appear in.
+  // Only fall back to the assembly when the description has no recognizable family.
+  const direct = rules.find(([, pattern]) => pattern.test(descriptionText));
+  if (direct) return direct[0];
+  const contextual = rules.find(([, pattern]) => pattern.test(assemblyText));
+  if (contextual) return contextual[0];
   const fallback = String(assembly || description || "Unclassified Part").split(/[|,]/, 1)[0].trim();
   return titleCase(fallback).slice(0, 160) || "Unclassified Part";
 }
@@ -1004,10 +1169,28 @@ function extractPageEvidence(html, knownPartNumber) {
   });
   const productNumber = String(product?.mpn || product?.sku || product?.productID || "").trim();
   const description = cleanText(product?.name || product?.description || "").slice(0, 1000);
+  const structuredAttributes = {};
+  const addStructured = (name, value) => {
+    const cleanName = cleanText(name).slice(0, 80);
+    const cleanValue = cleanText(typeof value === "object" ? value?.name || value?.value : value).slice(0, 200);
+    if (cleanName && cleanValue) structuredAttributes[cleanName] = cleanValue;
+  };
+  addStructured("brand", product?.brand);
+  addStructured("color", product?.color);
+  addStructured("material", product?.material);
+  addStructured("model", product?.model);
+  addStructured("category", product?.category);
+  const additionalProperties = Array.isArray(product?.additionalProperty) ? product.additionalProperty : product?.additionalProperty ? [product.additionalProperty] : [];
+  for (const property of additionalProperties) addStructured(property?.name || property?.propertyID, property?.value);
+  const offers = Array.isArray(product?.offers) ? product.offers[0] : product?.offers;
+  addStructured("online price", offers?.price);
+  addStructured("currency", offers?.priceCurrency);
+  addStructured("availability", String(offers?.availability || "").split("/").at(-1));
+  const attributeText = Object.entries(structuredAttributes).map(([name, value]) => `${name}: ${value}`).join("; ");
   const visibleText = cleanText(html).slice(0, ENRICHMENT_MAX_PAGE_BYTES);
   const exactNumberFound = Boolean(knownNorm && normalizePartNumber(visibleText).includes(knownNorm));
   const structuredExact = Boolean(knownNorm && [product?.mpn, product?.sku, product?.productID].map(normalizePartNumber).includes(knownNorm));
-  return { title, productNumber, description, exactNumberFound, structuredExact, hasProductData: Boolean(product) };
+  return { title, productNumber, description, attributeText, structuredAttributes, exactNumberFound, structuredExact, hasProductData: Boolean(product) };
 }
 
 function readHtmlAttribute(tag, name) {
@@ -2052,6 +2235,7 @@ async function processEnrichmentCandidate(candidate, threshold) {
     status: "needs_review",
     decision: null,
   }, inferVariantIntelligence(candidate), candidate), vehicleMapping, candidate);
+  update = applyExtractedAttributes(update, candidate);
 
   if (!candidate.source_url) {
     if (!candidate.part_number_norm) update.status = "not_found";
@@ -2078,7 +2262,8 @@ async function processEnrichmentCandidate(candidate, threshold) {
     position: evidenceLocation.position || localLocation.position || (candidate.item_number ? `Position ${candidate.item_number}` : null),
     evidenceUrl: finalUrl,
     evidenceTitle: evidence.title || null,
-  }, inferVariantIntelligence(candidate, evidence.description), candidate), vehicleMapping, candidate);
+  }, inferVariantIntelligence(candidate, `${evidence.description} ${evidence.attributeText}`), candidate), vehicleMapping, candidate);
+  update = applyExtractedAttributes(update, candidate, `${evidence.description} ${evidence.attributeText}`);
 
   const onlinePartNorm = normalizePartNumber(evidence.productNumber);
   if (candidate.part_number_norm && onlinePartNorm && onlinePartNorm !== candidate.part_number_norm) {
@@ -2430,6 +2615,8 @@ async function runEnrichmentJob(jobId) {
                vehicle_model = $vehicleModel, vehicle_trim = $vehicleTrim, vehicle_type = $vehicleType,
                vehicle_mapping_method = $vehicleMappingMethod,
                vehicle_mapping_confidence = $vehicleMappingConfidence,
+               extracted_attributes_json = $extractedAttributesJson,
+               extracted_attribute_count = $extractedAttributeCount,
                confidence = $confidence, status = $status, decision_notes = $decision,
                processed_at = current_timestamp
                WHERE id = $id`,
@@ -2464,6 +2651,8 @@ async function runEnrichmentJob(jobId) {
                 vehicleType: nullableResult("vehicleType"),
                 vehicleMappingMethod: nullableResult("vehicleMappingMethod"),
                 vehicleMappingConfidence: nullableResult("vehicleMappingConfidence"),
+                extractedAttributesJson: nullableResult("extractedAttributesJson"),
+                extractedAttributeCount: nullableResult("extractedAttributeCount"),
                 confidence: nullableResult("confidence"),
                 status: nullableResult("status"),
                 decision: nullableResult("decision"),
@@ -2691,10 +2880,11 @@ async function backfillVariantIntelligence() {
 
     const candidatesReader = await connection.runAndReadAll(
       `SELECT * FROM partmaster_enrichment_candidates
-       WHERE family_name IS NULL AND status IN ('needs_review', 'conflict', 'not_found', 'failed') LIMIT 10000`,
+       WHERE decision IS NULL LIMIT 20000`,
     );
     for (const candidate of candidatesReader.getRowObjectsJson()) {
-      const intelligence = applyVariantIntelligence({}, inferVariantIntelligence(candidate), candidate);
+      let intelligence = applyVariantIntelligence({}, inferVariantIntelligence(candidate), candidate);
+      intelligence = applyExtractedAttributes(intelligence, candidate, candidate.enriched_description);
       await connection.run(
         `UPDATE partmaster_enrichment_candidates SET family_name = $familyName,
          component_scope = $componentScope, heated_state = $heatedState,
@@ -2702,7 +2892,9 @@ async function backfillVariantIntelligence() {
          memory_state = $memoryState, blind_spot_state = $blindSpotState, camera_state = $cameraState,
          turn_signal_state = $turnSignalState, connector_pins = $connectorPins,
          required_options = $requiredOptions, excluded_options = $excludedOptions,
-         variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation
+         variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation,
+         extracted_attributes_json = $extractedAttributesJson,
+         extracted_attribute_count = $extractedAttributeCount
          WHERE id = $id`,
         {
           id: candidate.id,
@@ -2720,6 +2912,8 @@ async function backfillVariantIntelligence() {
           excludedOptions: intelligence.excludedOptions,
           variantSummary: intelligence.variantSummary,
           fitmentExplanation: intelligence.fitmentExplanation,
+          extractedAttributesJson: intelligence.extractedAttributesJson,
+          extractedAttributeCount: intelligence.extractedAttributeCount,
         },
       );
     }
@@ -3191,7 +3385,9 @@ app.get("/api/local/enrichment/jobs", asyncRoute(async (_request, response) => {
   const jobs = await withConnection(async (connection) => {
     const reader = await connection.runAndReadAll(
       `SELECT jobs.*, datasets.name AS dataset_name,
-       (SELECT max(candidate.source_row_id) FROM partmaster_enrichment_candidates candidate WHERE candidate.job_id = jobs.id) AS last_source_row_id
+       (SELECT max(candidate.source_row_id) FROM partmaster_enrichment_candidates candidate WHERE candidate.job_id = jobs.id) AS last_source_row_id,
+       (SELECT coalesce(sum(candidate.extracted_attribute_count), 0) FROM partmaster_enrichment_candidates candidate WHERE candidate.job_id = jobs.id) AS attribute_fact_count,
+       (SELECT count(*) FROM partmaster_enrichment_candidates candidate WHERE candidate.job_id = jobs.id AND candidate.extracted_attribute_count > 0) AS attributed_candidate_count
        FROM partmaster_enrichment_jobs jobs
        LEFT JOIN partmaster_datasets datasets ON datasets.id = jobs.dataset_id
        ORDER BY jobs.created_at DESC LIMIT 100`,
@@ -3221,7 +3417,9 @@ app.get("/api/local/enrichment/jobs/:id", asyncRoute(async (request, response) =
   const result = await withConnection(async (connection) => {
     const reader = await connection.runAndReadAll(
       `SELECT jobs.*,
-       (SELECT max(candidate.source_row_id) FROM partmaster_enrichment_candidates candidate WHERE candidate.job_id = jobs.id) AS last_source_row_id
+       (SELECT max(candidate.source_row_id) FROM partmaster_enrichment_candidates candidate WHERE candidate.job_id = jobs.id) AS last_source_row_id,
+       (SELECT coalesce(sum(candidate.extracted_attribute_count), 0) FROM partmaster_enrichment_candidates candidate WHERE candidate.job_id = jobs.id) AS attribute_fact_count,
+       (SELECT count(*) FROM partmaster_enrichment_candidates candidate WHERE candidate.job_id = jobs.id AND candidate.extracted_attribute_count > 0) AS attributed_candidate_count
        FROM partmaster_enrichment_jobs jobs WHERE jobs.id = $id`,
       { id: request.params.id },
     );
@@ -3874,6 +4072,7 @@ app.get("/api/local/master/stats", asyncRoute(async (_request, response) => {
        (SELECT count(*) FROM partmaster_part_compatibility) AS compatibility_fitments,
        (SELECT count(DISTINCT part_id) FROM partmaster_part_compatibility) AS compatibility_parts,
        (SELECT count(*) FROM partmaster_page_cache WHERE success) AS cached_pages,
+       (SELECT coalesce(sum(extracted_attribute_count), 0) FROM partmaster_enrichment_candidates) AS candidate_attribute_facts,
        (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status IN ('needs_review', 'conflict')) AS awaiting_review,
        (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status = 'enriched') AS enriched_candidates`,
     );
@@ -3916,6 +4115,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const relationshipsFilename = `part-relationships-${stamp}.csv`;
     const compatibilityFilename = `part-compatibility-${stamp}.csv`;
     const intelligenceFilename = `part-intelligence-${stamp}.csv`;
+    const attributesFilename = `part-attributes-${stamp}.csv`;
     const evidenceFilename = `field-evidence-${stamp}.csv`;
     const aliasesFilename = `part-aliases-${stamp}.csv`;
     const conflictsFilename = `data-conflicts-${stamp}.csv`;
@@ -3926,6 +4126,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const relationshipsPath = join(EXPORT_ROOT, relationshipsFilename);
     const compatibilityPath = join(EXPORT_ROOT, compatibilityFilename);
     const intelligencePath = join(EXPORT_ROOT, intelligenceFilename);
+    const attributesPath = join(EXPORT_ROOT, attributesFilename);
     const evidencePath = join(EXPORT_ROOT, evidenceFilename);
     const aliasesPath = join(EXPORT_ROOT, aliasesFilename);
     const conflictsPath = join(EXPORT_ROOT, conflictsFilename);
@@ -4015,6 +4216,18 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     );
     await connection.run(
       `COPY (SELECT parts.manufacturer AS "Manufacturer", parts.part_number AS "OEM Part Number",
+       families.family_name AS "Part Family", attributes.attribute_name AS "Attribute",
+       attributes.attribute_value AS "Value", attributes.confidence AS "Confidence",
+       attributes.source_method AS "Method", attributes.evidence_url AS "Evidence URL",
+       attributes.updated_at AS "Updated At"
+       FROM partmaster_variant_attributes attributes
+       JOIN partmaster_canonical_parts parts ON parts.id = attributes.part_id
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       ORDER BY parts.manufacturer_norm, parts.part_number_norm, attributes.attribute_name)
+       TO ${quoteString(attributesPath)} (FORMAT CSV, HEADER true)`,
+    );
+    await connection.run(
+      `COPY (SELECT parts.manufacturer AS "Manufacturer", parts.part_number AS "OEM Part Number",
        evidence.field_name AS "Field", evidence.field_value AS "Observed Value",
        evidence.source_url AS "Source URL", evidence.source_title AS "Source Title",
        evidence.source_method AS "Method", evidence.confidence AS "Confidence",
@@ -4069,6 +4282,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
       { filename: relationshipsFilename, path: relationshipsPath, bytes: (await stat(relationshipsPath)).size },
       { filename: compatibilityFilename, path: compatibilityPath, bytes: (await stat(compatibilityPath)).size },
       { filename: intelligenceFilename, path: intelligencePath, bytes: (await stat(intelligencePath)).size },
+      { filename: attributesFilename, path: attributesPath, bytes: (await stat(attributesPath)).size },
       { filename: evidenceFilename, path: evidencePath, bytes: (await stat(evidencePath)).size },
       { filename: aliasesFilename, path: aliasesPath, bytes: (await stat(aliasesPath)).size },
       { filename: conflictsFilename, path: conflictsPath, bytes: (await stat(conflictsPath)).size },
