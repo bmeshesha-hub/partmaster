@@ -291,6 +291,8 @@ export default function EnrichmentManager() {
   const [quality, setQuality] = useState({ total_parts: 0, incomplete_parts: 0, duplicate_part_keys: 0, low_confidence_parts: 0, total_applications: 0, mapped_applications: 0, applications_with_side: 0, applications_with_position: 0, compatibility_fitments: 0, meaningful_variant_attributes: 0, awaiting_review: 0 });
   const [selectedJobId, setSelectedJobId] = useState("");
   const [statusFilter, setStatusFilter] = useState("needs_review");
+  const [reviewFilters, setReviewFilters] = useState({ q: "", make: "", year: "", category: "" });
+  const [appliedReviewFilters, setAppliedReviewFilters] = useState({ q: "", make: "", year: "", category: "" });
   const [candidates, setCandidates] = useState([]);
   const [candidateTotal, setCandidateTotal] = useState(0);
   const [reviewing, setReviewing] = useState(null);
@@ -322,13 +324,13 @@ export default function EnrichmentManager() {
   const loadCandidates = useCallback(async () => {
     if (!connected) return;
     try {
-      const result = await localDataApi.enrichmentCandidates({ jobId: selectedJobId, status: statusFilter, limit: 200 });
+      const result = await localDataApi.enrichmentCandidates({ jobId: selectedJobId, status: statusFilter, ...appliedReviewFilters, limit: 200 });
       setCandidates(result.candidates);
       setCandidateTotal(result.total);
     } catch (requestError) {
       setError(requestError.message);
     }
-  }, [connected, selectedJobId, statusFilter]);
+  }, [appliedReviewFilters, connected, selectedJobId, statusFilter]);
 
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { loadCandidates(); }, [loadCandidates]);
@@ -357,6 +359,19 @@ export default function EnrichmentManager() {
     } finally {
       setStarting(false);
     }
+  }
+
+  function searchReview(event) {
+    event.preventDefault();
+    setSelectedCandidateIds([]);
+    setAppliedReviewFilters({ ...reviewFilters });
+  }
+
+  function clearReviewSearch() {
+    const empty = { q: "", make: "", year: "", category: "" };
+    setReviewFilters(empty);
+    setAppliedReviewFilters(empty);
+    setSelectedCandidateIds([]);
   }
 
   async function controlJob(job, action) {
@@ -475,6 +490,7 @@ export default function EnrichmentManager() {
 
     <section className="rounded-2xl border border-slate-200 bg-white shadow-panel">
       <header className="flex flex-wrap items-end justify-between gap-3 border-b border-slate-200 px-5 py-4"><div><h3 className="font-semibold">Evidence review</h3><p className="mt-1 text-sm text-slate-500">{Number(candidateTotal).toLocaleString()} matching candidates; showing up to 200.</p></div><div className="flex flex-wrap items-center gap-2">{selectedCandidateIds.length > 0 && <button type="button" onClick={() => setBulkConfirmCount(selectedCandidateIds.length)} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-3 py-2 text-sm font-bold text-white"><ListChecks size={16} />Approve selected ({selectedCandidateIds.length})</button>}<select value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); setSelectedCandidateIds([]); }} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"><option value="">All statuses</option>{REVIEW_STATUSES.map((status) => <option key={status} value={status}>{status.replaceAll("_", " ")}</option>)}</select></div></header>
+      <form onSubmit={searchReview} className="grid gap-3 border-b border-slate-200 bg-slate-50/70 px-5 py-4 sm:grid-cols-2 lg:grid-cols-[2fr_1fr_0.7fr_1fr_auto]"><label className="text-xs font-bold uppercase tracking-wide text-slate-500">Search<input value={reviewFilters.q} onChange={(event) => setReviewFilters((current) => ({ ...current, q: event.target.value }))} placeholder="OEM number, description, model, or source row" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label><label className="text-xs font-bold uppercase tracking-wide text-slate-500">Make<input value={reviewFilters.make} onChange={(event) => setReviewFilters((current) => ({ ...current, make: event.target.value }))} placeholder="Kawasaki" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label><label className="text-xs font-bold uppercase tracking-wide text-slate-500">Year<input value={reviewFilters.year} onChange={(event) => setReviewFilters((current) => ({ ...current, year: event.target.value }))} placeholder="1996" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label><label className="text-xs font-bold uppercase tracking-wide text-slate-500">Category<input value={reviewFilters.category} onChange={(event) => setReviewFilters((current) => ({ ...current, category: event.target.value }))} placeholder="Mirror" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal" /></label><div className="flex items-end gap-2"><button className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-bold text-white"><SearchCheck size={16} />Search</button>{Object.values(appliedReviewFilters).some(Boolean) && <button type="button" onClick={clearReviewSearch} className="rounded-xl border border-slate-300 bg-white p-2.5 text-slate-500" aria-label="Clear evidence filters"><X size={16} /></button>}</div><p className="text-xs leading-5 text-slate-500 sm:col-span-2 lg:col-span-5">Mirror demo: status <strong>needs review</strong>, Make <strong>Kawasaki</strong>, Year <strong>1996</strong>, Category <strong>Mirror</strong>. Search <strong>7012</strong> for left or <strong>7013</strong> for right.</p></form>
       <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-200 text-sm"><thead className="bg-slate-50"><tr><th className="px-4 py-3 text-left"><input type="checkbox" checked={allVisibleSelected} onChange={toggleAllCandidates} disabled={!eligibleCandidateIds.length} aria-label="Select all visible candidates" className="h-4 w-4 rounded border-slate-300 text-emerald-600" /></th>{["Status", "OEM Part Number", "Description / Variant", "Side / Position", "Make", "Year", "Vehicle / Assembly", "Confidence", ""].map((heading) => <th key={heading} className="whitespace-nowrap px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{candidates.map((candidate) => <tr key={candidate.id} className={selectedCandidateIds.includes(candidate.id) ? "bg-emerald-50/70" : "hover:bg-slate-50"}><td className="px-4 py-3"><input type="checkbox" checked={selectedCandidateIds.includes(candidate.id)} onChange={() => toggleCandidate(candidate.id)} disabled={!isBulkApprovable(candidate)} aria-label={`Select ${normalizeCandidateNumber(candidate) || "candidate"}`} className="h-4 w-4 rounded border-slate-300 text-emerald-600" /></td><td className="px-4 py-3"><span className={`whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-semibold ${statusTone(candidate.status)}`}>{candidate.status.replaceAll("_", " ")}</span></td><td className="whitespace-nowrap px-4 py-3 font-mono font-semibold text-brand-700">{candidate.enriched_part_number || candidate.part_number_raw || "Missing"}</td><td className="max-w-96 px-4 py-3 text-slate-600"><p className="truncate" title={candidate.enriched_description || candidate.description_raw || ""}>{candidate.enriched_description || candidate.description_raw || "—"}</p>{(candidate.family_name || candidate.variant_summary) && <p className="mt-1 truncate text-xs font-semibold text-violet-700" title={[candidate.family_name, candidate.variant_summary].filter(Boolean).join(" · ")}>{[candidate.family_name, candidate.variant_summary].filter(Boolean).join(" · ")}</p>}</td><td className="whitespace-nowrap px-4 py-3 text-slate-600">{[candidate.side, candidate.position].filter(Boolean).join(" · ") || "—"}</td><td className="whitespace-nowrap px-4 py-3 font-semibold text-slate-700">{candidate.vehicle_make || candidate.manufacturer_raw || "—"}</td><td className="whitespace-nowrap px-4 py-3 text-slate-600">{candidate.vehicle_year || candidate.year || "—"}</td><td className="max-w-72 px-4 py-3 text-slate-500"><p className="truncate" title={candidate.vehicle_model || candidate.model || ""}>{candidate.vehicle_model || candidate.model || "—"}</p>{candidate.assembly && <p className="mt-1 truncate text-xs" title={candidate.assembly}>{candidate.assembly}</p>}</td><td className="px-4 py-3 font-semibold">{Math.round(Number(candidate.confidence || 0) * 100)}%</td><td className="px-4 py-3"><button type="button" onClick={() => setReviewing(candidate)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold">Review</button></td></tr>)}</tbody></table>{!candidates.length && <div className="px-6 py-12 text-center text-sm text-slate-500">No candidates match this job and status.</div>}</div>
     </section>
     {reviewing && <ReviewModal candidate={reviewing} onClose={() => setReviewing(null)} onDecision={decideCandidate} />}

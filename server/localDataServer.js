@@ -3290,6 +3290,25 @@ app.get("/api/local/enrichment/candidates", asyncRoute(async (request, response)
       conditions.push("status = $status");
       values.status = String(request.query.status);
     }
+    if (request.query.q) {
+      conditions.push(`lower(concat_ws(' ', coalesce(CAST(source_row_id AS VARCHAR), ''), coalesce(manufacturer_raw, ''),
+       coalesce(year, ''), coalesce(model, ''), coalesce(assembly, ''), coalesce(item_number, ''),
+       coalesce(part_number_raw, ''), coalesce(enriched_part_number, ''), coalesce(description_raw, ''),
+       coalesce(enriched_description, ''), coalesce(family_name, ''), coalesce(evidence_title, ''))) LIKE $query`);
+      values.query = `%${String(request.query.q).trim().toLowerCase()}%`;
+    }
+    if (request.query.make) {
+      conditions.push("lower(coalesce(manufacturer_raw, '')) LIKE $make");
+      values.make = `%${String(request.query.make).trim().toLowerCase()}%`;
+    }
+    if (request.query.year) {
+      conditions.push("coalesce(vehicle_year, year, '') = $year");
+      values.year = String(request.query.year).trim();
+    }
+    if (request.query.category) {
+      conditions.push("lower(concat_ws(' ', coalesce(family_name, ''), coalesce(assembly, ''), coalesce(description_raw, ''))) LIKE $category");
+      values.category = `%${String(request.query.category).trim().toLowerCase()}%`;
+    }
     const clause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const limit = Math.max(10, Math.min(500, Number(request.query.limit) || 100));
     const reader = await connection.runAndReadAll(
