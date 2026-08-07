@@ -349,6 +349,12 @@ await withConnection((connection) => connection.run(`
     ON partmaster_canonical_parts (family_id)
 `));
 
+await withConnection((connection) => connection.run(`
+  DELETE FROM partmaster_variant_attributes
+  WHERE attribute_name = 'component_scope'
+    OR lower(trim(coalesce(attribute_value, ''))) IN ('', 'unknown', 'none_known');
+`));
+
 function asyncRoute(handler) {
   return (request, response, next) => Promise.resolve(handler(request, response, next)).catch(next);
 }
@@ -504,6 +510,55 @@ async function vehicleMappingStats() {
        (SELECT max(loaded_at) FROM partmaster_vehicle_master) AS loaded_at`,
     );
     return reader.getRowObjectsJson()[0];
+  });
+}
+
+async function backfillApplicationVehicleMappings() {
+  return withConnection(async (connection) => {
+    const beforeReader = await connection.runAndReadAll(
+      "SELECT count(*) AS count FROM partmaster_part_applications WHERE vehicle_mapping_method IS NOT NULL",
+    );
+    const before = Number(beforeReader.getRowObjectsJson()[0].count);
+    await connection.run(`
+      UPDATE partmaster_part_applications AS applications SET
+       vehicle_make = master.make_name, vehicle_model = master.model_name,
+       vehicle_trim = nullif(master.trim_name, '--'), vehicle_type = master.vehicle_type,
+       vehicle_mapping_method = 'exact_epid', vehicle_mapping_confidence = 1
+      FROM partmaster_vehicle_master AS master
+      WHERE applications.epid = master.epid AND applications.vehicle_mapping_method IS NULL
+    `);
+    await connection.run(`
+      WITH application_norm AS (
+        SELECT applications.id,
+         upper(regexp_replace(coalesce(applications.year, ''), '[^A-Za-z0-9]', '', 'g')) AS year_norm,
+         upper(regexp_replace(coalesce(parts.manufacturer, ''), '[^A-Za-z0-9]', '', 'g')) AS make_norm,
+         upper(regexp_replace(coalesce(applications.model, ''), '[^A-Za-z0-9]', '', 'g')) AS model_norm
+        FROM partmaster_part_applications applications
+        JOIN partmaster_canonical_parts parts ON parts.id = applications.part_id
+        WHERE applications.epid IS NULL OR trim(applications.epid) = ''
+      ), mapping_candidates AS (
+        SELECT application_norm.id, master.epid FROM application_norm
+        JOIN partmaster_vehicle_master master USING (year_norm, make_norm, model_norm)
+        UNION
+        SELECT application_norm.id, aliases.epid FROM application_norm
+        JOIN partmaster_vehicle_source_aliases aliases USING (year_norm, make_norm, model_norm)
+      ), unique_matches AS (
+        SELECT id, min(epid) AS epid FROM mapping_candidates
+        GROUP BY id HAVING count(DISTINCT epid) = 1
+      )
+      UPDATE partmaster_part_applications AS applications SET
+       epid = matches.epid, vehicle_make = master.make_name, vehicle_model = master.model_name,
+       vehicle_trim = nullif(master.trim_name, '--'), vehicle_type = master.vehicle_type,
+       vehicle_mapping_method = 'unique_vehicle_text_backfill', vehicle_mapping_confidence = .92
+      FROM unique_matches AS matches
+      JOIN partmaster_vehicle_master AS master ON master.epid = matches.epid
+      WHERE applications.id = matches.id
+    `);
+    const afterReader = await connection.runAndReadAll(
+      "SELECT count(*) AS count FROM partmaster_part_applications WHERE vehicle_mapping_method IS NOT NULL",
+    );
+    const after = Number(afterReader.getRowObjectsJson()[0].count);
+    return { backfilled: Math.max(0, after - before), mappedApplications: after };
   });
 }
 
@@ -1255,7 +1310,6 @@ async function ensurePartFamily(connection, candidate) {
 async function syncVariantAttributes(connection, partId, candidate) {
   const attributes = {
     side: candidate.side || "Unknown",
-    component_scope: candidate.component_scope || "component",
     heated: candidate.heated_state || "unknown",
     auto_dimming: candidate.auto_dimming_state || "unknown",
     power_folding: candidate.power_folding_state || "unknown",
@@ -1268,6 +1322,7 @@ async function syncVariantAttributes(connection, partId, candidate) {
     excluded_options: candidate.excluded_options || "none_known",
   };
   for (const [name, value] of Object.entries(attributes)) {
+    if (["", "unknown", "none_known"].includes(String(value || "").trim().toLowerCase())) continue;
     const reader = await connection.runAndReadAll(
       "SELECT id, confidence FROM partmaster_variant_attributes WHERE part_id = $partId AND attribute_name = $name",
       { partId, name },
@@ -2767,6 +2822,32 @@ app.get("/api/local/master/stats", asyncRoute(async (_request, response) => {
   response.json({ stats });
 }));
 
+app.get("/api/local/master/quality", asyncRoute(async (_request, response) => {
+  const quality = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT
+       (SELECT count(*) FROM partmaster_canonical_parts) AS total_parts,
+       (SELECT count(*) FROM partmaster_canonical_parts
+        WHERE manufacturer IS NULL OR trim(manufacturer) = '' OR part_number IS NULL OR trim(part_number) = ''
+         OR description IS NULL OR trim(description) = '' OR family_id IS NULL
+         OR evidence_url IS NULL OR trim(evidence_url) = '' OR confidence IS NULL) AS incomplete_parts,
+       (SELECT count(*) FROM (
+        SELECT manufacturer_norm, part_number_norm FROM partmaster_canonical_parts
+        GROUP BY 1, 2 HAVING count(*) > 1) duplicates) AS duplicate_part_keys,
+       (SELECT count(*) FROM partmaster_canonical_parts WHERE confidence < .8 OR confidence IS NULL) AS low_confidence_parts,
+       (SELECT count(*) FROM partmaster_part_applications) AS total_applications,
+       (SELECT count(*) FROM partmaster_part_applications WHERE vehicle_mapping_method IS NOT NULL) AS mapped_applications,
+       (SELECT count(*) FROM partmaster_part_applications WHERE side IS NOT NULL AND lower(trim(side)) NOT IN ('', 'unknown')) AS applications_with_side,
+       (SELECT count(*) FROM partmaster_part_applications WHERE position IS NOT NULL AND trim(position) != '') AS applications_with_position,
+       (SELECT count(*) FROM partmaster_part_compatibility) AS compatibility_fitments,
+       (SELECT count(*) FROM partmaster_variant_attributes) AS meaningful_variant_attributes,
+       (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status IN ('needs_review', 'conflict')) AS awaiting_review`,
+    );
+    return reader.getRowObjectsJson()[0];
+  });
+  response.json({ quality });
+}));
+
 app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
   const exports = await withConnection(async (connection) => {
     const stamp = Date.now();
@@ -2863,6 +2944,9 @@ app.use((error, _request, response, _next) => {
 });
 
 const vehicleMappingLoadResult = await loadVehicleMappingReferences().catch((error) => ({ loaded: false, reason: error.message }));
+const vehicleMappingBackfillResult = vehicleMappingLoadResult.loaded
+  ? await backfillApplicationVehicleMappings().catch((error) => ({ backfilled: 0, reason: error.message }))
+  : { backfilled: 0 };
 await backfillVariantIntelligence();
 
 const resumableJobIds = await withConnection(async (connection) => {
@@ -2883,6 +2967,8 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`Local data directory: ${DATA_ROOT}`);
   if (vehicleMappingLoadResult.loaded) {
     console.log(`Vehicle mapping reference: ${Number(vehicleMappingLoadResult.vehicles).toLocaleString()} vehicles, ${Number(vehicleMappingLoadResult.aliases).toLocaleString()} source aliases`);
+    if (vehicleMappingBackfillResult.reason) console.log(`Vehicle mapping backfill skipped: ${vehicleMappingBackfillResult.reason}`);
+    else if (vehicleMappingBackfillResult.backfilled) console.log(`Vehicle mapping backfill: ${Number(vehicleMappingBackfillResult.backfilled).toLocaleString()} existing applications updated`);
   } else {
     console.log(`Vehicle mapping reference not loaded: ${vehicleMappingLoadResult.reason}`);
   }

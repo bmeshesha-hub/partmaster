@@ -261,6 +261,7 @@ export default function EnrichmentManager() {
   const [datasets, setDatasets] = useState([]);
   const [jobs, setJobs] = useState([]);
   const [stats, setStats] = useState({ parts: 0, families: 0, applications: 0, attributed_variants: 0, compatibility_fitments: 0, compatibility_parts: 0, cached_pages: 0, awaiting_review: 0, enriched_candidates: 0 });
+  const [quality, setQuality] = useState({ total_parts: 0, incomplete_parts: 0, duplicate_part_keys: 0, low_confidence_parts: 0, total_applications: 0, mapped_applications: 0, applications_with_side: 0, applications_with_position: 0, compatibility_fitments: 0, meaningful_variant_attributes: 0, awaiting_review: 0 });
   const [selectedJobId, setSelectedJobId] = useState("");
   const [statusFilter, setStatusFilter] = useState("needs_review");
   const [candidates, setCandidates] = useState([]);
@@ -277,11 +278,12 @@ export default function EnrichmentManager() {
 
   const refresh = useCallback(async () => {
     try {
-      const [datasetResult, jobResult, statsResult] = await Promise.all([localDataApi.datasets(), localDataApi.enrichmentJobs(), localDataApi.masterStats()]);
+      const [datasetResult, jobResult, statsResult, qualityResult] = await Promise.all([localDataApi.datasets(), localDataApi.enrichmentJobs(), localDataApi.masterStats(), localDataApi.masterQuality()]);
       setConnected(true);
       setDatasets(datasetResult.datasets);
       setJobs(jobResult.jobs);
       setStats(statsResult.stats);
+      setQuality(qualityResult.quality);
       setForm((current) => ({ ...current, datasetId: current.datasetId || datasetResult.datasets[0]?.id || "" }));
       setSelectedJobId((current) => current || jobResult.jobs[0]?.id || "");
       setError("");
@@ -407,6 +409,8 @@ export default function EnrichmentManager() {
   }
 
   const featuredJob = jobs.find((job) => ["queued", "running"].includes(job.status)) || jobs[0];
+  const canonicalCompleteness = Number(quality.total_parts) ? Math.round(((Number(quality.total_parts) - Number(quality.incomplete_parts)) / Number(quality.total_parts)) * 100) : 0;
+  const vehicleMappingCoverage = Number(quality.total_applications) ? Math.round((Number(quality.mapped_applications) / Number(quality.total_applications)) * 100) : 0;
   const eligibleCandidateIds = candidates.filter(isBulkApprovable).map((candidate) => candidate.id);
   const allVisibleSelected = Boolean(eligibleCandidateIds.length) && eligibleCandidateIds.every((id) => selectedCandidateIds.includes(id));
 
@@ -419,6 +423,8 @@ export default function EnrichmentManager() {
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
       {[{ label: "Canonical parts", value: stats.parts }, { label: "Variant families", value: stats.families }, { label: "Compatibility fitments", value: stats.compatibility_fitments }, { label: "Part applications", value: stats.applications }].map((metric) => <article key={metric.label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel"><p className="text-sm font-medium text-slate-500">{metric.label}</p><p className="mt-2 text-3xl font-bold">{Number(metric.value || 0).toLocaleString()}</p></article>)}
     </section>
+
+    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel sm:p-6"><div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="flex items-center gap-2 text-lg font-semibold"><BadgeCheck className="text-emerald-600" size={21} />Master data quality</h3><p className="mt-1 text-sm text-slate-500">Integrity checks separate true data problems from optional fitment details that may not apply to every part.</p></div><span className={`rounded-full px-3 py-1.5 text-xs font-bold ${Number(quality.duplicate_part_keys) || Number(quality.incomplete_parts) ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}>{Number(quality.duplicate_part_keys) || Number(quality.incomplete_parts) ? "Needs attention" : "Core master is clean"}</span></div><div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><div className="rounded-xl bg-emerald-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-emerald-700">Core completeness</p><p className="mt-1 text-2xl font-bold text-emerald-950">{canonicalCompleteness}%</p><p className="mt-1 text-xs text-emerald-700">{Number(quality.incomplete_parts).toLocaleString()} incomplete canonical parts</p></div><div className="rounded-xl bg-blue-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-blue-700">Duplicate part keys</p><p className="mt-1 text-2xl font-bold text-blue-950">{Number(quality.duplicate_part_keys).toLocaleString()}</p><p className="mt-1 text-xs text-blue-700">Manufacturer + normalized OEM number</p></div><div className="rounded-xl bg-violet-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-violet-700">Vehicle mapping</p><p className="mt-1 text-2xl font-bold text-violet-950">{vehicleMappingCoverage}%</p><p className="mt-1 text-xs text-violet-700">{Number(quality.mapped_applications).toLocaleString()} of {Number(quality.total_applications).toLocaleString()} applications</p></div><div className="rounded-xl bg-amber-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-amber-700">Awaiting review</p><p className="mt-1 text-2xl font-bold text-amber-950">{Number(quality.awaiting_review).toLocaleString()}</p><p className="mt-1 text-xs text-amber-700">Held outside the canonical master</p></div></div><p className="mt-4 text-xs leading-5 text-slate-500">Optional evidence coverage: {Number(quality.applications_with_side).toLocaleString()} applications have a confirmed side, {Number(quality.applications_with_position).toLocaleString()} have a position, {Number(quality.compatibility_fitments).toLocaleString()} compatibility fitments are verified, and {Number(quality.meaningful_variant_attributes).toLocaleString()} meaningful variant attributes are stored. Missing optional fields are not treated as duplicates or invented.</p></section>
 
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel sm:p-6">
       <div className="flex flex-wrap items-start justify-between gap-4"><div><h3 className="flex items-center gap-2 text-lg font-semibold"><SearchCheck className="text-brand-600" size={21} />Start a safe test batch</h3><p className="mt-1 max-w-3xl text-sm text-slate-500">The worker deduplicates candidates, checks their source pages, and auto-promotes only high-confidence evidence. Begin with 1,000 unique parts.</p></div><button type="button" onClick={exportMaster} disabled={!Number(stats.parts)} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-40"><Download size={17} />Export master CSVs</button></div>

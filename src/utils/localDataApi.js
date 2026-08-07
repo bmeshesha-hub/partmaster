@@ -45,5 +45,6 @@ export const localDataApi = {
   savePartRelationship: (relationship) => request("/master/relationships", { method: "POST", body: JSON.stringify(relationship) }),
   reviewEnrichmentCandidate: (candidateId, changes) => request(`/enrichment/candidates/${encodeURIComponent(candidateId)}`, { method: "PATCH", body: JSON.stringify(changes) }),
   masterStats: () => request("/master/stats"),
+  masterQuality: () => request("/master/quality"),
   exportMaster: () => request("/master/exports", { method: "POST", body: "{}" }),
 };
