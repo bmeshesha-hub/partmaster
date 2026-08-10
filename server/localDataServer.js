@@ -4755,6 +4755,8 @@ app.get("/api/local/enrichment/candidates", asyncRoute(async (request, response)
     if (request.query.status) {
       conditions.push("status = $status");
       values.status = String(request.query.status);
+    } else if (request.query.reviewOnly === "true") {
+      conditions.push("status IN ('needs_review', 'conflict', 'not_found', 'failed') AND decision IS NULL");
     }
     if (request.query.q) {
       conditions.push(`lower(concat_ws(' ', coalesce(CAST(source_row_id AS VARCHAR), ''), coalesce(manufacturer_raw, ''),
@@ -4789,6 +4791,61 @@ app.get("/api/local/enrichment/candidates", asyncRoute(async (request, response)
     return { candidates: reader.getRowObjectsJson(), total: countReader.getRowObjectsJson()[0].count };
   });
   response.json(result);
+}));
+
+app.get("/api/local/review/overview", asyncRoute(async (_request, response) => {
+  const overview = await withConnection(async (connection) => {
+    const reviewCondition = "status IN ('needs_review', 'conflict', 'not_found', 'failed') AND decision IS NULL";
+    const summaryReader = await connection.runAndReadAll(
+      `SELECT count(*) AS awaiting_review,
+       count(*) FILTER (WHERE status = 'needs_review') AS needs_review,
+       count(*) FILTER (WHERE status = 'conflict') AS conflicts,
+       count(*) FILTER (WHERE status = 'not_found') AS not_found,
+       count(*) FILTER (WHERE status = 'failed') AS failed,
+       count(*) FILTER (WHERE trim(coalesce(enriched_part_number, part_number_raw, '')) = '') AS missing_part_numbers,
+       count(*) FILTER (WHERE confidence >= .85) AS high_confidence,
+       count(*) FILTER (WHERE extracted_attribute_count > 0) AS with_product_facts,
+       round(avg(coalesce(confidence, 0)) * 100, 1) AS average_confidence,
+       count(DISTINCT coalesce(nullif(trim(manufacturer_raw), ''), nullif(trim(manufacturer_norm), ''), 'Unknown')) AS brands
+       FROM partmaster_enrichment_candidates WHERE ${reviewCondition}`,
+    );
+    const brandsReader = await connection.runAndReadAll(
+      `SELECT coalesce(nullif(trim(manufacturer_raw), ''), nullif(trim(manufacturer_norm), ''), 'Unknown') AS brand,
+       count(*) AS awaiting_review,
+       count(*) FILTER (WHERE status = 'needs_review') AS needs_review,
+       count(*) FILTER (WHERE status = 'conflict') AS conflicts,
+       count(*) FILTER (WHERE status = 'not_found') AS not_found,
+       count(*) FILTER (WHERE status = 'failed') AS failed,
+       count(*) FILTER (WHERE trim(coalesce(enriched_part_number, part_number_raw, '')) = '') AS missing_part_numbers,
+       count(*) FILTER (WHERE extracted_attribute_count > 0) AS with_product_facts,
+       count(DISTINCT coalesce(nullif(trim(family_name), ''), nullif(trim(assembly), ''), 'Unclassified')) AS categories,
+       round(avg(coalesce(confidence, 0)) * 100, 1) AS average_confidence
+       FROM partmaster_enrichment_candidates WHERE ${reviewCondition}
+       GROUP BY 1 ORDER BY awaiting_review DESC, brand`,
+    );
+    const categoriesReader = await connection.runAndReadAll(
+      `SELECT coalesce(nullif(trim(family_name), ''), nullif(trim(assembly), ''), 'Unclassified') AS category,
+       count(*) AS awaiting_review,
+       count(*) FILTER (WHERE status = 'conflict') AS conflicts,
+       count(DISTINCT coalesce(nullif(trim(manufacturer_raw), ''), nullif(trim(manufacturer_norm), ''), 'Unknown')) AS brands
+       FROM partmaster_enrichment_candidates WHERE ${reviewCondition}
+       GROUP BY 1 ORDER BY awaiting_review DESC, category LIMIT 12`,
+    );
+    const decisionsReader = await connection.runAndReadAll(
+      `SELECT count(*) AS total_decisions,
+       count(*) FILTER (WHERE decision = 'approve') AS approved,
+       count(*) FILTER (WHERE decision = 'reject') AS rejected,
+       count(*) FILTER (WHERE created_at >= current_timestamp - INTERVAL 7 DAY) AS decisions_last_7_days
+       FROM partmaster_review_feedback`,
+    );
+    return {
+      summary: summaryReader.getRowObjectsJson()[0],
+      brands: brandsReader.getRowObjectsJson(),
+      categories: categoriesReader.getRowObjectsJson(),
+      decisions: decisionsReader.getRowObjectsJson()[0],
+    };
+  });
+  response.json(overview);
 }));
 
 app.get("/api/local/enrichment/candidates/:id/variants", asyncRoute(async (request, response) => {

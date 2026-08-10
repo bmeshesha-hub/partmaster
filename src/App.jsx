@@ -24,9 +24,8 @@ import LocalDataManager from "./components/LocalDataManager.jsx";
 import MasterDataPage from "./components/MasterDataPage.jsx";
 import PartsLibrary from "./components/PartsLibrary.jsx";
 import PartsIntelligence from "./components/PartsIntelligence.jsx";
-import ReviewTable from "./components/ReviewTable.jsx";
+import ReviewWorkspace from "./components/ReviewWorkspace.jsx";
 import {
-  approveQueueItem,
   DEFAULT_REPOSITORY,
   fetchWorkspaceData,
   saveAnalysisResults,
@@ -61,7 +60,6 @@ export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_STORAGE_KEY) || "");
   const [data, setData] = useState(EMPTY_DATA);
   const [loading, setLoading] = useState(false);
-  const [approvingId, setApprovingId] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [view, setView] = useState("dashboard");
@@ -91,19 +89,6 @@ export default function App() {
     setData(EMPTY_DATA);
     setError("");
     setSettingsOpen(false);
-  }
-
-  async function handleApprove(itemId, variantId) {
-    setApprovingId(itemId);
-    setError("");
-    try {
-      await approveQueueItem({ token, itemId, variantId });
-      await loadWorkspace();
-    } catch (requestError) {
-      setError(requestError.message || "Approval failed. Please try again.");
-    } finally {
-      setApprovingId(null);
-    }
   }
 
   async function handleAnalysisSave(analysis) {
@@ -146,14 +131,16 @@ export default function App() {
         </nav>
 
         <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-          <div><p className="text-sm font-semibold text-brand-700">{eyebrow}</p><h2 className="mt-1 text-2xl font-bold tracking-tight text-ink">{heading}</h2><p className="mt-2 text-sm text-slate-500">{view === "about" ? "A transparent guide for operators, reviewers, and partners" : view === "master" ? "Public aggregate metrics · detailed records stay on this Mac" : ["local", "enrichment", "intelligence"].includes(view) ? "Stored only in partmaster/local_data on this Mac" : `${DEFAULT_REPOSITORY.owner}/${DEFAULT_REPOSITORY.repo} · ${DEFAULT_REPOSITORY.branch}`}</p></div>
-          {!["analyze", "master", "local", "enrichment", "about"].includes(view) && <div className="flex items-center gap-3"><span className="rounded-full bg-white px-3 py-1.5 text-sm font-medium text-slate-600 shadow-sm ring-1 ring-slate-200">{data.queue.length} pending</span><button type="button" onClick={loadWorkspace} disabled={!token || loading || Boolean(approvingId)} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"><RefreshCw className={loading ? "animate-spin" : ""} size={16} />Refresh</button></div>}
+          <div><p className="text-sm font-semibold text-brand-700">{eyebrow}</p><h2 className="mt-1 text-2xl font-bold tracking-tight text-ink">{heading}</h2><p className="mt-2 text-sm text-slate-500">{view === "about" ? "A transparent guide for operators, reviewers, and partners" : view === "master" ? "Public aggregate metrics · detailed records stay on this Mac" : ["review", "local", "enrichment", "intelligence"].includes(view) ? "Stored only in partmaster/local_data on this Mac" : `${DEFAULT_REPOSITORY.owner}/${DEFAULT_REPOSITORY.repo} · ${DEFAULT_REPOSITORY.branch}`}</p></div>
+          {!["review", "analyze", "master", "local", "enrichment", "about"].includes(view) && <div className="flex items-center gap-3"><span className="rounded-full bg-white px-3 py-1.5 text-sm font-medium text-slate-600 shadow-sm ring-1 ring-slate-200">{data.queue.length} pending</span><button type="button" onClick={loadWorkspace} disabled={!token || loading} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"><RefreshCw className={loading ? "animate-spin" : ""} size={16} />Refresh</button></div>}
         </div>
 
         {error && <div className="mb-5 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" role="alert"><AlertCircle className="mt-0.5 shrink-0" size={18} /><span>{error}</span></div>}
 
         {view === "master" ? (
           <MasterDataPage />
+        ) : view === "review" ? (
+          <ReviewWorkspace />
         ) : view === "local" ? (
           <LocalDataManager />
         ) : view === "enrichment" ? (
@@ -172,9 +159,7 @@ export default function App() {
           <AnalysisWorkflow saving={saving} onSave={handleAnalysisSave} />
         ) : view === "library" ? (
           <PartsLibrary data={data} />
-        ) : (
-          <ReviewTable items={data.queue} approvingId={approvingId} onApprove={handleApprove} />
-        )}
+        ) : null}
       </main>
 
       <GitHubAuth open={settingsOpen} initialToken={token} onClose={() => setSettingsOpen(false)} onSave={saveToken} />

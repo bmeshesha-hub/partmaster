@@ -59,6 +59,7 @@ export const localDataApi = {
     const query = new URLSearchParams(Object.entries(parameters).filter(([, value]) => value !== "" && value != null));
     return request(`/enrichment/candidates?${query}`);
   },
+  reviewOverview: () => request("/review/overview"),
   candidateVariants: (candidateId) => request(`/enrichment/candidates/${encodeURIComponent(candidateId)}/variants`),
   checkMasterPart: (partId) => request(`/master/parts/${encodeURIComponent(partId)}/check`, { method: "POST", body: "{}" }),
   fetchCandidateCompatibility: (candidateId, options = {}) => request(`/enrichment/candidates/${encodeURIComponent(candidateId)}/compatibility`, { method: "POST", body: JSON.stringify(options) }),

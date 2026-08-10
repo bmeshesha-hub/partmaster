@@ -57,6 +57,26 @@
     { "label": "Cooling / HVAC", "parts": 5702, "with_facts": 519 },
     { "label": "Paint / Chemical", "parts": 2004, "with_facts": 2004 }
   ],
+  "review": {
+    "summary": { "awaiting_review": 6176, "needs_review": 5862, "conflicts": 0, "not_found": 314, "failed": 0, "missing_part_numbers": 523, "high_confidence": 2567, "with_product_facts": 4338, "average_confidence": 44.5, "brands": 4 },
+    "brands": [
+      { "brand": "Kawasaki", "awaiting_review": 2931, "needs_review": 2627, "conflicts": 0, "not_found": 304, "failed": 0, "missing_part_numbers": 446, "with_product_facts": 2783, "categories": 74, "average_confidence": 20.7 },
+      { "brand": "BMW", "awaiting_review": 2000, "needs_review": 2000, "conflicts": 0, "not_found": 0, "failed": 0, "missing_part_numbers": 0, "with_product_facts": 1348, "categories": 72, "average_confidence": 89.8 },
+      { "brand": "Ford", "awaiting_review": 973, "needs_review": 973, "conflicts": 0, "not_found": 0, "failed": 0, "missing_part_numbers": 0, "with_product_facts": 0, "categories": 1, "average_confidence": 35.0 },
+      { "brand": "Yamaha", "awaiting_review": 272, "needs_review": 262, "conflicts": 0, "not_found": 10, "failed": 0, "missing_part_numbers": 77, "with_product_facts": 207, "categories": 12, "average_confidence": 1.3 }
+    ],
+    "categories": [
+      { "category": "Fastener / Hardware", "awaiting_review": 1223, "conflicts": 0, "brands": 3 },
+      { "category": "General Part", "awaiting_review": 973, "conflicts": 0, "brands": 1 },
+      { "category": "Engine", "awaiting_review": 398, "conflicts": 0, "brands": 3 },
+      { "category": "Electrical / Sensor", "awaiting_review": 258, "conflicts": 0, "brands": 2 },
+      { "category": "Seal / Gasket", "awaiting_review": 250, "conflicts": 0, "brands": 3 },
+      { "category": "Brake System", "awaiting_review": 211, "conflicts": 0, "brands": 2 },
+      { "category": "Wheel", "awaiting_review": 200, "conflicts": 0, "brands": 2 },
+      { "category": "Suspension / Steering", "awaiting_review": 141, "conflicts": 0, "brands": 3 }
+    ],
+    "decisions": { "total_decisions": 1, "approved": 1, "rejected": 0, "decisions_last_7_days": 1 }
+  },
   "evidence": [
     { "label": "queued", "parts": 564597 },
     { "label": "verified", "parts": 9252 }

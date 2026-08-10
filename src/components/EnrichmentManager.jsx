@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { localDataApi } from "../utils/localDataApi.js";
+import { candidateReviewValues } from "../utils/reviewUtils.js";
 import LocalWorkspaceUnavailable from "./LocalWorkspaceUnavailable.jsx";
 
 const REVIEW_STATUSES = ["needs_review", "conflict", "not_found", "failed", "enriched", "rejected"];
@@ -312,37 +313,12 @@ function ConfirmDialog({ count, busy, onCancel, onConfirm }) {
   </div>;
 }
 
-function candidateReviewValues(candidate) {
-  return {
-    partNumber: candidate.enriched_part_number || candidate.part_number_raw || "",
-    description: candidate.enriched_description || candidate.description_raw || "",
-    side: candidate.side || "Unknown",
-    position: candidate.position || "",
-    locationNotes: candidate.location_notes || "",
-    familyName: candidate.family_name || "",
-    componentScope: candidate.component_scope || "component",
-    heatedState: candidate.heated_state || "unknown",
-    autoDimmingState: candidate.auto_dimming_state || "unknown",
-    powerFoldingState: candidate.power_folding_state || "unknown",
-    memoryState: candidate.memory_state || "unknown",
-    blindSpotState: candidate.blind_spot_state || "unknown",
-    cameraState: candidate.camera_state || "unknown",
-    turnSignalState: candidate.turn_signal_state || "unknown",
-    connectorPins: candidate.connector_pins || "",
-    requiredOptions: candidate.required_options || "",
-    excludedOptions: candidate.excluded_options || "",
-    variantSummary: candidate.variant_summary || "",
-    fitmentExplanation: candidate.fitment_explanation || "",
-    notes: candidate.decision_notes || "",
-  };
-}
-
 function FeatureSelect({ label, value, onChange }) {
   const tone = value === "yes" ? "border-emerald-300 bg-emerald-50 text-emerald-800" : value === "no" ? "border-red-200 bg-red-50 text-red-800" : "border-slate-300 bg-white text-slate-700";
   return <label className="text-xs font-bold uppercase tracking-wide text-slate-500">{label}<select value={value || "unknown"} onChange={(event) => onChange(event.target.value)} className={`mt-1.5 w-full rounded-xl border px-3 py-2.5 text-sm font-semibold normal-case tracking-normal ${tone}`}><option value="unknown">Unknown</option><option value="yes">Yes</option><option value="no">No</option></select></label>;
 }
 
-function ReviewModal({ candidate, onClose, onDecision }) {
+export function ReviewModal({ candidate, onClose, onDecision }) {
   const [values, setValues] = useState(() => candidateReviewValues(candidate));
   const [saving, setSaving] = useState(false);
   const [reviewError, setReviewError] = useState("");
