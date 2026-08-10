@@ -1453,9 +1453,23 @@ function extractPageEvidence(html, knownPartNumber) {
   addStructured("availability", String(offers?.availability || "").split("/").at(-1));
   const attributeText = Object.entries(structuredAttributes).map(([name, value]) => `${name}: ${value}`).join("; ");
   const visibleText = cleanText(html).slice(0, ENRICHMENT_MAX_PAGE_BYTES);
+  // Many OEM catalog pages expose the part number in rendered table text but
+  // omit Product JSON-LD. Recover a likely OEM number from the visible page,
+  // preferring numbers near the source description/title.
+  let fallbackNumber = "";
+  if (!productNumber) {
+    const numberMatches = [...visibleText.matchAll(/\b\d{4,6}[-–]\d{3,5}\b/g)].map((match) => ({ number: match[0].replace("–", "-"), index: match.index || 0 }));
+    const contextWords = cleanText(`${title} ${description}`).toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length >= 4);
+    const scored = numberMatches.map((number, index) => {
+      const window = visibleText.slice(Math.max(0, number.index - 250), number.index + 250).toLowerCase();
+      return { number: number.number, score: contextWords.reduce((total, word) => total + (window.includes(word) ? 1 : 0), 0) };
+    });
+    fallbackNumber = scored.sort((left, right) => right.score - left.score)[0]?.number || numberMatches[0] || "";
+  }
+  const resolvedProductNumber = productNumber || fallbackNumber;
   const exactNumberFound = Boolean(knownNorm && normalizePartNumber(visibleText).includes(knownNorm));
   const structuredExact = Boolean(knownNorm && [product?.mpn, product?.sku, product?.productID].map(normalizePartNumber).includes(knownNorm));
-  return { title, productNumber, description, attributeText, structuredAttributes, exactNumberFound, structuredExact, hasProductData: Boolean(product) };
+  return { title, productNumber: resolvedProductNumber, description, attributeText, structuredAttributes, exactNumberFound, structuredExact, hasProductData: Boolean(product || fallbackNumber) };
 }
 
 function readHtmlAttribute(tag, name) {
