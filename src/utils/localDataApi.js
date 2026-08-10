@@ -54,7 +54,7 @@ export const localDataApi = {
   startEnrichment: (options) => request("/enrichment/jobs", { method: "POST", body: JSON.stringify(options) }),
   pauseEnrichment: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}/pause`, { method: "POST", body: "{}" }),
   resumeEnrichment: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST", body: "{}" }),
-  reprocessEnrichmentReview: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}/reprocess-review`, { method: "POST", body: "{}" }),
+  reprocessEnrichmentReview: (jobId, candidateIds = []) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}/reprocess-review`, { method: "POST", body: JSON.stringify({ candidateIds }) }),
   enrichmentCandidates: (parameters = {}) => {
     const query = new URLSearchParams(Object.entries(parameters).filter(([, value]) => value !== "" && value != null));
     return request(`/enrichment/candidates?${query}`);

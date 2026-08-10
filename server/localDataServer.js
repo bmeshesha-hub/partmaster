@@ -4724,14 +4724,16 @@ app.post("/api/local/enrichment/jobs/:id/resume", asyncRoute(async (request, res
 }));
 
 app.post("/api/local/enrichment/jobs/:id/reprocess-review", asyncRoute(async (request, response) => {
+  const candidateIds = Array.isArray(request.body?.candidateIds) ? request.body.candidateIds.filter(Boolean) : [];
   const resumable = await withConnection(async (connection) => {
     const jobReader = await connection.runAndReadAll("SELECT status FROM partmaster_enrichment_jobs WHERE id = $id", { id: request.params.id });
     const job = jobReader.getRowObjectsJson()[0];
     if (!job || !["completed", "paused", "failed"].includes(job.status)) return false;
+    const idFilter = candidateIds.length ? "AND id IN (SELECT unnest($candidateIds))" : "";
     await connection.run(
       `UPDATE partmaster_enrichment_candidates SET status = 'pending', processed_at = NULL, decision_notes = NULL
-       WHERE job_id = $id AND status IN ('needs_review', 'not_found', 'failed') AND decision IS NULL`,
-      { id: request.params.id },
+       WHERE job_id = $id AND status IN ('needs_review', 'not_found', 'failed') AND decision IS NULL ${idFilter}`,
+      { id: request.params.id, candidateIds },
     );
     await connection.run(
       "UPDATE partmaster_enrichment_jobs SET status = 'queued', completed_at = NULL, last_error = NULL WHERE id = $id",
