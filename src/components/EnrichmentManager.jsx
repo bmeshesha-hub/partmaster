@@ -340,6 +340,7 @@ function FeatureSelect({ label, value, onChange }) {
 export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
   const [values, setValues] = useState(() => candidateReviewValues(candidate));
   const [saving, setSaving] = useState(false);
+  const [fetchingSource, setFetchingSource] = useState(false);
   const [reviewError, setReviewError] = useState("");
   const [comparison, setComparison] = useState({ familyName: "", variants: [], compatibility: [], compatibilitySourceUrl: "" });
   const [comparisonLoading, setComparisonLoading] = useState(true);
@@ -372,6 +373,19 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
       setReviewError(requestError.message || "The review decision could not be saved.");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function fetchSource() {
+    setFetchingSource(true);
+    setReviewError("");
+    try {
+      if (typeof onFetchSource !== "function") throw new Error("Source fetch is not available for this review.");
+      await onFetchSource();
+    } catch (requestError) {
+      setReviewError(requestError.message || "The source page could not be fetched.");
+    } finally {
+      setFetchingSource(false);
     }
   }
 
@@ -420,7 +434,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
       <section className={`mx-5 mt-5 rounded-2xl border-2 p-4 ${missingFields.length ? "border-amber-300 bg-amber-50" : "border-emerald-200 bg-emerald-50"}`}>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div><p className={`text-xs font-black uppercase tracking-wide ${missingFields.length ? "text-amber-800" : "text-emerald-800"}`}>{missingFields.length ? "Missing information" : "Record completeness"}</p><div className="mt-2 flex flex-wrap gap-2">{missingFields.length ? missingFields.map((field) => <span key={field} className="rounded-full bg-white px-2.5 py-1 text-xs font-bold text-amber-900 ring-1 ring-amber-300">Missing {field}</span>) : <span className="rounded-full bg-white px-2.5 py-1 text-xs font-bold text-emerald-800 ring-1 ring-emerald-300">No obvious gaps</span>}</div><p className="mt-3 text-sm font-bold text-slate-900">Action plan: <span className="font-normal">{actionPlan}</span></p></div>
-          {missingFields.includes("OEM number") && candidate.source_url && <button type="button" onClick={onFetchSource} className="inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-3 py-2 text-xs font-bold text-white"><Globe2 size={15} />Fetch from source page</button>}
+          {missingFields.includes("OEM number") && candidate.source_url && <button type="button" disabled={fetchingSource} onClick={fetchSource} className="inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-3 py-2 text-xs font-bold text-white disabled:cursor-wait disabled:opacity-60">{fetchingSource ? <LoaderCircle className="animate-spin" size={15} /> : <Globe2 size={15} />}{fetchingSource ? "Fetching source page…" : "Fetch from source page"}</button>}
         </div>
         {candidate.source_url && <a href={candidate.source_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-brand-700">Open supplied source page <ExternalLink size={13} /></a>}
       </section>
