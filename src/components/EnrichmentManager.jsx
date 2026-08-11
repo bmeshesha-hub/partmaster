@@ -91,6 +91,17 @@ function candidateActionPlan(candidate) {
   return "Review evidence";
 }
 
+function attentionExplanation(candidate) {
+  const decision = String(candidate.decision || candidate.decision_notes || "").trim();
+  if (decision) return decision;
+  if (!sideApplies(candidate) && (!candidate.side || String(candidate.side).toLowerCase() === "unknown")) return "Side is not applicable for this motorcycle-type part; no left/right value should be invented.";
+  if (!candidate.side || String(candidate.side).toLowerCase() === "unknown") return "Side is unknown. This is missing information, not contradictory evidence.";
+  if (candidate.status === "conflict") return "Conflicting evidence needs comparison before approval.";
+  if (candidate.status === "not_found") return "The exact OEM number was not confirmed by the available source evidence.";
+  if (candidate.status === "failed") return "The source check failed and should be retried.";
+  return "This record is awaiting a human evidence decision.";
+}
+
 function statusTone(status) {
   if (["completed", "enriched"].includes(status)) return "bg-emerald-50 text-emerald-700";
   if (["running", "queued", "processing"].includes(status)) return "bg-blue-50 text-blue-700";
@@ -454,7 +465,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
       </header>
       <section className={`mx-5 mt-5 rounded-2xl border-2 p-4 ${missingFields.length ? "border-amber-300 bg-amber-50" : "border-emerald-200 bg-emerald-50"}`}>
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div><p className={`text-xs font-black uppercase tracking-wide ${missingFields.length ? "text-amber-800" : "text-emerald-800"}`}>{missingFields.length ? "Missing information" : "Record completeness"}</p><div className="mt-2 flex flex-wrap gap-2">{missingFields.length ? missingFields.map((field) => <span key={field} className="rounded-full bg-white px-2.5 py-1 text-xs font-bold text-amber-900 ring-1 ring-amber-300">Missing {field}</span>) : <span className="rounded-full bg-white px-2.5 py-1 text-xs font-bold text-emerald-800 ring-1 ring-emerald-300">No obvious gaps</span>}</div><p className="mt-3 text-sm font-bold text-slate-900">Action plan: <span className="font-normal">{actionPlan}</span></p></div>
+          <div><p className={`text-xs font-black uppercase tracking-wide ${missingFields.length ? "text-amber-800" : "text-emerald-800"}`}>{missingFields.length ? "Missing information" : "Record completeness"}</p><div className="mt-2 flex flex-wrap gap-2">{missingFields.length ? missingFields.map((field) => <span key={field} className="rounded-full bg-white px-2.5 py-1 text-xs font-bold text-amber-900 ring-1 ring-amber-300">Missing {field}</span>) : <span className="rounded-full bg-white px-2.5 py-1 text-xs font-bold text-emerald-800 ring-1 ring-emerald-300">No obvious gaps</span>}</div><p className="mt-3 text-sm font-bold text-slate-900">Why this needs attention: <span className="font-normal">{attentionExplanation(candidate)}</span></p><p className="mt-2 text-sm font-bold text-slate-900">Action plan: <span className="font-normal">{actionPlan}</span></p></div>
           {missingFields.includes("OEM number") && candidate.source_url && <button type="button" disabled={fetchingSource} onClick={fetchSource} className="inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-3 py-2 text-xs font-bold text-white disabled:cursor-wait disabled:opacity-60">{fetchingSource ? <LoaderCircle className="animate-spin" size={15} /> : <Globe2 size={15} />}{fetchingSource ? "Fetching source page…" : "Fetch from source page"}</button>}
         </div>
         {candidate.source_url && <a href={candidate.source_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-brand-700">Open supplied source page <ExternalLink size={13} /></a>}
