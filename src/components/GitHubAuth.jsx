@@ -1,6 +1,8 @@
-import { AlarmClock, Eye, EyeOff, KeyRound, Settings, X } from "lucide-react";
+import { AlarmClock, Eye, EyeOff, Globe2, KeyRound, Settings, Sparkles, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import AutomationSettings from "./AutomationSettings.jsx";
+import ApprovedSourcesSettings from "./ApprovedSourcesSettings.jsx";
+import FeatureSettings from "./FeatureSettings.jsx";
 
 export default function GitHubAuth({ open, initialToken, onClose, onSave }) {
   const [token, setToken] = useState(initialToken);
@@ -28,9 +30,11 @@ export default function GitHubAuth({ open, initialToken, onClose, onSave }) {
         <nav className="flex gap-1 border-b border-slate-200 bg-slate-50 px-5 pt-3 sm:px-6" aria-label="Settings sections">
           <button type="button" onClick={() => setSection("automation")} className={`inline-flex items-center gap-2 rounded-t-xl border-x border-t px-4 py-2.5 text-sm font-bold ${section === "automation" ? "border-slate-200 bg-white text-brand-700" : "border-transparent text-slate-500 hover:text-slate-800"}`}><AlarmClock size={17} />Scheduler & jobs</button>
           <button type="button" onClick={() => setSection("github")} className={`inline-flex items-center gap-2 rounded-t-xl border-x border-t px-4 py-2.5 text-sm font-bold ${section === "github" ? "border-slate-200 bg-white text-brand-700" : "border-transparent text-slate-500 hover:text-slate-800"}`}><KeyRound size={17} />GitHub connection</button>
+          <button type="button" onClick={() => setSection("sources")} className={`inline-flex items-center gap-2 rounded-t-xl border-x border-t px-4 py-2.5 text-sm font-bold ${section === "sources" ? "border-slate-200 bg-white text-brand-700" : "border-transparent text-slate-500 hover:text-slate-800"}`}><Globe2 size={17} />Approved sources</button>
+          <button type="button" onClick={() => setSection("features")} className={`inline-flex items-center gap-2 rounded-t-xl border-x border-t px-4 py-2.5 text-sm font-bold ${section === "features" ? "border-slate-200 bg-white text-brand-700" : "border-transparent text-slate-500 hover:text-slate-800"}`}><Sparkles size={17} />Features</button>
         </nav>
         <div className="overflow-y-auto p-5 sm:p-6">
-          {section === "automation" ? <AutomationSettings /> : <form onSubmit={handleSubmit} className="mx-auto max-w-xl">
+          {section === "automation" ? <AutomationSettings /> : section === "sources" ? <ApprovedSourcesSettings /> : section === "features" ? <FeatureSettings /> : <form onSubmit={handleSubmit} className="mx-auto max-w-xl">
             <div className="flex gap-3"><span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-brand-50 text-brand-700"><KeyRound size={20} aria-hidden="true" /></span><div><h3 className="text-lg font-semibold text-ink">GitHub connection</h3><p className="mt-1 text-sm text-slate-500">Use a fine-grained token with Contents read/write access to the data repository.</p></div></div>
             <label className="mt-6 block text-sm font-medium text-slate-700" htmlFor="github-token">Personal access token</label>
             <div className="relative mt-2"><input id="github-token" type={showToken ? "text" : "password"} value={token} onChange={(event) => setToken(event.target.value)} placeholder="github_pat_…" autoComplete="off" spellCheck="false" className="w-full rounded-xl border border-slate-300 px-3 py-2.5 pr-11 text-sm shadow-sm focus:border-brand-500" /><button type="button" onClick={() => setShowToken((visible) => !visible)} className="absolute inset-y-0 right-0 px-3 text-slate-400 hover:text-slate-700" aria-label={showToken ? "Hide token" : "Show token"}>{showToken ? <EyeOff size={18} /> : <Eye size={18} />}</button></div>

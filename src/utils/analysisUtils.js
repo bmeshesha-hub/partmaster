@@ -108,7 +108,7 @@ export function selectScopeRecords(source, scopeKey) {
   });
 }
 
-export function buildAnalysisPrompt({ rawText, sourceName, source, scopeKey }) {
+export function buildAnalysisPrompt({ rawText, sourceName, source, scopeKey, itemHeaders = "", approvedSources = {} }) {
   const vin = extractVin(sourceName);
   const selectedRecords = selectScopeRecords(source, scopeKey);
   const selectedScope = source.scopes.find((scope) => scope.key === scopeKey);
@@ -124,11 +124,20 @@ export function buildAnalysisPrompt({ rawText, sourceName, source, scopeKey }) {
       ])
     : rawText.trim();
 
+  const requestedHeaders = itemHeaders.split(",").map((header) => header.trim()).filter(Boolean);
+  const sources = Object.values(approvedSources).flat();
+  const approvedSourceText = sources.length ? sources.map((item) => `- ${item.name} (${item.priority}): ${item.url}`).join("\\n") : "No approved sources configured; use only supplied source URLs.";
   return `Act as an automotive OEM parts research specialist. Analyze the supplied catalog data and produce a clean, auditable parts list.
 
 Source file: ${sourceName || "Pasted raw text"}
 ${vin ? `Vehicle VIN from the source filename: ${vin}` : "Vehicle VIN: not supplied"}
 ${selectedScope ? `Selected catalog scope: ${selectedScope.label}` : "Selected catalog scope: pasted raw data"}
+
+Approved research sources (use only these for online research):
+${approvedSourceText}
+
+Required item-specific headers (preserve these exact names):
+${requestedHeaders.length ? requestedHeaders.join(" | ") : "No additional headers supplied"}
 
 Requirements:
 1. Identify the most likely vehicle make, model, model year, generation, and relevant catalog section. Use the VIN when supplied. Clearly label anything uncertain.
@@ -136,6 +145,8 @@ Requirements:
 3. Explain duplicates, left/right distinctions, numbered diagram positions, supersessions, and specialty clips when relevant.
 4. Normalize Honda-style OEM numbers as XXXXX-XXX-XXX. Preserve suffixes and other manufacturers' established formatting.
 5. Call out suspicious results, especially when left and right parts share one number.
+6. For every requested item-specific header, return a source-supported value or Unknown. Never convert missing evidence into No.
+7. Use the approved source list above and include direct source URLs and concise evidence in the research notes.
 6. End with exactly one fenced CSV block. The first row must be:
 ${FINAL_HEADERS.join(",")}
 Use one physical part/position per row. Quote CSV values containing commas. Do not put commentary inside the CSV block.

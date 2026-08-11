@@ -19,8 +19,13 @@ import {
   parseAnalysisResponse,
   resultsToCsv,
 } from "../utils/analysisUtils.js";
+import { loadApprovedSources } from "../utils/sourcePolicy.js";
 
 const STAGES = ["Import", "Analyze", "Finalize"];
+const RESEARCH_PRESETS = {
+  General: "",
+  Mirror: "Placement on Vehicle, Side, Mirror Adjustment, Heated, Power Folding, Manual Folding, Memory, Blind Spot Monitoring / BLIS, Blind Spot Glass, Turn Signal Indicator, Puddle / Approach Light, Camera, 360° / Surround View Camera, Auto-Dimming, Tow Mirror, Telescoping / Extendable, Power Telescoping, Spotlight, Temperature Sensor, Mirror Glass Type, Housing Finish, Cap Finish/Color, Housing Color, Connector / Pins, Complete Assembly, OEM Part Number, Superseded Part Number, Fitment, Dimension, Weight",
+};
 
 export default function AnalysisWorkflow({ saving, onSave }) {
   const [stage, setStage] = useState(1);
@@ -30,13 +35,14 @@ export default function AnalysisWorkflow({ saving, onSave }) {
   const [aiResponse, setAiResponse] = useState("");
   const [results, setResults] = useState([]);
   const [notes, setNotes] = useState("");
+  const [itemHeaders, setItemHeaders] = useState("Placement on Vehicle, Heated, Power Folding, Camera, Color");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const fileInput = useRef(null);
   const source = useMemo(() => inspectSource(rawText), [rawText]);
   const prompt = useMemo(
-    () => buildAnalysisPrompt({ rawText, sourceName, source, scopeKey }),
-    [rawText, sourceName, source, scopeKey],
+    () => buildAnalysisPrompt({ rawText, sourceName, source, scopeKey, itemHeaders, approvedSources: loadApprovedSources() }),
+    [rawText, sourceName, source, scopeKey, itemHeaders],
   );
 
   async function handleFile(event) {
@@ -159,7 +165,7 @@ export default function AnalysisWorkflow({ saving, onSave }) {
           <textarea value={rawText} onChange={handleRawTextChange} rows={10} placeholder="Paste raw CSV or messy catalog text here…" className="w-full rounded-xl border border-slate-300 p-3 font-mono text-xs leading-5 focus:border-brand-500" />
 
           {rawText && (
-            <div className="mt-5 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">
+          <div className="mt-5 rounded-xl bg-slate-50 p-4 text-sm text-slate-600">
               <p><strong>{source.structured ? `${source.rowCount.toLocaleString()} CSV records detected` : `${source.rowCount.toLocaleString()} text/CSV rows detected`}</strong>{extractVin(sourceName) && ` · VIN ${extractVin(sourceName)}`}</p>
               {source.structured && source.scopes.length > 0 && (
                 <label className="mt-4 block font-medium text-slate-700">Catalog application set
@@ -168,7 +174,14 @@ export default function AnalysisWorkflow({ saving, onSave }) {
                   </select>
                 </label>
               )}
-            </div>
+            <label className="mt-5 block text-sm font-medium text-slate-700">Research preset
+              <select onChange={(event) => setItemHeaders(RESEARCH_PRESETS[event.target.value])} className="mt-2 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm"><option>Custom headers</option><option value="Mirror">Mirror item specifics</option><option value="General">General part research</option></select>
+            </label>
+            <label className="mt-4 block text-sm font-medium text-slate-700">Item-specific headers to research
+            <input value={itemHeaders} onChange={(event) => setItemHeaders(event.target.value)} placeholder="Placement on Vehicle, Heated, Camera, Color" className="mt-2 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm" />
+            <span className="mt-1 block text-xs font-normal text-slate-500">Comma-separated headers. These are passed to GPT without renaming them.</span>
+            </label>
+          </div>
           )}
           <div className="mt-6 flex justify-end"><button type="button" onClick={continueToAnalysis} className="inline-flex items-center gap-2 rounded-xl bg-brand-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-brand-700">Continue to analysis <ArrowRight size={17} /></button></div>
         </section>
