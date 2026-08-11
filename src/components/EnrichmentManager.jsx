@@ -102,6 +102,15 @@ function attentionExplanation(candidate) {
   return "This record is awaiting a human evidence decision.";
 }
 
+function conflictPartNumbers(candidate) {
+  const source = String(candidate.part_number_raw || "").trim();
+  const online = String(candidate.enriched_part_number || "").trim();
+  const normalize = (value) => String(value).toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return candidate.status === "conflict" && source && online && normalize(online) !== normalize(source)
+    ? { source, online }
+    : null;
+}
+
 function statusTone(status) {
   if (["completed", "enriched"].includes(status)) return "bg-emerald-50 text-emerald-700";
   if (["running", "queued", "processing"].includes(status)) return "bg-blue-50 text-blue-700";
@@ -416,9 +425,14 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
     finally { setSearchingSources(false); }
   }
 
-  function useSearchResult(result) {
-    setValues((current) => ({ ...current, partNumber: result.partNumber || current.partNumber }));
-    if (result.partNumber) setReviewError("");
+  function applySearchResult(result) {
+    const selectedPartNumber = String(result.partNumber || result.part_number || "").trim();
+    setValues((current) => ({
+      ...current,
+      ...(selectedPartNumber ? { partNumber: selectedPartNumber } : {}),
+      ...(result.title ? { notes: `${current.notes ? `${current.notes}\n` : ""}Selected search result: ${result.title}` } : {}),
+    }));
+    setReviewError(selectedPartNumber ? "" : "This result has no detected OEM number. Open it and enter the number manually.");
   }
 
   async function fetchCompatibility() {
@@ -469,7 +483,8 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
           {missingFields.includes("OEM number") && candidate.source_url && <button type="button" disabled={fetchingSource} onClick={fetchSource} className="inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-3 py-2 text-xs font-bold text-white disabled:cursor-wait disabled:opacity-60">{fetchingSource ? <LoaderCircle className="animate-spin" size={15} /> : <Globe2 size={15} />}{fetchingSource ? "Fetching source page…" : "Fetch from source page"}</button>}
         </div>
         {candidate.source_url && <a href={candidate.source_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-brand-700">Open supplied source page <ExternalLink size={13} /></a>}
-        <div className="mt-4 border-t border-amber-200 pt-3"><button type="button" disabled={searchingSources} onClick={searchSources} className="inline-flex items-center gap-2 rounded-xl border border-cyan-300 bg-white px-3 py-2 text-xs font-bold text-cyan-800 disabled:opacity-60">{searchingSources ? <LoaderCircle className="animate-spin" size={15} /> : <SearchCheck size={15} />}Search web for OEM number</button>{sourceResults.length > 0 && <div className="mt-3 grid gap-2">{sourceResults.map((result) => <div key={`${result.url}-${result.title}`} className="rounded-xl border border-slate-200 bg-white p-3 text-xs"><a href={result.url} target="_blank" rel="noreferrer" className="font-bold text-brand-700 underline">{result.title}</a><p className="mt-1 break-all text-slate-500">{result.url}</p>{result.partNumber && <p className="mt-1 font-mono font-bold text-slate-800">Possible OEM: {result.partNumber}</p>}<button type="button" onClick={() => useSearchResult(result)} className="mt-2 rounded-lg bg-emerald-600 px-2.5 py-1.5 font-bold text-white">Use this result</button></div>)}</div>}</div>
+        {conflictPartNumbers(candidate) && <div className="mt-4 rounded-xl border border-red-300 bg-white p-3 text-sm"><p className="font-black text-red-900">Conflicting part numbers</p><div className="mt-2 grid gap-2 sm:grid-cols-2"><div><p className="text-[10px] font-black uppercase tracking-wide text-slate-500">Source record</p><p className="font-mono font-bold text-slate-900">{conflictPartNumbers(candidate).source}</p></div><div><p className="text-[10px] font-black uppercase tracking-wide text-slate-500">Online structured result</p><p className="font-mono font-bold text-red-700">{conflictPartNumbers(candidate).online}</p></div></div></div>}
+        <div className="mt-4 border-t border-amber-200 pt-3"><button type="button" disabled={searchingSources} onClick={searchSources} className="inline-flex items-center gap-2 rounded-xl border border-cyan-300 bg-white px-3 py-2 text-xs font-bold text-cyan-800 disabled:opacity-60">{searchingSources ? <LoaderCircle className="animate-spin" size={15} /> : <SearchCheck size={15} />}Search web for OEM number</button>{sourceResults.length > 0 && <div className="mt-3 grid gap-2">{sourceResults.map((result) => <div key={`${result.url}-${result.title}`} className="rounded-xl border border-slate-200 bg-white p-3 text-xs"><a href={result.url} target="_blank" rel="noreferrer" className="font-bold text-brand-700 underline">{result.title}</a><p className="mt-1 break-all text-slate-500">{result.url}</p>{result.partNumber && <p className="mt-1 font-mono font-bold text-slate-800">Possible OEM: {result.partNumber}</p>}<button type="button" onClick={() => applySearchResult(result)} className="mt-2 rounded-lg bg-emerald-600 px-2.5 py-1.5 font-bold text-white">Use this result</button></div>)}</div>}</div>
       </section>
       {reviewError && <div className="mx-5 mt-5 flex items-start gap-3 rounded-2xl border-2 border-red-300 bg-red-50 p-4 text-red-900" role="alert"><AlertTriangle className="mt-0.5 shrink-0 text-red-600" size={22} /><div><p className="font-bold">Could not save this review</p><p className="mt-1 text-sm leading-5">{reviewError}</p><p className="mt-2 text-xs font-semibold text-red-700">Your edits are still here. Correct the issue and try again.</p></div></div>}
       <div className="grid gap-4 p-5 sm:grid-cols-2">

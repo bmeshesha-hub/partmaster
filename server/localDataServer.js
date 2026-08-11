@@ -2974,7 +2974,7 @@ async function processEnrichmentCandidate(candidate, threshold) {
   if (candidate.part_number_norm && onlinePartNorm && onlinePartNorm !== candidate.part_number_norm) {
     update.confidence = 0.2;
     update.status = "conflict";
-    update.decision = "Online structured part number conflicts with the source record.";
+    update.decision = `Online structured part number (${evidence.productNumber}) conflicts with the source record (${candidate.part_number_raw}).`;
     return update;
   }
   if (localLocation.side !== "Unknown" && evidenceLocation.side !== "Unknown"
