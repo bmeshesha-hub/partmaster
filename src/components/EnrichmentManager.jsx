@@ -341,6 +341,8 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
   const [values, setValues] = useState(() => candidateReviewValues(candidate));
   const [saving, setSaving] = useState(false);
   const [fetchingSource, setFetchingSource] = useState(false);
+  const [searchingSources, setSearchingSources] = useState(false);
+  const [sourceResults, setSourceResults] = useState([]);
   const [reviewError, setReviewError] = useState("");
   const [comparison, setComparison] = useState({ familyName: "", variants: [], compatibility: [], compatibilitySourceUrl: "" });
   const [comparisonLoading, setComparisonLoading] = useState(true);
@@ -380,13 +382,27 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
     setFetchingSource(true);
     setReviewError("");
     try {
-      if (typeof onFetchSource !== "function") throw new Error("Source fetch is not available for this review.");
-      await onFetchSource();
+      // Fetch directly from the modal's candidate context. This avoids losing
+      // the callback when the review is rendered through a stale/HMR tree.
+      await localDataApi.reprocessEnrichmentReview(candidate.job_id, [candidate.id]);
+      if (typeof onFetchSource === "function") await onFetchSource({ queued: true });
     } catch (requestError) {
       setReviewError(requestError.message || "The source page could not be fetched.");
     } finally {
       setFetchingSource(false);
     }
+  }
+
+  async function searchSources() {
+    setSearchingSources(true); setReviewError("");
+    try { const result = await localDataApi.searchCandidateSources(candidate.id); setSourceResults(result.results || []); }
+    catch (requestError) { setReviewError(requestError.message || "Web search failed."); }
+    finally { setSearchingSources(false); }
+  }
+
+  function useSearchResult(result) {
+    setValues((current) => ({ ...current, partNumber: result.partNumber || current.partNumber }));
+    if (result.partNumber) setReviewError("");
   }
 
   async function fetchCompatibility() {
@@ -437,6 +453,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
           {missingFields.includes("OEM number") && candidate.source_url && <button type="button" disabled={fetchingSource} onClick={fetchSource} className="inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-3 py-2 text-xs font-bold text-white disabled:cursor-wait disabled:opacity-60">{fetchingSource ? <LoaderCircle className="animate-spin" size={15} /> : <Globe2 size={15} />}{fetchingSource ? "Fetching source page…" : "Fetch from source page"}</button>}
         </div>
         {candidate.source_url && <a href={candidate.source_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-brand-700">Open supplied source page <ExternalLink size={13} /></a>}
+        <div className="mt-4 border-t border-amber-200 pt-3"><button type="button" disabled={searchingSources} onClick={searchSources} className="inline-flex items-center gap-2 rounded-xl border border-cyan-300 bg-white px-3 py-2 text-xs font-bold text-cyan-800 disabled:opacity-60">{searchingSources ? <LoaderCircle className="animate-spin" size={15} /> : <SearchCheck size={15} />}Search web for OEM number</button>{sourceResults.length > 0 && <div className="mt-3 grid gap-2">{sourceResults.map((result) => <div key={`${result.url}-${result.title}`} className="rounded-xl border border-slate-200 bg-white p-3 text-xs"><a href={result.url} target="_blank" rel="noreferrer" className="font-bold text-brand-700 underline">{result.title}</a><p className="mt-1 break-all text-slate-500">{result.url}</p>{result.partNumber && <p className="mt-1 font-mono font-bold text-slate-800">Possible OEM: {result.partNumber}</p>}<button type="button" onClick={() => useSearchResult(result)} className="mt-2 rounded-lg bg-emerald-600 px-2.5 py-1.5 font-bold text-white">Use this result</button></div>)}</div>}</div>
       </section>
       {reviewError && <div className="mx-5 mt-5 flex items-start gap-3 rounded-2xl border-2 border-red-300 bg-red-50 p-4 text-red-900" role="alert"><AlertTriangle className="mt-0.5 shrink-0 text-red-600" size={22} /><div><p className="font-bold">Could not save this review</p><p className="mt-1 text-sm leading-5">{reviewError}</p><p className="mt-2 text-xs font-semibold text-red-700">Your edits are still here. Correct the issue and try again.</p></div></div>}
       <div className="grid gap-4 p-5 sm:grid-cols-2">
@@ -514,6 +531,7 @@ export default function EnrichmentManager() {
   const [reviewing, setReviewing] = useState(null);
   const [jobsExpanded, setJobsExpanded] = useState(false);
   const [selectedCandidateIds, setSelectedCandidateIds] = useState([]);
+  const [batchSearching, setBatchSearching] = useState(false);
   const [bulkConfirmCount, setBulkConfirmCount] = useState(0);
   const [bulkApproving, setBulkApproving] = useState(false);
   const [form, setForm] = useState({ datasetId: "", name: "", requestedCandidates: 1000, startRowId: 0, batchSize: 10, autoAcceptThreshold: 0.94 });
@@ -641,6 +659,16 @@ export default function EnrichmentManager() {
     } catch (requestError) { setError(requestError.message); }
   }
 
+  async function searchMissingOemBatch() {
+    setBatchSearching(true); setError("");
+    try {
+      const result = await localDataApi.batchSearchMissingOem({ limit: 25 });
+      setMessage(`Missing-OEM search: ${result.updated} updated, ${result.ambiguous} need review, ${result.noResults} had no result.`);
+      await refresh(); await loadCandidates();
+    } catch (requestError) { setError(requestError.message); }
+    finally { setBatchSearching(false); }
+  }
+
   function prepareNextBatch(job) {
     setForm((current) => ({
       ...current,
@@ -748,7 +776,7 @@ export default function EnrichmentManager() {
       <form onSubmit={searchReview} className="grid gap-3 border-b border-slate-200 bg-slate-50/70 px-5 py-4 sm:grid-cols-2 lg:grid-cols-[2fr_1fr_0.7fr_1fr_auto]"><label className="text-xs font-bold uppercase tracking-wide text-slate-500">Search<input value={reviewFilters.q} onChange={(event) => setReviewFilters((current) => ({ ...current, q: event.target.value }))} placeholder="OEM number, description, model, or source row" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal placeholder:text-slate-400" /></label><label className="text-xs font-bold uppercase tracking-wide text-slate-500">Make<input value={reviewFilters.make} onChange={(event) => setReviewFilters((current) => ({ ...current, make: event.target.value }))} placeholder="e.g. Kawasaki" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal placeholder:text-slate-400" /></label><label className="text-xs font-bold uppercase tracking-wide text-slate-500">Year<input value={reviewFilters.year} onChange={(event) => setReviewFilters((current) => ({ ...current, year: event.target.value }))} placeholder="e.g. 1996" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal placeholder:text-slate-400" /></label><label className="text-xs font-bold uppercase tracking-wide text-slate-500">Category<input value={reviewFilters.category} onChange={(event) => setReviewFilters((current) => ({ ...current, category: event.target.value }))} placeholder="e.g. Mirror" className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal placeholder:text-slate-400" /></label><div className="flex items-end gap-2"><button className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-bold text-white"><SearchCheck size={16} />Search</button>{Object.values(appliedReviewFilters).some(Boolean) && <button type="button" onClick={clearReviewSearch} className="rounded-xl border border-slate-300 bg-white p-2.5 text-slate-500" aria-label="Clear evidence filters"><X size={16} /></button>}</div><div className="flex flex-wrap items-center gap-2 sm:col-span-2 lg:col-span-5"><button type="button" onClick={loadMirrorDemo} className="rounded-full border border-violet-200 bg-violet-50 px-3 py-1.5 text-xs font-bold text-violet-700">Load mirror demo</button><span className="text-xs text-slate-500">Automatically searches source row 7012 · Kawasaki · 1996 · Mirror.</span></div>{Object.values(appliedReviewFilters).some(Boolean) && <div className="flex flex-wrap items-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 sm:col-span-2 lg:col-span-5"><span className="text-xs font-bold uppercase tracking-wide text-blue-700">Active filters</span>{statusFilter && <span className="rounded-full bg-white px-2.5 py-1 text-xs font-semibold text-blue-800">Status: {statusFilter.replaceAll("_", " ")}</span>}{Object.entries(appliedReviewFilters).filter(([, value]) => value).map(([key, value]) => <span key={key} className="rounded-full bg-white px-2.5 py-1 text-xs font-semibold text-blue-800">{key === "q" ? "Search" : key[0].toUpperCase() + key.slice(1)}: {value}</span>)}<span className="ml-auto text-xs font-medium text-blue-700">Searching all jobs</span></div>}</form>
       <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-200 text-sm"><thead className="bg-slate-50"><tr><th className="px-4 py-3 text-left"><input type="checkbox" checked={allVisibleSelected} onChange={toggleAllCandidates} disabled={!eligibleCandidateIds.length} aria-label="Select all visible candidates" className="h-4 w-4 rounded border-slate-300 text-emerald-600" /></th>{["Status", "OEM Part Number", "Description / Variant", "Side / Position", "Make", "Year", "Vehicle / Assembly", "Missing / action", "Confidence", ""].map((heading) => <th key={heading} className="whitespace-nowrap px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{candidates.map((candidate) => { const missing = candidateMissingFields(candidate); return <tr key={candidate.id} className={selectedCandidateIds.includes(candidate.id) ? "bg-emerald-50/70" : "hover:bg-slate-50"}><td className="px-4 py-3"><input type="checkbox" checked={selectedCandidateIds.includes(candidate.id)} onChange={() => toggleCandidate(candidate.id)} disabled={!eligibleCandidateIds.includes(candidate.id)} aria-label={`Select ${normalizeCandidateNumber(candidate) || "candidate"}`} className="h-4 w-4 rounded border-slate-300 text-emerald-600" /></td><td className="px-4 py-3"><span className={`whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-semibold ${statusTone(candidate.status)}`}>{candidate.status.replaceAll("_", " ")}</span></td><td className={`whitespace-nowrap px-4 py-3 font-mono font-semibold ${missing.includes("OEM number") ? "bg-amber-50 text-amber-800" : "text-brand-700"}`}>{candidate.enriched_part_number || candidate.part_number_raw || "Missing"}</td><td className="max-w-96 px-4 py-3 text-slate-600"><p className="truncate" title={candidate.enriched_description || candidate.description_raw || ""}>{candidate.enriched_description || candidate.description_raw || "—"}</p>{(candidate.family_name || candidate.variant_summary) && <p className="mt-1 truncate text-xs font-semibold text-violet-700" title={[candidate.family_name, candidate.variant_summary].filter(Boolean).join(" · ")}>{[candidate.family_name, candidate.variant_summary].filter(Boolean).join(" · ")}</p>}{Number(candidate.extracted_attribute_count || 0) > 0 && <span className="mt-1 inline-flex rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-black text-emerald-700">{Number(candidate.extracted_attribute_count)} product facts</span>}</td><td className={`whitespace-nowrap px-4 py-3 text-slate-600 ${missing.includes("side") ? "bg-amber-50 text-amber-800" : ""}`}>{[candidate.side, candidate.position].filter(Boolean).join(" · ") || "—"}</td><td className="whitespace-nowrap px-4 py-3 font-semibold text-slate-700">{candidate.vehicle_make || candidate.manufacturer_raw || "—"}</td><td className="whitespace-nowrap px-4 py-3 text-slate-600">{candidate.vehicle_year || candidate.year || "—"}</td><td className="max-w-72 px-4 py-3 text-slate-500"><p className="truncate" title={candidate.vehicle_model || candidate.model || ""}>{candidate.vehicle_model || candidate.model || "—"}</p>{candidate.assembly && <p className="mt-1 truncate text-xs" title={candidate.assembly}>{candidate.assembly}</p>}</td><td className="min-w-52 px-4 py-3"><div className="flex flex-wrap gap-1">{missing.length ? missing.map((field) => <span key={field} className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-800">Missing {field}</span>) : <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-800">No obvious gaps</span>}</div><p className="mt-1 text-xs font-bold text-cyan-800">Next: {candidateActionPlan(candidate)}</p></td><td className="px-4 py-3 font-semibold">{Math.round(Number(candidate.confidence || 0) * 100)}%</td><td className="px-4 py-3"><button type="button" onClick={() => setReviewing(candidate)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold">Review</button></td></tr>; })}</tbody></table>{!candidates.length && <div className="px-6 py-12 text-center text-sm text-slate-500">No candidates match this job and status.</div>}</div>
     </section>
-    {reviewing && <ReviewModal candidate={reviewing} onClose={() => setReviewing(null)} onDecision={decideCandidate} onFetchSource={async () => { await localDataApi.reprocessEnrichmentReview(reviewing.job_id, [reviewing.id]); setReviewing(null); setMessage("Source-page fetch queued. The review record will update when processing finishes."); await refresh(); await loadCandidates(); }} />}
+    {reviewing && <ReviewModal candidate={reviewing} onClose={() => setReviewing(null)} onDecision={decideCandidate} onFetchSource={async () => { setReviewing(null); setMessage("Source-page fetch queued. The review record will update when processing finishes."); await refresh(); await loadCandidates(); }} />}
     <ConfirmDialog count={bulkConfirmCount} busy={bulkApproving} onCancel={() => setBulkConfirmCount(0)} onConfirm={approveSelected} />
     <FeedbackDialog type="error" message={error} onClose={() => setError("")} />
     {!error && <FeedbackDialog type="success" message={message} onClose={() => setMessage("")} />}

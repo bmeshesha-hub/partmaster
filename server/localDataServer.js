@@ -1747,6 +1747,25 @@ async function fetchEvidence(url) {
   }
 }
 
+async function searchCandidateSources(candidate) {
+  const query = [candidate.manufacturer_raw, candidate.year, candidate.model, candidate.description_raw, candidate.assembly].filter(Boolean).join(" ");
+  const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  const response = await fetch(searchUrl, { headers: { Accept: "text/html", "User-Agent": "Mozilla/5.0" } });
+  if (!response.ok) throw new Error(`Search returned HTTP ${response.status}.`);
+  const html = (await response.text()).slice(0, 500000);
+  const results = [];
+  for (const match of html.matchAll(/<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)) {
+    let url = match[1];
+    try { url = new URL(url, searchUrl).searchParams.get("uddg") || url; } catch { /* keep original */ }
+    const title = cleanText(match[2]);
+    const context = html.slice(Math.max(0, match.index - 300), match.index + 900);
+    const partNumber = context.match(/\b\d{4,6}[-–]\d{3,5}\b/)?.[0]?.replace("–", "-") || "";
+    if (title && /^https?:/i.test(url)) results.push({ title, url, partNumber, confidence: partNumber ? 0.55 : 0.25 });
+    if (results.length >= 8) break;
+  }
+  return { query, results };
+}
+
 async function getEvidencePage(url, { force = false } = {}) {
   const cached = force ? null : await withConnection(async (connection) => {
     const reader = await connection.runAndReadAll(
@@ -4759,6 +4778,50 @@ app.post("/api/local/enrichment/jobs/:id/reprocess-review", asyncRoute(async (re
   });
   if (resumable) scheduleEnrichmentJob(request.params.id);
   response.json({ ok: true, resumed: resumable });
+}));
+
+app.get("/api/local/enrichment/candidates/:id/source-search", asyncRoute(async (request, response) => {
+  const candidate = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll("SELECT * FROM partmaster_enrichment_candidates WHERE id = $id", { id: request.params.id });
+    return reader.getRowObjectsJson()[0];
+  });
+  if (!candidate) return response.status(404).json({ error: "Review candidate not found." });
+  response.json(await searchCandidateSources(candidate));
+}));
+
+app.post("/api/local/enrichment/candidates/source-search-batch", asyncRoute(async (request, response) => {
+  const limit = Math.max(1, Math.min(100, Number(request.body?.limit) || 25));
+  const candidates = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT * FROM partmaster_enrichment_candidates
+       WHERE decision IS NULL AND status IN ('needs_review', 'not_found', 'failed')
+       AND coalesce(nullif(trim(enriched_part_number), ''), nullif(trim(part_number_raw), '')) IS NULL
+       ORDER BY source_row_id LIMIT ${limit}`,
+    );
+    return reader.getRowObjectsJson();
+  });
+  const report = { scanned: candidates.length, updated: 0, ambiguous: 0, noResults: 0, errors: [] };
+  for (const candidate of candidates) {
+    try {
+      const search = await searchCandidateSources(candidate);
+      const withNumbers = (search.results || []).filter((result) => result.partNumber);
+      const uniqueNumbers = [...new Set(withNumbers.map((result) => normalizePartNumber(result.partNumber)))];
+      if (uniqueNumbers.length !== 1) {
+        if (withNumbers.length) report.ambiguous += 1; else report.noResults += 1;
+        continue;
+      }
+      const result = withNumbers[0];
+      await withConnection((connection) => connection.run(
+        `UPDATE partmaster_enrichment_candidates SET enriched_part_number = $partNumber,
+         evidence_url = $evidenceUrl, evidence_title = $title, confidence = greatest(coalesce(confidence, 0), 0.7),
+         status = 'needs_review', decision_notes = 'OEM number found by web search; verify exact fitment before approval.'
+         WHERE id = $id`,
+        { id: candidate.id, partNumber: result.partNumber, evidenceUrl: result.url, title: result.title },
+      ));
+      report.updated += 1;
+    } catch (error) { report.errors.push({ id: candidate.id, error: error.message }); }
+  }
+  response.json(report);
 }));
 
 app.get("/api/local/enrichment/candidates", asyncRoute(async (request, response) => {
