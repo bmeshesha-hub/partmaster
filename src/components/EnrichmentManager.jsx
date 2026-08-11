@@ -67,12 +67,17 @@ function isBulkApprovable(candidate) {
   return ["needs_review", "conflict"].includes(candidate.status) && Boolean(normalizeCandidateNumber(candidate));
 }
 
+function sideApplies(candidate) {
+  const vehicleText = [candidate.vehicle_type, candidate.vehicle_motorcycle_type, candidate.motorcycle_type].filter(Boolean).join(" ").toLowerCase();
+  return !/motorcycle|motor bike|scooter|atv|utv|off[- ]?road bike/.test(vehicleText);
+}
+
 function candidateMissingFields(candidate) {
   const missing = [];
   if (!normalizeCandidateNumber(candidate)) missing.push("OEM number");
   if (!String(candidate.enriched_description || candidate.description_raw || "").trim()) missing.push("description");
   if (!String(candidate.source_url || candidate.evidence_url || "").trim()) missing.push("source page");
-  if (!String(candidate.side || "").trim() || String(candidate.side).toLowerCase() === "unknown") missing.push("side");
+  if (sideApplies(candidate) && (!String(candidate.side || "").trim() || String(candidate.side).toLowerCase() === "unknown")) missing.push("side");
   return missing;
 }
 
@@ -458,7 +463,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
       {reviewError && <div className="mx-5 mt-5 flex items-start gap-3 rounded-2xl border-2 border-red-300 bg-red-50 p-4 text-red-900" role="alert"><AlertTriangle className="mt-0.5 shrink-0 text-red-600" size={22} /><div><p className="font-bold">Could not save this review</p><p className="mt-1 text-sm leading-5">{reviewError}</p><p className="mt-2 text-xs font-semibold text-red-700">Your edits are still here. Correct the issue and try again.</p></div></div>}
       <div className="grid gap-4 p-5 sm:grid-cols-2">
         <label className="text-sm font-medium text-slate-700">OEM Part Number<input value={values.partNumber} onChange={(event) => setValues((current) => ({ ...current, partNumber: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-mono font-normal" /></label>
-        <label className="text-sm font-medium text-slate-700">Side<select value={values.side} onChange={(event) => setValues((current) => ({ ...current, side: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 font-normal">{["Unknown", "Left", "Right", "Center", "Universal"].map((side) => <option key={side}>{side}</option>)}</select></label>
+        <label className="text-sm font-medium text-slate-700">Side<select value={values.side} onChange={(event) => setValues((current) => ({ ...current, side: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 font-normal">{["Unknown", "Not applicable", "Left", "Right", "Center", "Universal"].map((side) => <option key={side}>{side}</option>)}</select><ControlHint>{sideApplies(candidate) ? "Side is relevant for this vehicle/part." : "Motorcycle parts commonly have no left/right side; do not invent one."}</ControlHint></label>
         <label className="text-sm font-medium text-slate-700 sm:col-span-2">Description<input value={values.description} onChange={(event) => setValues((current) => ({ ...current, description: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
         <label className="text-sm font-medium text-slate-700">Position<input value={values.position} onChange={(event) => setValues((current) => ({ ...current, position: event.target.value }))} placeholder="Position 1, Front Upper…" className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
         <label className="text-sm font-medium text-slate-700">Location notes<input value={values.locationNotes} onChange={(event) => setValues((current) => ({ ...current, locationNotes: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
