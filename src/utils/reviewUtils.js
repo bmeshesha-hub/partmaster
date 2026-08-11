@@ -20,5 +20,6 @@ export function candidateReviewValues(candidate) {
     variantSummary: candidate.variant_summary || "",
     fitmentExplanation: candidate.fitment_explanation || "",
     notes: candidate.decision_notes || "",
+    evidenceUrl: candidate.evidence_url || candidate.source_url || "",
   };
 }

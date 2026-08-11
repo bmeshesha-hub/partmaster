@@ -5351,6 +5351,7 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
       fitment_explanation: String(request.body.fitmentExplanation || candidate.fitment_explanation || "").trim() || null,
       confidence: decision === "approve" ? Math.max(Number(candidate.confidence) || 0, 0.9) : Number(candidate.confidence) || 0,
       decision,
+      evidence_url: String(request.body.evidenceUrl || candidate.evidence_url || candidate.source_url || "").trim() || null,
     };
     let reviewedPartId = null;
     if (decision === "approve") {
@@ -5366,7 +5367,7 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
        memory_state = $memoryState, blind_spot_state = $blindSpotState, camera_state = $cameraState,
        turn_signal_state = $turnSignalState, connector_pins = $connectorPins,
        required_options = $requiredOptions, excluded_options = $excludedOptions,
-       variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation,
+       variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation, evidence_url = $evidenceUrl,
        status = $status, decision = $decision, decision_notes = $notes, reviewed_at = current_timestamp
        WHERE id = $id`,
       {
@@ -5391,6 +5392,7 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
         excludedOptions: edited.excluded_options,
         variantSummary: edited.variant_summary,
         fitmentExplanation: edited.fitment_explanation,
+        evidenceUrl: edited.evidence_url,
         status: decision === "approve" ? "enriched" : "rejected",
         decision,
         notes: String(request.body.notes || "").trim() || null,

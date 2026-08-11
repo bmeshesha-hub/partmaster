@@ -368,6 +368,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
   const [fetchingSource, setFetchingSource] = useState(false);
   const [searchingSources, setSearchingSources] = useState(false);
   const [sourceResults, setSourceResults] = useState([]);
+  const [selectedSourceResult, setSelectedSourceResult] = useState(null);
   const [reviewError, setReviewError] = useState("");
   const [comparison, setComparison] = useState({ familyName: "", variants: [], compatibility: [], compatibilitySourceUrl: "" });
   const [comparisonLoading, setComparisonLoading] = useState(true);
@@ -427,12 +428,14 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
 
   function applySearchResult(result) {
     const selectedPartNumber = String(result.partNumber || result.part_number || "").trim();
+    setSelectedSourceResult(result);
     setValues((current) => ({
       ...current,
+      ...(result.url ? { evidenceUrl: result.url } : {}),
       ...(selectedPartNumber ? { partNumber: selectedPartNumber } : {}),
       ...(result.title ? { notes: `${current.notes ? `${current.notes}\n` : ""}Selected search result: ${result.title}` } : {}),
     }));
-    setReviewError(selectedPartNumber ? "" : "This result has no detected OEM number. Open it and enter the number manually.");
+    setReviewError("");
   }
 
   async function fetchCompatibility() {
@@ -484,7 +487,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
         </div>
         {candidate.source_url && <a href={candidate.source_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-brand-700">Open supplied source page <ExternalLink size={13} /></a>}
         {conflictPartNumbers(candidate) && <div className="mt-4 rounded-xl border border-red-300 bg-white p-3 text-sm"><p className="font-black text-red-900">Conflicting part numbers</p><div className="mt-2 grid gap-2 sm:grid-cols-2"><div><p className="text-[10px] font-black uppercase tracking-wide text-slate-500">Source record</p><p className="font-mono font-bold text-slate-900">{conflictPartNumbers(candidate).source}</p></div><div><p className="text-[10px] font-black uppercase tracking-wide text-slate-500">Online structured result</p><p className="font-mono font-bold text-red-700">{conflictPartNumbers(candidate).online}</p></div></div></div>}
-        <div className="mt-4 border-t border-amber-200 pt-3"><button type="button" disabled={searchingSources} onClick={searchSources} className="inline-flex items-center gap-2 rounded-xl border border-cyan-300 bg-white px-3 py-2 text-xs font-bold text-cyan-800 disabled:opacity-60">{searchingSources ? <LoaderCircle className="animate-spin" size={15} /> : <SearchCheck size={15} />}Search web for OEM number</button>{sourceResults.length > 0 && <div className="mt-3 grid gap-2">{sourceResults.map((result) => <div key={`${result.url}-${result.title}`} className="rounded-xl border border-slate-200 bg-white p-3 text-xs"><a href={result.url} target="_blank" rel="noreferrer" className="font-bold text-brand-700 underline">{result.title}</a><p className="mt-1 break-all text-slate-500">{result.url}</p>{result.partNumber && <p className="mt-1 font-mono font-bold text-slate-800">Possible OEM: {result.partNumber}</p>}<button type="button" onClick={() => applySearchResult(result)} className="mt-2 rounded-lg bg-emerald-600 px-2.5 py-1.5 font-bold text-white">Use this result</button></div>)}</div>}</div>
+        <div className="mt-4 border-t border-amber-200 pt-3"><button type="button" disabled={searchingSources} onClick={searchSources} className="inline-flex items-center gap-2 rounded-xl border border-cyan-300 bg-white px-3 py-2 text-xs font-bold text-cyan-800 disabled:opacity-60">{searchingSources ? <LoaderCircle className="animate-spin" size={15} /> : <SearchCheck size={15} />}Search web for OEM number</button>{selectedSourceResult && <p className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-800">Selected as evidence: {selectedSourceResult.title}{selectedSourceResult.partNumber ? ` · OEM ${selectedSourceResult.partNumber}` : " · no OEM number detected; current OEM field was kept"}</p>}{sourceResults.length > 0 && <div className="mt-3 grid gap-2">{sourceResults.map((result) => <div key={`${result.url}-${result.title}`} className="rounded-xl border border-slate-200 bg-white p-3 text-xs"><a href={result.url} target="_blank" rel="noreferrer" className="font-bold text-brand-700 underline">{result.title}</a><p className="mt-1 break-all text-slate-500">{result.url}</p>{result.partNumber && <p className="mt-1 font-mono font-bold text-slate-800">Possible OEM: {result.partNumber}</p>}<button type="button" onClick={() => applySearchResult(result)} className="mt-2 rounded-lg bg-emerald-600 px-2.5 py-1.5 font-bold text-white">Use this result</button></div>)}</div>}</div>
       </section>
       {reviewError && <div className="mx-5 mt-5 flex items-start gap-3 rounded-2xl border-2 border-red-300 bg-red-50 p-4 text-red-900" role="alert"><AlertTriangle className="mt-0.5 shrink-0 text-red-600" size={22} /><div><p className="font-bold">Could not save this review</p><p className="mt-1 text-sm leading-5">{reviewError}</p><p className="mt-2 text-xs font-semibold text-red-700">Your edits are still here. Correct the issue and try again.</p></div></div>}
       <div className="grid gap-4 p-5 sm:grid-cols-2">
