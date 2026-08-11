@@ -4766,7 +4766,7 @@ app.post("/api/local/enrichment/jobs/:id/reprocess-review", asyncRoute(async (re
     const candidateBindings = Object.fromEntries(candidateIds.map((candidateId, index) => [`candidateId${index}`, candidateId]));
     await connection.run(
       `UPDATE partmaster_enrichment_candidates SET status = 'pending', processed_at = NULL, decision_notes = NULL
-       WHERE job_id = $id AND status IN ('needs_review', 'not_found', 'failed') AND decision IS NULL ${idFilter}`,
+       WHERE job_id = $id AND status IN ('needs_review', 'conflict', 'not_found', 'failed') AND decision IS NULL ${idFilter}`,
       { id: request.params.id, ...candidateBindings },
     );
     await connection.run(
