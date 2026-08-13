@@ -32,6 +32,88 @@ input:focus-visible {
   outline-offset: 2px;
 }
 
+.process-card-active {
+  border-color: rgba(22, 131, 216, 0.28);
+  box-shadow: 0 10px 28px rgba(22, 131, 216, 0.08);
+}
+
+.process-card-active .process-icon {
+  animation: process-icon-pulse 1.8s ease-in-out infinite;
+}
+
+.process-live-badge {
+  animation: process-badge-pulse 1.8s ease-in-out infinite;
+}
+
+.process-activity span:nth-child(2) {
+  animation: process-text-in 300ms ease-out;
+}
+
+.process-activity-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: currentColor;
+  animation: process-dot-bounce 900ms ease-in-out infinite;
+}
+
+.process-activity-dots i:nth-child(2) { animation-delay: 140ms; }
+.process-activity-dots i:nth-child(3) { animation-delay: 280ms; }
+
+@keyframes process-icon-pulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(22, 131, 216, 0.16); }
+  50% { transform: scale(1.06); box-shadow: 0 0 0 7px rgba(22, 131, 216, 0); }
+}
+
+@keyframes process-badge-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(22, 131, 216, 0); }
+  50% { box-shadow: 0 0 0 4px rgba(22, 131, 216, 0.1); }
+}
+
+@keyframes process-text-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes process-dot-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.45; }
+  30% { transform: translateY(-3px); opacity: 1; }
+}
+
+.process-progress-fill {
+  position: relative;
+  overflow: hidden;
+}
+
+.process-terminal {
+  background:
+    radial-gradient(circle at 80% 10%, rgba(34, 211, 238, 0.08), transparent 24rem),
+    #020617;
+  text-shadow: 0 0 8px rgba(103, 232, 249, 0.12);
+}
+
+.process-log-line {
+  animation: process-log-in 240ms ease-out;
+}
+
+@keyframes process-log-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.process-card-active .process-progress-fill::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  background: linear-gradient(105deg, transparent 20%, rgba(255, 255, 255, 0.65) 48%, transparent 76%);
+  animation: process-sweep 1.6s linear infinite;
+}
+
+@keyframes process-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
+
 .enrichment-journey {
   isolation: isolate;
   background:
@@ -156,6 +238,21 @@ input:focus-visible {
   .enrichment-live-dot,
   .enrichment-flow-line span,
   .enrichment-scanner span {
+    animation: none;
+  }
+
+  .process-card-active .process-progress-fill::after {
+    animation: none;
+  }
+
+  .process-card-active .process-icon,
+  .process-live-badge,
+  .process-activity span:nth-child(2),
+  .process-activity-dots i {
+    animation: none;
+  }
+
+  .process-log-line {
     animation: none;
   }
 }

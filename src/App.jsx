@@ -13,6 +13,7 @@ import {
   SearchCheck,
   Settings,
   TableProperties,
+  Workflow,
 } from "lucide-react";
 import { createElement, useCallback, useEffect, useState } from "react";
 import AnalysisWorkflow from "./components/AnalysisWorkflow.jsx";
@@ -25,6 +26,7 @@ import MasterDataPage from "./components/MasterDataPage.jsx";
 import PartsLibrary from "./components/PartsLibrary.jsx";
 import PartsIntelligence from "./components/PartsIntelligence.jsx";
 import ReviewWorkspace from "./components/ReviewWorkspace.jsx";
+import ProcessControl from "./components/ProcessControl.jsx";
 import {
   DEFAULT_REPOSITORY,
   fetchWorkspaceData,
@@ -35,6 +37,7 @@ const TOKEN_STORAGE_KEY = "partmaster.githubToken";
 const EMPTY_DATA = { input: [], queue: [], approved: [], analyses: [], headSha: "" };
 const NAVIGATION = [
   { id: "dashboard", label: "Dashboard", shortLabel: "Home", icon: LayoutDashboard },
+  { id: "processes", label: "Processes", shortLabel: "Process", icon: Workflow },
   { id: "master", label: "Master data", shortLabel: "Master", icon: TableProperties },
   { id: "review", label: "Review", shortLabel: "Review", icon: ClipboardCheck },
   { id: "analyze", label: "Analyze parts", shortLabel: "Analyze", icon: FileSearch },
@@ -46,6 +49,7 @@ const NAVIGATION = [
 ];
 const VIEW_COPY = {
   dashboard: ["Operations dashboard", "Part processing progress"],
+  processes: ["Operations control", "Monitor and manage every process"],
   master: ["Master data", "Quality metrics and searchable consolidated catalog"],
   review: ["Human review", "Parts awaiting review"],
   analyze: ["Research workflow", "Import and analyze parts"],
@@ -63,6 +67,7 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [view, setView] = useState("dashboard");
+  const [processMode, setProcessMode] = useState("monitor");
   const [settingsOpen, setSettingsOpen] = useState(() => !localStorage.getItem(TOKEN_STORAGE_KEY));
 
   const loadWorkspace = useCallback(async () => {
@@ -118,12 +123,14 @@ export default function App() {
           </button>
           <div className="flex items-center gap-2">
             <nav className="hidden rounded-xl bg-slate-100 p-1 2xl:flex" aria-label="Primary navigation">
-              {NAVIGATION.map(({ id, label, icon }) => <button key={id} type="button" onClick={() => setView(id)} className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium ${view === id ? "bg-white text-brand-700 shadow-sm" : "text-slate-600 hover:text-slate-900"}`}>{createElement(icon, { size: 16, "aria-hidden": true })}{label}</button>)}
+              {NAVIGATION.map(({ id, label, icon }) => <button key={id} type="button" onClick={() => setView(id)} className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium ${view === id ? "bg-white text-brand-700 shadow-sm" : "text-slate-600 hover:text-slate-900"}`}>{createElement(icon, { size: 16, "aria-hidden": true })}{label}{id === "processes" && <span className="rounded-full bg-emerald-100 px-1.5 text-[10px] font-black text-emerald-700">LIVE</span>}</button>)}
             </nav>
             <button type="button" onClick={() => setSettingsOpen(true)} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"><Settings size={17} aria-hidden="true" /><span className="hidden sm:inline">Settings</span></button>
           </div>
         </div>
       </header>
+
+      {view === "processes" && <nav className="border-b border-slate-200 bg-white px-4 py-2 shadow-sm" aria-label="Processes submenu"><div className="mx-auto flex max-w-7xl items-center gap-2 sm:px-2"><span className="mr-2 text-xs font-black uppercase tracking-widest text-slate-400">Processes</span><button type="button" onClick={() => setProcessMode("monitor")} className={`rounded-lg px-3 py-1.5 text-sm font-bold ${processMode === "monitor" ? "bg-brand-50 text-brand-700" : "text-slate-600 hover:bg-slate-50"}`}>Monitor</button><button type="button" onClick={() => setProcessMode("logs")} className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-bold ${processMode === "logs" ? "bg-slate-950 text-cyan-300" : "text-slate-600 hover:bg-slate-50"}`}><span className="h-2 w-2 rounded-full bg-emerald-400" />Live log</button></div></nav>}
 
       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
         <nav className="mb-6 grid grid-cols-3 rounded-xl bg-slate-200/70 p-1 sm:grid-cols-5 lg:grid-cols-9 2xl:hidden" aria-label="Primary navigation">
@@ -137,7 +144,9 @@ export default function App() {
 
         {error && <div className="mb-5 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" role="alert"><AlertCircle className="mt-0.5 shrink-0" size={18} /><span>{error}</span></div>}
 
-        {view === "master" ? (
+        {view === "processes" ? (
+          <ProcessControl mode={processMode} onModeChange={setProcessMode} />
+        ) : view === "master" ? (
           <MasterDataPage />
         ) : view === "review" ? (
           <ReviewWorkspace />

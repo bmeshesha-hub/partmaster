@@ -71,6 +71,7 @@ export default function ReviewWorkspace() {
   const [status, setStatus] = useState("");
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("");
+  const [priority, setPriority] = useState("impact");
   const [appliedQuery, setAppliedQuery] = useState("");
   const [selectedIds, setSelectedIds] = useState([]);
   const [reviewing, setReviewing] = useState(null);
@@ -98,12 +99,12 @@ export default function ReviewWorkspace() {
     if (connected !== true) return;
     setLoadingQueue(true);
     try {
-      const result = await localDataApi.enrichmentCandidates({ reviewOnly: true, status, make: brand, category, q: appliedQuery, limit: 200 });
+      const result = await localDataApi.enrichmentCandidates({ reviewOnly: true, status, make: brand, category, q: appliedQuery, priority, limit: 200 });
       setCandidates(result.candidates || []);
       setCandidateTotal(result.total || 0);
     } catch (error) { setNotice({ type: "error", message: error.message }); }
     finally { setLoadingQueue(false); }
-  }, [appliedQuery, brand, category, connected, status]);
+  }, [appliedQuery, brand, category, connected, priority, status]);
 
   useEffect(() => { loadOverview(); }, [loadOverview]);
   useEffect(() => { loadQueue(); }, [loadQueue]);
@@ -200,10 +201,11 @@ export default function ReviewWorkspace() {
 
     {connected ? <section id="brand-review-queue" className="scroll-mt-24 overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-panel">
       <header className="border-b border-slate-200 bg-slate-50 px-5 py-5 sm:px-6"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="flex items-center gap-2 text-xs font-black uppercase tracking-wide text-brand-700"><Layers3 size={16} />Evidence decision queue</p><h3 className="mt-1 text-xl font-black">{brand ? `${brand} parts awaiting review` : "All brands awaiting review"}</h3><p className="mt-1 text-sm text-slate-500">{number(candidateTotal)} matching records · showing up to 200 highest recent candidates</p></div>{selectedIds.length > 0 && <div className="flex flex-wrap gap-2"><button type="button" onClick={recheckSelected} disabled={bulkBusy} className="inline-flex items-center gap-2 rounded-xl border border-cyan-300 bg-cyan-50 px-4 py-2.5 text-sm font-black text-cyan-800 disabled:opacity-50"><RefreshCw size={17} />Mass recheck ({number(selectedIds.length)})</button><button type="button" onClick={approveSelected} disabled={bulkBusy} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-black text-white shadow-lg hover:bg-emerald-700 disabled:opacity-50">{bulkBusy ? <LoaderCircle className="animate-spin" size={17} /> : <ListChecks size={17} />}Approve selected ({number(selectedIds.length)})</button><button type="button" onClick={rejectSelected} disabled={bulkBusy} className="inline-flex items-center gap-2 rounded-xl border border-red-300 bg-red-50 px-4 py-2.5 text-sm font-black text-red-700 disabled:opacity-50">Reject selected</button></div>}</div></header>
-      <form onSubmit={submitSearch} className="grid gap-3 border-b border-slate-200 px-5 py-4 sm:grid-cols-2 lg:grid-cols-[1.7fr_1fr_1fr_auto]">
+      <form onSubmit={submitSearch} className="grid gap-3 border-b border-slate-200 px-5 py-4 sm:grid-cols-2 lg:grid-cols-[1.7fr_1fr_1fr_1fr_auto]">
         <label className="text-[10px] font-black uppercase tracking-wide text-slate-500">Search evidence<div className="relative mt-1.5"><Search className="absolute left-3 top-2.5 text-slate-400" size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="OEM number, description, model…" className="w-full rounded-xl border border-slate-300 py-2.5 pl-9 pr-3 text-sm font-normal normal-case tracking-normal" /></div></label>
         <label className="text-[10px] font-black uppercase tracking-wide text-slate-500">Attention type<select value={status} onChange={(event) => { setStatus(event.target.value); setSelectedIds([]); }} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal">{STATUS_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
         <label className="text-[10px] font-black uppercase tracking-wide text-slate-500">Category<select value={category} onChange={(event) => { setCategory(event.target.value); setSelectedIds([]); }} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal"><option value="">All categories</option>{(overview.categories || []).map((item) => <option key={item.category} value={item.category}>{item.category} · {number(item.awaiting_review)}</option>)}</select></label>
+        <label className="text-[10px] font-black uppercase tracking-wide text-slate-500">Queue order<select value={priority} onChange={(event) => { setPriority(event.target.value); setSelectedIds([]); }} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal"><option value="impact">Highest source impact</option><option value="recent">Most recently processed</option></select></label>
         <div className="flex items-end gap-2"><button className="inline-flex items-center gap-2 rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-bold text-white"><Filter size={16} />Apply</button>{filtersActive && <button type="button" onClick={resetFilters} className="rounded-xl border border-slate-300 p-2.5 text-slate-500" aria-label="Clear review filters"><X size={16} /></button>}</div>
       </form>
       {filtersActive && <div className="flex flex-wrap items-center gap-2 border-b border-blue-100 bg-blue-50 px-5 py-3 text-xs font-bold text-blue-800"><span>Active:</span>{brand && <span className="rounded-full bg-white px-2.5 py-1">Brand · {brand}</span>}{status && <span className="rounded-full bg-white px-2.5 py-1">{statusLabel(status)}</span>}{category && <span className="rounded-full bg-white px-2.5 py-1">Category · {category}</span>}{appliedQuery && <span className="rounded-full bg-white px-2.5 py-1">Search · {appliedQuery}</span>}</div>}

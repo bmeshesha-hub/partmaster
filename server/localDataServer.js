@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, open, readdir, stat } from "node:fs/promises";
 import { basename, extname, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
+import { lookup } from "node:dns/promises";
 
 const APP_ROOT = resolve(import.meta.dirname, "..");
 const DATA_ROOT = join(APP_ROOT, "local_data");
@@ -21,6 +22,7 @@ const activeEnrichmentJobs = new Set();
 const activeRowEnhancementJobs = new Set();
 const activeAutopilotJobs = new Set();
 const activePipelineJobs = new Set();
+const networkEvents = [];
 const compatibilityQueue = [];
 const queuedCompatibilityKeys = new Set();
 let compatibilityWorkerRunning = false;
@@ -1714,6 +1716,11 @@ function isSafeEvidenceUrl(value) {
 }
 
 async function fetchEvidence(url) {
+  const startedAt = Date.now();
+  const host = (() => { try { return new URL(url).hostname; } catch { return "invalid-host"; } })();
+  let ip = "unresolved";
+  try { ip = (await lookup(host)).address; } catch { /* DNS failures are recorded with the request result. */ }
+  networkEvents.push({ at: new Date().toISOString(), kind: "request", host, ip, url: String(url).replace(/([?&](?:token|key|api_key|q)=)[^&]+/gi, "$1[redacted]") });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), ENRICHMENT_FETCH_TIMEOUT_MS);
   try {
@@ -1741,7 +1748,12 @@ async function fetchEvidence(url) {
     const declaredLength = Number(response.headers.get("content-length") || 0);
     if (declaredLength > ENRICHMENT_MAX_PAGE_BYTES) throw new Error("Source page is larger than the configured evidence limit.");
     const html = (await response.text()).slice(0, ENRICHMENT_MAX_PAGE_BYTES);
+    const finalHost = (() => { try { return new URL(response.url || currentUrl).hostname; } catch { return host; } })();
+    networkEvents.push({ at: new Date().toISOString(), kind: "response", host: finalHost, ip, status: response.status, ms: Date.now() - startedAt, bytes: html.length, url: response.url || currentUrl });
     return { html, finalUrl: response.url || currentUrl };
+  } catch (error) {
+    networkEvents.push({ at: new Date().toISOString(), kind: "error", host, ip, ms: Date.now() - startedAt, message: error.message });
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -2782,6 +2794,7 @@ async function createEnrichmentJob(options) {
     const sourceUrl = firstColumnExpression(columns, ["url", "source_url"]);
     const epid = firstColumnExpression(columns, ["epid", "e_pid"]);
     const scanLimit = Math.min(500000, Math.max(requestedCandidates * 30, requestedCandidates));
+    const repairPriority = `CASE WHEN upper(regexp_replace(coalesce(${manufacturer}, ''), '[^A-Za-z0-9]', '', 'g')) NOT IN ('BMW','HONDA','KTM','KAWASAKI','SUZUKI','YAMAHA','HARLEYDAVIDSON') OR length(upper(regexp_replace(coalesce(${partNumber}, ''), '[^A-Za-z0-9]', '', 'g'))) NOT BETWEEN 3 AND 50 THEN 0 ELSE 1 END`;
     const query = `
       WITH source_rows AS (
         SELECT
@@ -2803,7 +2816,10 @@ async function createEnrichmentJob(options) {
             SELECT 1 FROM partmaster_enrichment_candidates prior
             WHERE prior.dataset_id = $datasetId AND prior.source_row_id = source._row_id
           )
-        ORDER BY _row_id
+        -- Spend each enrichment batch on rows that cannot currently enter the
+        -- master first. This closes the gap where valid rows consumed the
+        -- batch budget while repairable/invalid rows waited indefinitely.
+        ORDER BY ${repairPriority}, _row_id
         LIMIT ${scanLimit}
       ), keyed AS (
         SELECT *,
@@ -2958,6 +2974,28 @@ async function processEnrichmentCandidate(candidate, threshold) {
     return update;
   }
   const evidence = extractPageEvidence(html, candidate.part_number_raw);
+  // Recovery pass for rows whose source has a description/URL but no OEM
+  // number. A single search hit is not enough: fetch that page and require
+  // the recovered number to appear in its evidence before auto-accepting.
+  let recoveredFromSearch = false;
+  if (!candidate.part_number_norm && !normalizePartNumber(evidence.productNumber)) {
+    try {
+      const search = await searchCandidateSources({ ...candidate, description_raw: candidate.description_raw || evidence.description });
+      const numbered = (search.results || []).filter((result) => result.partNumber && isSafeEvidenceUrl(result.url));
+      const uniqueNumbers = [...new Set(numbered.map((result) => normalizePartNumber(result.partNumber)))];
+      if (uniqueNumbers.length === 1 && numbered[0]?.url) {
+        const recoveryPage = await getEvidencePage(numbered[0].url);
+        const recoveredEvidence = extractPageEvidence(recoveryPage.html, numbered[0].partNumber);
+        const recoveredNorm = normalizePartNumber(recoveredEvidence.productNumber || numbered[0].partNumber);
+        if (recoveredNorm === uniqueNumbers[0] && (recoveredEvidence.exactNumberFound || recoveredEvidence.structuredExact)) {
+          html = recoveryPage.html;
+          finalUrl = recoveryPage.finalUrl;
+          recoveredFromSearch = true;
+          Object.assign(evidence, recoveredEvidence, { productNumber: numbered[0].partNumber, exactNumberFound: true, structuredExact: Boolean(recoveredEvidence.structuredExact || recoveredEvidence.exactNumberFound) });
+        }
+      }
+    } catch { /* Original source evidence remains authoritative when recovery fails. */ }
+  }
   const evidenceLocation = inferLocation(evidence.description, evidence.title);
   update = applyVehicleMapping(applyVariantIntelligence({
     ...update,
@@ -2987,7 +3025,7 @@ async function processEnrichmentCandidate(candidate, threshold) {
   if (candidate.part_number_norm && evidence.structuredExact) update.confidence = 0.98;
   else if (candidate.part_number_norm && evidence.exactNumberFound && pageTitleMatchesContext(candidate, evidence.title)) update.confidence = 0.96;
   else if (candidate.part_number_norm && evidence.exactNumberFound) update.confidence = 0.9;
-  else if (!candidate.part_number_norm && onlinePartNorm && evidence.hasProductData) update.confidence = 0.86;
+  else if (!candidate.part_number_norm && onlinePartNorm && evidence.hasProductData) update.confidence = recoveredFromSearch ? 0.96 : 0.86;
   else if (!candidate.part_number_norm) update.status = "not_found";
 
   if (localLocation.side !== "Unknown" && evidenceLocation.side === "Unknown") {
@@ -3921,6 +3959,9 @@ async function createPipelineJob(options = {}) {
 }
 
 const app = express();
+app.get("/api/local/processes/network-log", (_request, response) => {
+  response.json({ events: networkEvents.slice(-250) });
+});
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/api/local/health", (_request, response) => {
@@ -4392,6 +4433,33 @@ app.get("/api/local/master-catalog", asyncRoute(async (request, response) => {
   response.json(result);
 }));
 
+app.post("/api/local/master-catalog/export", asyncRoute(async (request, response) => {
+  const filters = request.body || {};
+  const conditions = []; const values = {};
+  const query = String(filters.q || "").trim().toLowerCase();
+  if (query) { conditions.push("lower(concat_ws(' ', manufacturer, part_number, description, family_name, side, position, extracted_attributes_json)) LIKE $query"); values.query = `%${query}%`; }
+  if (filters.manufacturer) { conditions.push("manufacturer_norm = $manufacturer"); values.manufacturer = normalizePartNumber(normalizeManufacturer(filters.manufacturer)); }
+  if (filters.family) { conditions.push("coalesce(family_name, 'Unclassified') = $family"); values.family = String(filters.family); }
+  if (filters.onlineStatus) { conditions.push("online_status = $onlineStatus"); values.onlineStatus = String(filters.onlineStatus); }
+  if (filters.factStatus === "with_facts") conditions.push("extracted_attribute_count > 0");
+  if (filters.factStatus === "missing_facts") conditions.push("extracted_attribute_count = 0");
+  if (filters.descriptionStatus === "missing") conditions.push("nullif(trim(description), '') IS NULL");
+  if (filters.descriptionStatus === "present") conditions.push("nullif(trim(description), '') IS NOT NULL");
+  if (Number.isFinite(Number(filters.minConfidence))) { conditions.push("confidence >= $minConfidence"); values.minConfidence = Number(filters.minConfidence); }
+  if (Number.isFinite(Number(filters.maxConfidence))) { conditions.push("confidence <= $maxConfidence"); values.maxConfidence = Number(filters.maxConfidence); }
+  if (Number.isFinite(Number(filters.minOccurrences))) { conditions.push("occurrence_count >= $minOccurrences"); values.minOccurrences = Number(filters.minOccurrences); }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const stamp = Date.now(); const filename = `master-catalog-filtered-${stamp}.csv`; const path = join(EXPORT_ROOT, filename);
+  await withConnection((connection) => connection.run(
+    `COPY (SELECT manufacturer AS "Manufacturer", part_number AS "OEM Part Number", description AS "Description", family_name AS "Part Family", component_scope AS "Component Scope", side AS "Side", position AS "Position", occurrence_count AS "Occurrences", dataset_count AS "Datasets", application_count AS "Applications", source_page_count AS "Source Pages", extracted_attribute_count AS "Extracted Facts", confidence AS "Confidence", attribute_status AS "Attribute Status", online_status AS "Online Evidence Status", best_source_url AS "Best Source URL", manufacturer_norm AS "Normalized Manufacturer", part_number_norm AS "Normalized OEM Number", part_key AS "Global Part Key" FROM partmaster_offline_parts ${where} ORDER BY manufacturer_norm, part_number_norm) TO ${quoteString(path)} (FORMAT CSV, HEADER true)`, values,
+  ));
+  const count = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(`SELECT count(*) AS count FROM partmaster_offline_parts ${where}`, values);
+    return Number(reader.getRowObjectsJson()[0].count);
+  });
+  response.json({ exports: [{ filename, downloadUrl: `/api/local/exports/${encodeURIComponent(filename)}`, filters }], count });
+}));
+
 app.post("/api/local/pipeline/exports", asyncRoute(async (_request, response) => {
   const attributeKeys = [...new Set(CATEGORY_ATTRIBUTE_SCHEMAS.flatMap((schema) => schema.attributes.map((attribute) => attribute.key)))]
     .filter((key) => !["side", "position"].includes(key));
@@ -4857,11 +4925,17 @@ app.get("/api/local/enrichment/candidates", asyncRoute(async (request, response)
       conditions.push("lower(concat_ws(' ', coalesce(family_name, ''), coalesce(assembly, ''), coalesce(description_raw, ''))) LIKE $category");
       values.category = `%${String(request.query.category).trim().toLowerCase()}%`;
     }
+    const priority = request.query.priority === "impact";
     const clause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const limit = Math.max(10, Math.min(500, Number(request.query.limit) || 100));
     const reader = await connection.runAndReadAll(
-      `SELECT * FROM partmaster_enrichment_candidates ${clause}
-       ORDER BY coalesce(processed_at, created_at) DESC, source_row_id LIMIT ${limit}`,
+      `SELECT candidates.*,
+       coalesce((SELECT sum(sources.occurrence_count) FROM partmaster_offline_part_sources sources
+         WHERE sources.manufacturer_norm = candidates.manufacturer_norm
+           AND sources.part_number_norm = coalesce(nullif(candidates.part_number_norm, ''), nullif(candidates.enriched_part_number, ''))), 0) AS source_impact
+       FROM partmaster_enrichment_candidates candidates ${clause ? `${clause} AND` : "WHERE"}
+       ${priority ? "true" : "true"}
+       ORDER BY ${priority ? "source_impact DESC, coalesce(candidates.confidence, 0) ASC, candidates.created_at ASC" : "coalesce(candidates.processed_at, candidates.created_at) DESC, candidates.source_row_id"} LIMIT ${limit}`,
       values,
     );
     const countReader = await connection.runAndReadAll(
@@ -5533,7 +5607,21 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
        applications.quantity AS "Quantity", applications.source_url AS "Source URL",
        applications.required_options AS "Required Options", applications.excluded_options AS "Excluded Options",
        applications.fitment_explanation AS "Why It Fits", applications.evidence_url AS "Evidence URL",
-       applications.confidence AS "Confidence"
+       applications.confidence AS "Confidence",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'heated' LIMIT 1) AS "Heated",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name IN ('leather', 'leather_trim') LIMIT 1) AS "Leather",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name IN ('color', 'colour') LIMIT 1) AS "Color",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'auto_dimming' LIMIT 1) AS "Auto Dimming",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'power_folding' LIMIT 1) AS "Power Folding",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'memory' LIMIT 1) AS "Memory",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'blind_spot' LIMIT 1) AS "Blind Spot",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'camera' LIMIT 1) AS "Camera",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'turn_signal' LIMIT 1) AS "Turn Signal",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'connector_pins' LIMIT 1) AS "Connector Pins",
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'voltage' LIMIT 1) AS "Voltage",
+       parts.evidence_url AS "Part Evidence URL", parts.verification_status AS "Part Verification Status",
+       parts.confidence AS "Part Confidence", applications.dataset_id AS "Source Dataset ID",
+       applications.source_row_id AS "Source Row ID"
        FROM partmaster_part_applications applications
        JOIN partmaster_canonical_parts parts ON parts.id = applications.part_id
        ORDER BY parts.manufacturer_norm, parts.part_number_norm, applications.year, applications.model)

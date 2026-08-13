@@ -31,6 +31,7 @@ export const localDataApi = {
   exportRows: (datasetId, filters) => request(`/datasets/${encodeURIComponent(datasetId)}/exports`, { method: "POST", body: JSON.stringify(filters) }),
   deleteDataset: (datasetId) => request(`/datasets/${encodeURIComponent(datasetId)}`, { method: "DELETE" }),
   pipelineJobs: () => request("/pipeline/jobs"),
+  networkLog: () => request("/processes/network-log"),
   startPipeline: (options) => request("/pipeline/jobs", { method: "POST", body: JSON.stringify(options) }),
   pausePipeline: (jobId) => request(`/pipeline/jobs/${encodeURIComponent(jobId)}/pause`, { method: "POST", body: "{}" }),
   resumePipeline: (jobId) => request(`/pipeline/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST", body: "{}" }),
@@ -47,6 +48,7 @@ export const localDataApi = {
     const query = new URLSearchParams(Object.entries(parameters).filter(([, value]) => value !== "" && value != null));
     return request(`/master-catalog?${query}`);
   },
+  exportMasterCatalog: (parameters = {}) => request("/master-catalog/export", { method: "POST", body: JSON.stringify(parameters) }),
   exportPipelineCatalog: () => request("/pipeline/exports", { method: "POST", body: "{}" }),
   enrichmentJobs: () => request("/enrichment/jobs"),
   enrichmentJob: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}`),
