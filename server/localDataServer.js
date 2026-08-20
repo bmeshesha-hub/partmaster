@@ -317,6 +317,22 @@ await withConnection((connection) => connection.run(`
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
   );
 
+  CREATE TABLE IF NOT EXISTS partmaster_master_impurities (
+    part_key VARCHAR PRIMARY KEY,
+    manufacturer VARCHAR,
+    part_number VARCHAR,
+    part_number_norm VARCHAR,
+    description VARCHAR,
+    family_name VARCHAR,
+    reason_code VARCHAR NOT NULL,
+    occurrence_count BIGINT NOT NULL DEFAULT 0,
+    dataset_count BIGINT NOT NULL DEFAULT 0,
+    source_page_count BIGINT NOT NULL DEFAULT 0,
+    best_source_url VARCHAR,
+    detected_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    status VARCHAR NOT NULL DEFAULT 'quarantined'
+  );
+
   CREATE TABLE IF NOT EXISTS partmaster_offline_source_pages (
     source_url VARCHAR PRIMARY KEY,
     source_host VARCHAR,
@@ -579,6 +595,9 @@ await withConnection((connection) => connection.run(`
 await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_pipeline_jobs ADD COLUMN IF NOT EXISTS attribute_processed BIGINT DEFAULT 0;
   ALTER TABLE partmaster_pipeline_jobs ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'full';
+  ALTER TABLE partmaster_enrichment_schedules ADD COLUMN IF NOT EXISTS dataset_ids VARCHAR;
+  ALTER TABLE partmaster_enrichment_schedules ADD COLUMN IF NOT EXISTS cursor_json VARCHAR DEFAULT '{}';
+  ALTER TABLE partmaster_enrichment_schedules ADD COLUMN IF NOT EXISTS last_dataset_id VARCHAR;
   ALTER TABLE partmaster_enrichment_jobs ADD COLUMN IF NOT EXISTS start_row_id BIGINT DEFAULT 0;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS application_key VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS family_name VARCHAR;
@@ -762,6 +781,21 @@ function normalizeManufacturer(value) {
 
 function normalizePartNumber(value) {
   return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function partNumberValidationSql(column = "part_number_norm") {
+  return `length(${column}) BETWEEN 3 AND 50
+    AND regexp_matches(${column}, '[0-9]')
+    AND NOT regexp_matches(${column}, '^(NA|NONE|NULL|UNKNOWN|UNAVAILABLE|NOTAVAILABLE|TBD|MISSING|X+)$')`;
+}
+
+function partNumberReasonSql() {
+  return `CASE
+    WHEN nullif(trim(part_number_norm), '') IS NULL THEN 'missing_part_number'
+    WHEN length(part_number_norm) < 3 OR length(part_number_norm) > 50 THEN 'invalid_length'
+    WHEN regexp_matches(part_number_norm, '^(NA|NONE|NULL|UNKNOWN|UNAVAILABLE|NOTAVAILABLE|TBD|MISSING|X+)$') THEN 'placeholder_part_number'
+    WHEN NOT regexp_matches(part_number_norm, '[0-9]') THEN 'alpha_only_part_number'
+    ELSE 'invalid_part_number' END`;
 }
 
 function normalizeApplicationValue(value) {
@@ -2421,7 +2455,7 @@ async function scanDatasetOffline(jobId, dataset) {
       ${fields.quantity} AS quantity, ${fields.sourceUrl} AS source_url
       FROM ${quoteIdentifier(dataset.table_name)}`;
     const validCondition = `manufacturer_norm IN ('BMW','HONDA','KTM','KAWASAKI','SUZUKI','YAMAHA','HARLEYDAVIDSON')
-      AND length(part_number_norm) BETWEEN 3 AND 50`;
+      AND ${partNumberValidationSql("part_number_norm")}`;
     const countsReader = await connection.runAndReadAll(
       `WITH source_rows AS (${sourceRows}), normalized AS (
        SELECT *, ${manufacturerNorm} AS manufacturer_norm, ${partNorm} AS part_number_norm FROM source_rows)
@@ -2941,6 +2975,25 @@ async function enrichmentDatasetProgress(datasetId) {
   });
 }
 
+function scheduleDatasetIds(schedule) {
+  return String(schedule.dataset_ids || schedule.dataset_id || "").split(",").map((value) => value.trim()).filter(Boolean);
+}
+
+async function enrichmentScheduleProgress(schedule) {
+  const datasetIds = scheduleDatasetIds(schedule);
+  const progress = await Promise.all(datasetIds.map((datasetId) => enrichmentDatasetProgress(datasetId)));
+  return {
+    dataset_ids: datasetIds,
+    dataset_name: progress.length > 1 ? "All CSV sources" : progress[0]?.dataset_name || "Imported CSV",
+    source_file: progress.map((item) => item.source_file).filter(Boolean).join(", "),
+    total_rows: progress.reduce((sum, item) => sum + Number(item.total_rows || 0), 0),
+    processed_rows: progress.reduce((sum, item) => sum + Number(item.processed_rows || 0), 0),
+    in_progress_rows: progress.reduce((sum, item) => sum + Number(item.in_progress_rows || 0), 0),
+    remaining_rows: progress.reduce((sum, item) => sum + Number(item.remaining_rows || 0), 0),
+    datasets: progress,
+  };
+}
+
 function nextEnrichmentScheduleRun(schedule, after = new Date()) {
   const intervalMinutes = Math.max(1, Math.min(1440, Number(schedule.interval_minutes || schedule.intervalMinutes) || 20));
   return new Date(after.getTime() + intervalMinutes * 60 * 1000);
@@ -2962,8 +3015,8 @@ async function runEnrichmentSchedule(schedule, { manual = false } = {}) {
     return { jobId: existingJob.status === "paused" || existingJob.status === "failed" ? null : existingJob.id, blocked: true, status: existingJob.status };
   }
   if (jobState.activeJob) return { jobId: jobState.activeJob.id, blocked: true, status: jobState.activeJob.status };
-  const progress = await enrichmentDatasetProgress(schedule.dataset_id);
-  if (!progress.remaining_rows) {
+  const scheduleProgress = await enrichmentScheduleProgress(schedule);
+  if (!scheduleProgress.remaining_rows) {
     await withConnection((connection) => connection.run(
       `UPDATE partmaster_enrichment_schedules SET enabled = false, last_run_at = current_timestamp,
        last_status = 'complete', next_run_at = NULL, last_error = NULL, updated_at = current_timestamp WHERE id = $id`,
@@ -2971,11 +3024,17 @@ async function runEnrichmentSchedule(schedule, { manual = false } = {}) {
     ));
     return { jobId: null, status: "complete", remainingRows: 0 };
   }
+  const cursor = (() => {
+    try { return JSON.parse(schedule.cursor_json || "{}"); } catch { return {}; }
+  })();
+  const selectedProgress = [...scheduleProgress.datasets]
+    .sort((left, right) => Number(right.remaining_rows || 0) - Number(left.remaining_rows || 0))[0];
+  if (!selectedProgress) return { jobId: null, status: "complete", remainingRows: 0 };
   const result = await createEnrichmentJob({
-    datasetId: schedule.dataset_id,
+    datasetId: selectedProgress.dataset_id,
     name: `${schedule.name}${manual ? " — run now" : " — scheduled"}`,
-    requestedCandidates: Math.min(Number(schedule.batch_size || 1000), progress.remaining_rows),
-    startRowId: Number(schedule.next_start_row_id || 0),
+    requestedCandidates: Math.min(Number(schedule.batch_size || 1000), selectedProgress.remaining_rows),
+    startRowId: Number(cursor[selectedProgress.dataset_id] || (schedule.dataset_id === selectedProgress.dataset_id ? schedule.next_start_row_id : 0) || 0),
     batchSize: 10,
     autoAcceptThreshold: 0.94,
   });
@@ -2983,6 +3042,7 @@ async function runEnrichmentSchedule(schedule, { manual = false } = {}) {
   await withConnection((connection) => connection.run(
     `UPDATE partmaster_enrichment_schedules SET last_run_at = current_timestamp, last_job_id = $jobId,
      last_status = $lastStatus, enabled = $enabled, next_start_row_id = $nextStartRowId, next_run_at = $nextRunAt,
+     cursor_json = $cursorJson, last_dataset_id = $lastDatasetId,
      last_error = NULL, updated_at = current_timestamp WHERE id = $id`,
     {
       id: schedule.id,
@@ -2991,10 +3051,12 @@ async function runEnrichmentSchedule(schedule, { manual = false } = {}) {
       enabled: Boolean(result.candidateCount),
       nextStartRowId: result.lastSourceRowId,
       nextRunAt: result.candidateCount ? localTimestamp(nextRun) : null,
+      cursorJson: JSON.stringify({ ...cursor, [selectedProgress.dataset_id]: result.lastSourceRowId }),
+      lastDatasetId: selectedProgress.dataset_id,
     },
   ));
   if (result.candidateCount) scheduleEnrichmentJob(result.id);
-  return { jobId: result.candidateCount ? result.id : null, candidateCount: result.candidateCount, remainingRows: progress.remaining_rows };
+  return { jobId: result.candidateCount ? result.id : null, candidateCount: result.candidateCount, remainingRows: scheduleProgress.remaining_rows, datasetId: selectedProgress.dataset_id };
 }
 
 async function findExistingVariantConflicts(candidate, result) {
@@ -4277,16 +4339,22 @@ app.get("/api/local/enrichment/schedules", asyncRoute(async (_request, response)
     return reader.getRowObjectsJson();
   });
   const withProgress = await Promise.all(schedules.map(async (schedule) => {
-    try { return { ...schedule, ...(await enrichmentDatasetProgress(schedule.dataset_id)) }; }
+    try { return { ...schedule, ...(await enrichmentScheduleProgress(schedule)) }; }
     catch (error) { return { ...schedule, progress_error: error.message, total_rows: 0, processed_rows: 0, remaining_rows: 0 }; }
   }));
   response.json({ schedules: withProgress });
 }));
 
 app.post("/api/local/enrichment/schedules", asyncRoute(async (request, response) => {
-  const datasetId = String(request.body.datasetId || "");
-  if (!datasetId) throw new Error("Choose an imported dataset for the row schedule.");
-  const progress = await enrichmentDatasetProgress(datasetId);
+  const requestedDatasetId = String(request.body.datasetId || "");
+  const datasetIds = requestedDatasetId && requestedDatasetId !== "all"
+    ? [requestedDatasetId]
+    : await withConnection(async (connection) => {
+      const reader = await connection.runAndReadAll("SELECT id FROM partmaster_datasets ORDER BY imported_at, id");
+      return reader.getRowObjectsJson().map((dataset) => dataset.id);
+    });
+  if (!datasetIds.length) throw new Error("Import at least one CSV before creating a row schedule.");
+  const progress = await enrichmentScheduleProgress({ dataset_ids: datasetIds });
   const requestedBatchSize = Number(request.body.batchSize);
   const batchSize = Math.max(1, Math.min(10000, Number.isFinite(requestedBatchSize) ? requestedBatchSize : 1000));
   const requestedInterval = Number(request.body.intervalMinutes);
@@ -4294,17 +4362,18 @@ app.post("/api/local/enrichment/schedules", asyncRoute(async (request, response)
   const id = randomUUID();
   await withConnection((connection) => connection.run(
     `INSERT INTO partmaster_enrichment_schedules
-     (id, dataset_id, name, enabled, batch_size, interval_minutes, next_start_row_id, next_run_at)
-     VALUES ($id, $datasetId, $name, true, $batchSize, $intervalMinutes, 0, current_timestamp)`,
+     (id, dataset_id, dataset_ids, name, enabled, batch_size, interval_minutes, next_start_row_id, cursor_json, next_run_at)
+     VALUES ($id, $datasetId, $datasetIds, $name, true, $batchSize, $intervalMinutes, 0, '{}', current_timestamp)`,
     {
       id,
-      datasetId,
-      name: String(request.body.name || `${progress.dataset_name} row batches`).trim().slice(0, 200),
+      datasetId: datasetIds[0],
+      datasetIds: datasetIds.join(","),
+      name: String(request.body.name || `${datasetIds.length > 1 ? "All CSV sources" : progress.dataset_name} row batches`).trim().slice(0, 200),
       batchSize,
       intervalMinutes,
     },
   ));
-  response.status(201).json({ id, totalRows: progress.total_rows, remainingRows: progress.remaining_rows, batchSize, intervalMinutes });
+  response.status(201).json({ id, datasetIds, totalRows: progress.total_rows, remainingRows: progress.remaining_rows, batchSize, intervalMinutes });
 }));
 
 app.patch("/api/local/enrichment/schedules/:id", asyncRoute(async (request, response) => {
@@ -4644,7 +4713,8 @@ app.post("/api/local/master-catalog/export", asyncRoute(async (request, response
   if (Number.isFinite(Number(filters.maxConfidence))) { conditions.push("confidence <= $maxConfidence"); values.maxConfidence = Number(filters.maxConfidence); }
   if (Number.isFinite(Number(filters.minOccurrences))) { conditions.push("occurrence_count >= $minOccurrences"); values.minOccurrences = Number(filters.minOccurrences); }
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const stamp = Date.now(); const filename = `master-catalog-filtered-${stamp}.csv`; const path = join(EXPORT_ROOT, filename);
+  const hasFilters = Object.entries(filters).some(([key, value]) => !["sort", "direction", "page", "pageSize"].includes(key) && value !== "" && value != null);
+  const stamp = Date.now(); const filename = `master-catalog-${hasFilters ? "filtered" : "all"}-${stamp}.csv`; const path = join(EXPORT_ROOT, filename);
   await withConnection((connection) => connection.run(
     `COPY (SELECT manufacturer AS "Manufacturer", part_number AS "OEM Part Number", description AS "Description", family_name AS "Part Family", component_scope AS "Component Scope", side AS "Side", position AS "Position", occurrence_count AS "Occurrences", dataset_count AS "Datasets", application_count AS "Applications", source_page_count AS "Source Pages", extracted_attribute_count AS "Extracted Facts", confidence AS "Confidence", attribute_status AS "Attribute Status", online_status AS "Online Evidence Status", best_source_url AS "Best Source URL", manufacturer_norm AS "Normalized Manufacturer", part_number_norm AS "Normalized OEM Number", part_key AS "Global Part Key" FROM partmaster_offline_parts ${where} ORDER BY manufacturer_norm, part_number_norm) TO ${quoteString(path)} (FORMAT CSV, HEADER true)`, values,
   ));
@@ -5739,6 +5809,7 @@ app.get("/api/local/master/quality", asyncRoute(async (_request, response) => {
 app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
   const exports = await withConnection(async (connection) => {
     const stamp = Date.now();
+    const catalogFilename = `master-catalog-all-${stamp}.csv`;
     const partsFilename = `parts-master-${stamp}.csv`;
     const applicationsFilename = `part-applications-${stamp}.csv`;
     const relationshipsFilename = `part-relationships-${stamp}.csv`;
@@ -5750,6 +5821,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const conflictsFilename = `data-conflicts-${stamp}.csv`;
     const autopilotJobsFilename = `autopilot-runs-${stamp}.csv`;
     const autopilotItemsFilename = `autopilot-outcomes-${stamp}.csv`;
+    const catalogPath = join(EXPORT_ROOT, catalogFilename);
     const partsPath = join(EXPORT_ROOT, partsFilename);
     const applicationsPath = join(EXPORT_ROOT, applicationsFilename);
     const relationshipsPath = join(EXPORT_ROOT, relationshipsFilename);
@@ -5761,6 +5833,19 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const conflictsPath = join(EXPORT_ROOT, conflictsFilename);
     const autopilotJobsPath = join(EXPORT_ROOT, autopilotJobsFilename);
     const autopilotItemsPath = join(EXPORT_ROOT, autopilotItemsFilename);
+    await connection.run(
+      `COPY (SELECT manufacturer AS "Manufacturer", part_number AS "OEM Part Number",
+       description AS "Description", family_name AS "Part Family", component_scope AS "Component Scope",
+       side AS "Side", position AS "Position", extracted_attributes_json AS "Extracted Attributes JSON",
+       extracted_attribute_count AS "Extracted Facts", occurrence_count AS "Raw Occurrences",
+       dataset_count AS "Source Datasets", application_count AS "Applications", source_page_count AS "Source Pages",
+       best_source_url AS "Best Source URL", confidence AS "Confidence", attribute_status AS "Attribute Status",
+       online_status AS "Online Evidence Status", updated_at AS "Updated At",
+       manufacturer_norm AS "Normalized Manufacturer", part_number_norm AS "Normalized OEM Number",
+       part_key AS "Global Part Key"
+       FROM partmaster_offline_parts ORDER BY manufacturer_norm, part_number_norm)
+       TO ${quoteString(catalogPath)} (FORMAT CSV, HEADER true)`,
+    );
     await connection.run(
       `COPY (SELECT parts.manufacturer AS "Manufacturer", families.family_name AS "Part Family",
        parts.part_number AS "OEM Part Number", parts.description AS "Description",
@@ -5921,6 +6006,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
        TO ${quoteString(autopilotItemsPath)} (FORMAT CSV, HEADER true)`,
     );
     return [
+      { filename: catalogFilename, path: catalogPath, bytes: (await stat(catalogPath)).size },
       { filename: partsFilename, path: partsPath, bytes: (await stat(partsPath)).size },
       { filename: applicationsFilename, path: applicationsPath, bytes: (await stat(applicationsPath)).size },
       { filename: relationshipsFilename, path: relationshipsPath, bytes: (await stat(relationshipsPath)).size },
@@ -5932,7 +6018,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
       { filename: conflictsFilename, path: conflictsPath, bytes: (await stat(conflictsPath)).size },
       { filename: autopilotJobsFilename, path: autopilotJobsPath, bytes: (await stat(autopilotJobsPath)).size },
       { filename: autopilotItemsFilename, path: autopilotItemsPath, bytes: (await stat(autopilotItemsPath)).size },
-    ];
+    ].map((item) => ({ ...item, downloadUrl: `/api/local/exports/${encodeURIComponent(item.filename)}` }));
   });
   response.json({ exports });
 }));

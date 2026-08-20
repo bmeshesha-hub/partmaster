@@ -159,7 +159,7 @@ export default function App() {
         ) : view === "about" ? (
           <AboutPage />
         ) : view === "dashboard" ? (
-          <Dashboard data={data} onNavigate={setView} />
+          <Dashboard data={data} onNavigate={setView} onOpenSettings={() => setSettingsOpen(true)} />
         ) : !token ? (
           <div className="rounded-2xl border border-slate-200 bg-white px-6 py-16 text-center shadow-panel"><Settings className="mx-auto text-brand-600" size={40} /><h2 className="mt-4 text-lg font-semibold">Connect the data repository</h2><p className="mx-auto mt-2 max-w-md text-sm text-slate-500">Add a GitHub personal access token to load your dashboard, analyses, and completed-parts library.</p><button type="button" onClick={() => setSettingsOpen(true)} className="mt-5 rounded-xl bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700">Open settings</button></div>
         ) : loading && !data.headSha ? (

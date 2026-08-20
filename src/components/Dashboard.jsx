@@ -9,6 +9,7 @@ import {
   HardDrive,
   LoaderCircle,
   Play,
+  Timer,
 } from "lucide-react";
 import { createElement, useCallback, useEffect, useState } from "react";
 import { buildPartsLibrary } from "../utils/libraryUtils.js";
@@ -51,6 +52,14 @@ function MetricCard({ icon, label, value, detail, tone = "blue" }) {
 
 function ProgressMetric({ label, value, detail, tone = "text-slate-950" }) {
   return <article className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p className="text-[10px] font-black uppercase tracking-wide text-slate-500">{label}</p><p className={`mt-1 text-2xl font-black ${tone}`}>{typeof value === "string" ? value : number(value)}</p><p className="mt-1 text-[11px] leading-4 text-slate-500">{detail}</p></article>;
+}
+
+function ProgressDonut({ done, remaining, label }) {
+  const total = Math.max(0, Number(done || 0) + Number(remaining || 0));
+  const percent = total ? Math.min(100, (Number(done || 0) / total) * 100) : 0;
+  const radius = 43;
+  const circumference = 2 * Math.PI * radius;
+  return <div className="relative h-44 w-44 shrink-0" aria-label={`${Math.round(percent)}% complete: ${number(done)} done and ${number(remaining)} remaining`} role="img"><svg viewBox="0 0 110 110" className="h-full w-full -rotate-90"><circle cx="55" cy="55" r={radius} fill="none" stroke="#e2e8f0" strokeWidth="11" /><circle cx="55" cy="55" r={radius} fill="none" stroke="#10b981" strokeWidth="11" strokeLinecap="round" strokeDasharray={`${(percent / 100) * circumference} ${circumference}`} className="transition-all duration-700" /></svg><div className="absolute inset-0 grid place-items-center text-center"><div><p className="text-3xl font-black text-slate-950">{Math.round(percent)}%</p><p className="text-[10px] font-black uppercase tracking-wide text-slate-500">{label}</p></div></div></div>;
 }
 
 function snapshotToProgress(metrics) {
@@ -120,7 +129,7 @@ function pipelinePhaseDetails(job) {
   return label;
 }
 
-export default function Dashboard({ data, onNavigate }) {
+export default function Dashboard({ data, onNavigate, onOpenSettings }) {
   const library = buildPartsLibrary(data);
   const completed = library.length;
   const recent = library.slice(0, 5);
@@ -170,6 +179,11 @@ export default function Dashboard({ data, onNavigate }) {
   const enrichedParts = Number(progress.parts_with_facts || 0);
   const verifiedParts = Number(progress.online_verified_parts || 0);
   const totalPages = Number(progress.source_pages || 0);
+  const trackedSchedule = rowSchedules[0] || null;
+  const chartDone = trackedSchedule ? Number(trackedSchedule.processed_rows || 0) : scannedRows;
+  const chartRemaining = trackedSchedule ? Number(trackedSchedule.remaining_rows || 0) : rawRemaining;
+  const chartLabel = trackedSchedule ? "Rows complete" : "Rows scanned";
+  const scheduleNeedsResume = ["paused", "failed"].includes(trackedSchedule?.job_status);
   const stages = [
     { label: "Combined CSV rows", done: scannedRows, total: rawRows, left: rawRemaining, tone: "bg-cyan-500", detail: "Rows scanned from all source files" },
     { label: "Usable rows", done: usableRows, total: scannedRows, left: Number(progress.invalid_rows || 0), tone: "bg-blue-500", detail: "Rows with usable identity" },
@@ -265,8 +279,17 @@ export default function Dashboard({ data, onNavigate }) {
     finally { setActionBusy(""); }
   }
 
-  return <div className="space-y-6">
+  function progressAction() {
+    if (!trackedSchedule) { onOpenSettings?.(); return; }
+    if (scheduleNeedsResume) { controlRowSchedule(trackedSchedule, "resume-job"); return; }
+    if (activeRowBatch) { onNavigate("enrichment"); return; }
+    if (Number(trackedSchedule.remaining_rows || 0)) { controlRowSchedule(trackedSchedule, "run"); return; }
+    onNavigate("enrichment");
+  }
+
+   return <div className="space-y-6">
     <section className="overflow-hidden rounded-3xl bg-gradient-to-br from-slate-950 via-blue-950 to-emerald-950 text-white shadow-panel"><div className="grid gap-8 p-6 sm:p-8 lg:grid-cols-[1.35fr_0.65fr] lg:items-center"><div><div className="flex flex-wrap items-center gap-2"><p className="text-xs font-black uppercase tracking-[0.18em] text-cyan-300">Raw data processing status</p><span className={`rounded-full px-2.5 py-1 text-[10px] font-black uppercase ${catalogProgress?.live ? "bg-emerald-400 text-emerald-950" : "bg-white/10 text-slate-300"}`}>{catalogProgress?.live ? "Live from this Mac" : "Published snapshot"}</span></div><h3 className="mt-3 text-2xl font-black tracking-tight sm:text-3xl">{catalogProgress ? `${number(scannedRows)} of ${number(rawRows)} raw rows scanned` : "Loading catalog progress…"}</h3><p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">This measures CSV consolidation. Parts that still need product facts or online checks are already in Master—they are enrichment work, not unprocessed raw rows.</p><div className="mt-6 h-3 overflow-hidden rounded-full bg-white/15" aria-label={`${Math.round(scanPercent)}% of raw rows scanned`}><div className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-emerald-400 transition-all" style={{ width: `${scanPercent}%` }} /></div><div className="mt-3 flex flex-wrap justify-between gap-2 text-xs font-bold text-slate-300"><span>{scanPercent.toFixed(1)}% scanned</span><span>{number(rawRemaining)} raw rows remaining</span></div></div><div className="grid grid-cols-2 gap-3"><button type="button" onClick={() => onNavigate("master")} className="rounded-xl bg-white px-4 py-4 text-left text-sm font-semibold text-slate-900 hover:bg-cyan-50"><Database className="mb-3 text-emerald-600" size={21} />Open Master Data<ArrowRight className="mt-3" size={17} /></button><button type="button" onClick={() => onNavigate("enrichment")} className="rounded-xl border border-white/20 bg-white/10 px-4 py-4 text-left text-sm font-semibold text-white hover:bg-white/15"><Gauge className="mb-3 text-cyan-300" size={21} />Open Enrichment<ArrowRight className="mt-3" size={17} /></button></div></div></section>
+    <section className="rounded-3xl border border-emerald-200 bg-white p-5 shadow-panel sm:p-6" aria-label="Done and remaining progress"><div className="grid gap-6 lg:grid-cols-[auto_1fr_auto] lg:items-center"><ProgressDonut done={chartDone} remaining={chartRemaining} label={chartLabel} /><div><p className="text-xs font-black uppercase tracking-[0.16em] text-emerald-700">Visual completion</p><h3 className="mt-1 text-2xl font-black text-slate-950">{trackedSchedule ? trackedSchedule.name : "Overall row processing"}</h3><p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">{trackedSchedule ? `${number(chartDone)} rows are done and ${number(chartRemaining)} remain. The schedule runs ${number(trackedSchedule.batch_size)} rows every ${number(trackedSchedule.interval_minutes)} minutes.` : `${number(chartDone)} rows are done and ${number(chartRemaining)} remain in the current raw-row scan. Create a row schedule to process the remaining rows automatically.`}</p><div className="mt-4 flex flex-wrap gap-3 text-xs font-black"><span className="rounded-full bg-emerald-100 px-3 py-1.5 text-emerald-800">Done: {number(chartDone)}</span><span className="rounded-full bg-amber-100 px-3 py-1.5 text-amber-800">Remaining: {number(chartRemaining)}</span>{trackedSchedule?.in_progress_rows > 0 && <span className="rounded-full bg-blue-100 px-3 py-1.5 text-blue-800">In progress: {number(trackedSchedule.in_progress_rows)}</span>}</div></div><div className="flex min-w-52 flex-col gap-2">{scheduleNeedsResume ? <button type="button" disabled={Boolean(actionBusy)} onClick={progressAction} className="inline-flex items-center justify-center gap-2 rounded-xl bg-brand-600 px-4 py-3 text-sm font-black text-white disabled:opacity-50"><Play size={17} />Resume batch</button> : <button type="button" disabled={Boolean(actionBusy) || activeRowBatch} onClick={progressAction} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-3 text-sm font-black text-white disabled:opacity-50"><Timer size={17} />{trackedSchedule ? chartRemaining ? activeRowBatch ? "Open active batch" : "Run next batch" : "Open enrichment" : "Set up row schedule"}</button>}<button type="button" onClick={() => onNavigate("enrichment")} className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 px-4 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50"><Gauge size={17} />Open enrichment</button></div></div></section>
 
     {!catalogProgress ? <div className="grid min-h-40 place-items-center rounded-3xl border border-slate-200 bg-white"><LoaderCircle className="animate-spin text-brand-600" size={28} /></div> : <>
       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8" aria-label="Raw data and master progress metrics"><ProgressMetric label="CSV files" value={progress.discovered_files} detail={`${number(progress.indexed_files)} fully scanned`} /><ProgressMetric label="Source size" value={formatBytes(totalBytes)} detail="Combined raw CSV size" /><ProgressMetric label="Raw rows" value={rawRows} detail={`${number(scannedRows)} scanned`} /><ProgressMetric label="Rows remaining" value={rawRemaining} detail="Still waiting for scan" tone={rawRemaining ? "text-amber-700" : "text-emerald-700"} /><ProgressMetric label="Unique Master parts" value={progress.master_parts} detail={`${number(masterRemaining)} known parts missing`} tone="text-blue-700" /><ProgressMetric label="Need product facts" value={progress.remaining_fact_parts} detail="Already in Master" tone="text-violet-700" /><ProgressMetric label="Pages checked" value={progress.processed_source_pages} detail={`${number(progress.source_pages)} linked pages total`} tone="text-cyan-700" /><ProgressMetric label="Pages remaining" value={progress.pending_source_pages} detail="Controlled online checks" tone="text-amber-700" /></section>

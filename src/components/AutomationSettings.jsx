@@ -70,11 +70,10 @@ export default function AutomationSettings() {
 
   async function createRowSchedule(event) {
     event.preventDefault();
-    if (!rowForm.datasetId) { setNotice({ type: "error", message: "Choose an imported dataset for the row schedule." }); return; }
     setBusy("row-create"); setNotice({ type: "", message: "" });
     try {
       await localDataApi.createEnrichmentSchedule({ ...rowForm, batchSize: Number(rowForm.batchSize), intervalMinutes: Number(rowForm.intervalMinutes) });
-      setNotice({ type: "success", message: `Row schedule created: up to ${number(rowForm.batchSize)} rows every ${number(rowForm.intervalMinutes)} minutes. The first batch will start shortly.` });
+      setNotice({ type: "success", message: `All CSV sources scheduled: up to ${number(rowForm.batchSize)} rows every ${number(rowForm.intervalMinutes)} minutes. The first batch will start shortly.` });
       await load();
     } catch (error) { setNotice({ type: "error", message: error.message }); }
     finally { setBusy(""); }
@@ -182,7 +181,7 @@ export default function AutomationSettings() {
     <section className="overflow-hidden rounded-2xl border border-cyan-200 bg-cyan-50/40">
       <header className="border-b border-cyan-100 px-5 py-4"><div className="flex items-center gap-2"><Timer className="text-cyan-700" size={20} /><h3 className="font-bold text-ink">Resumable row batches</h3></div><p className="mt-1 text-xs leading-5 text-slate-600">Process a fixed number of source rows, wait between batches, and continue from the saved checkpoint. Completed and remaining counts are shown on the Dashboard and Enrichment pages.</p></header>
       <form onSubmit={createRowSchedule} className="grid gap-3 bg-white p-5 sm:grid-cols-2 lg:grid-cols-5">
-        <label className="text-xs font-bold uppercase tracking-wide text-slate-600 lg:col-span-2">Dataset<select value={rowForm.datasetId} onChange={(event) => updateRow("datasetId", event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium normal-case tracking-normal"><option value="">Select imported data…</option>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.name} · {number(dataset.row_count)} rows</option>)}</select></label>
+        <label className="text-xs font-bold uppercase tracking-wide text-slate-600 lg:col-span-2">CSV scope<select value={rowForm.datasetId || "all"} onChange={(event) => updateRow("datasetId", event.target.value === "all" ? "" : event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium normal-case tracking-normal"><option value="all">All CSV sources · {number(datasets.reduce((sum, dataset) => sum + Number(dataset.row_count || 0), 0))} rows</option>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.name} · {number(dataset.row_count)} rows</option>)}</select></label>
         <label className="text-xs font-bold uppercase tracking-wide text-slate-600">Rows per batch<input type="number" min="1" max="10000" value={rowForm.batchSize} onChange={(event) => updateRow("batchSize", event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium normal-case tracking-normal" /></label>
         <label className="text-xs font-bold uppercase tracking-wide text-slate-600">Interval (minutes)<input type="number" min="1" max="1440" value={rowForm.intervalMinutes} onChange={(event) => updateRow("intervalMinutes", event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium normal-case tracking-normal" /></label>
         <button type="submit" disabled={Boolean(busy)} className="mt-auto inline-flex items-center justify-center gap-2 rounded-xl bg-cyan-700 px-4 py-2.5 text-sm font-bold text-white hover:bg-cyan-800 disabled:opacity-50">{busy === "row-create" ? <LoaderCircle className="animate-spin" size={17} /> : <Timer size={17} />}Create row schedule</button>
