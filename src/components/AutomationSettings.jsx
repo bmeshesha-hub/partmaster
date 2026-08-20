@@ -1,4 +1,4 @@
-import { AlarmClock, CalendarClock, CirclePause, CirclePlay, HardDrive, LoaderCircle, Play, RefreshCw, Trash2 } from "lucide-react";
+import { AlarmClock, CalendarClock, CirclePause, CirclePlay, HardDrive, LoaderCircle, Play, RefreshCw, Timer, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { localDataApi } from "../utils/localDataApi.js";
 
@@ -31,7 +31,10 @@ export default function AutomationSettings() {
   const [available, setAvailable] = useState(null);
   const [form, setForm] = useState(() => ({ ...DEFAULT_FORM, runAt: localDateTimeInput() }));
   const [sources, setSources] = useState([]);
+  const [datasets, setDatasets] = useState([]);
   const [schedules, setSchedules] = useState([]);
+  const [rowSchedules, setRowSchedules] = useState([]);
+  const [rowForm, setRowForm] = useState({ name: "Resumable row enrichment", datasetId: "", batchSize: 1000, intervalMinutes: 20 });
   const [activeJob, setActiveJob] = useState(null);
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState({ type: "", message: "" });
@@ -40,10 +43,12 @@ export default function AutomationSettings() {
     try {
       const health = await localDataApi.health();
       if (!health?.ok) throw new Error("Local data service is unavailable.");
-      const [scheduleResult, sourceResult] = await Promise.all([localDataApi.pipelineSchedules(), localDataApi.pipelineSources()]);
+      const [scheduleResult, sourceResult, datasetResult, rowScheduleResult] = await Promise.all([localDataApi.pipelineSchedules(), localDataApi.pipelineSources(), localDataApi.datasets(), localDataApi.enrichmentSchedules()]);
       setSchedules(scheduleResult.schedules || []);
       setActiveJob(scheduleResult.activeJob || null);
       setSources((sourceResult.sources || []).filter((source) => source.dataset_id && Number(source.pending_source_pages || 0) > 0));
+      setDatasets(datasetResult.datasets || []);
+      setRowSchedules(rowScheduleResult.schedules || []);
       setAvailable(true);
     } catch {
       setAvailable(false);
@@ -61,6 +66,41 @@ export default function AutomationSettings() {
   const scopeLabel = selectedSource?.source_file || "All raw CSV sources";
 
   function update(field, value) { setForm((current) => ({ ...current, [field]: value })); }
+  function updateRow(field, value) { setRowForm((current) => ({ ...current, [field]: value })); }
+
+  async function createRowSchedule(event) {
+    event.preventDefault();
+    if (!rowForm.datasetId) { setNotice({ type: "error", message: "Choose an imported dataset for the row schedule." }); return; }
+    setBusy("row-create"); setNotice({ type: "", message: "" });
+    try {
+      await localDataApi.createEnrichmentSchedule({ ...rowForm, batchSize: Number(rowForm.batchSize), intervalMinutes: Number(rowForm.intervalMinutes) });
+      setNotice({ type: "success", message: `Row schedule created: up to ${number(rowForm.batchSize)} rows every ${number(rowForm.intervalMinutes)} minutes. The first batch will start shortly.` });
+      await load();
+    } catch (error) { setNotice({ type: "error", message: error.message }); }
+    finally { setBusy(""); }
+  }
+
+  async function toggleRowSchedule(schedule) {
+    setBusy(schedule.id); setNotice({ type: "", message: "" });
+    try { await localDataApi.updateEnrichmentSchedule(schedule.id, { enabled: !schedule.enabled }); await load(); }
+    catch (error) { setNotice({ type: "error", message: error.message }); }
+    finally { setBusy(""); }
+  }
+
+  async function runRowSchedule(schedule) {
+    setBusy(schedule.id); setNotice({ type: "", message: "" });
+    try { const result = await localDataApi.runEnrichmentSchedule(schedule.id); setNotice({ type: "success", message: result.jobId ? `${schedule.name} started the next row batch.` : "No remaining rows were found." }); await load(); }
+    catch (error) { setNotice({ type: "error", message: error.message }); }
+    finally { setBusy(""); }
+  }
+
+  async function removeRowSchedule(schedule) {
+    if (!window.confirm(`Delete “${schedule.name}”? Completed row work will remain saved.`)) return;
+    setBusy(schedule.id);
+    try { await localDataApi.deleteEnrichmentSchedule(schedule.id); await load(); }
+    catch (error) { setNotice({ type: "error", message: error.message }); }
+    finally { setBusy(""); }
+  }
 
   async function submit(event) {
     event.preventDefault();
@@ -138,6 +178,16 @@ export default function AutomationSettings() {
     <section className="overflow-hidden rounded-2xl border border-slate-200">
       <header className="flex items-center justify-between gap-3 border-b border-slate-200 bg-white px-5 py-4"><div><h3 className="font-bold text-ink">Saved schedules</h3><p className="mt-1 text-xs text-slate-500">Stored in the local database on this Mac.</p></div><button type="button" onClick={load} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100" aria-label="Refresh schedules"><RefreshCw size={17} /></button></header>
       {!schedules.length ? <p className="bg-slate-50 px-5 py-10 text-center text-sm text-slate-500">No scheduled jobs yet.</p> : <div className="divide-y divide-slate-200 bg-white">{schedules.map((schedule) => <article key={schedule.id} className="flex flex-wrap items-center justify-between gap-4 px-5 py-4"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h4 className="font-bold text-slate-900">{schedule.name}</h4><span className={`rounded-full px-2 py-1 text-[10px] font-black uppercase ${schedule.enabled ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-600"}`}>{schedule.enabled ? "Active" : schedule.schedule_type === "once" && schedule.last_run_at ? "Completed" : "Paused"}</span></div><p className="mt-1 text-xs text-slate-500">{schedule.schedule_type === "daily" ? `Daily at ${schedule.time_of_day}` : `Once · ${displayDate(schedule.run_at)}`} · {schedule.run_all_remaining ? "all remaining pages" : `${number(schedule.online_budget)} pages`} · {schedule.dataset_ids ? "selected CSV" : "all CSVs"}</p><p className="mt-1 text-[11px] text-slate-400">Next: {schedule.enabled ? displayDate(schedule.next_run_at) : "not scheduled"} · Last: {schedule.last_run_at ? `${displayDate(schedule.last_run_at)} (${schedule.job_status || schedule.last_status || "started"})` : "never"}</p>{schedule.job_error && <p className="mt-1 text-xs font-semibold text-red-600">{schedule.job_error}</p>}</div><div className="flex items-center gap-1.5"><button type="button" onClick={() => runNow(schedule)} disabled={Boolean(busy) || Boolean(activeJob)} title="Start this schedule immediately" className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-40"><CirclePlay size={15} />Run now</button>{schedule.schedule_type === "daily" && <button type="button" onClick={() => toggle(schedule)} disabled={Boolean(busy)} title={schedule.enabled ? "Pause this daily schedule" : "Enable this daily schedule"} className="rounded-lg border border-slate-300 p-2 text-slate-600 hover:bg-slate-50">{schedule.enabled ? <CirclePause size={16} /> : <CirclePlay size={16} />}</button>}<button type="button" onClick={() => remove(schedule)} disabled={Boolean(busy)} title="Delete schedule" className="rounded-lg border border-red-200 p-2 text-red-600 hover:bg-red-50"><Trash2 size={16} /></button></div></article>)}</div>}
+    </section>
+    <section className="overflow-hidden rounded-2xl border border-cyan-200 bg-cyan-50/40">
+      <header className="border-b border-cyan-100 px-5 py-4"><div className="flex items-center gap-2"><Timer className="text-cyan-700" size={20} /><h3 className="font-bold text-ink">Resumable row batches</h3></div><p className="mt-1 text-xs leading-5 text-slate-600">Process a fixed number of source rows, wait between batches, and continue from the saved checkpoint. Completed and remaining counts are shown on the Dashboard and Enrichment pages.</p></header>
+      <form onSubmit={createRowSchedule} className="grid gap-3 bg-white p-5 sm:grid-cols-2 lg:grid-cols-5">
+        <label className="text-xs font-bold uppercase tracking-wide text-slate-600 lg:col-span-2">Dataset<select value={rowForm.datasetId} onChange={(event) => updateRow("datasetId", event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium normal-case tracking-normal"><option value="">Select imported data…</option>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.name} · {number(dataset.row_count)} rows</option>)}</select></label>
+        <label className="text-xs font-bold uppercase tracking-wide text-slate-600">Rows per batch<input type="number" min="1" max="10000" value={rowForm.batchSize} onChange={(event) => updateRow("batchSize", event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium normal-case tracking-normal" /></label>
+        <label className="text-xs font-bold uppercase tracking-wide text-slate-600">Interval (minutes)<input type="number" min="1" max="1440" value={rowForm.intervalMinutes} onChange={(event) => updateRow("intervalMinutes", event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium normal-case tracking-normal" /></label>
+        <button type="submit" disabled={Boolean(busy)} className="mt-auto inline-flex items-center justify-center gap-2 rounded-xl bg-cyan-700 px-4 py-2.5 text-sm font-bold text-white hover:bg-cyan-800 disabled:opacity-50">{busy === "row-create" ? <LoaderCircle className="animate-spin" size={17} /> : <Timer size={17} />}Create row schedule</button>
+      </form>
+      {rowSchedules.length ? <div className="divide-y divide-cyan-100 bg-white">{rowSchedules.map((schedule) => <article key={schedule.id} className="flex flex-wrap items-center justify-between gap-4 px-5 py-4"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h4 className="font-bold text-slate-900">{schedule.name}</h4><span className={`rounded-full px-2 py-1 text-[10px] font-black uppercase ${schedule.enabled ? "bg-emerald-100 text-emerald-800" : "bg-slate-200 text-slate-600"}`}>{schedule.enabled ? "Active" : "Paused"}</span></div><p className="mt-1 text-xs text-slate-500">{schedule.dataset_name} · {number(schedule.batch_size)} rows every {number(schedule.interval_minutes)} minutes</p><p className="mt-1 text-[11px] text-slate-500"><span className="font-bold text-emerald-700">{number(schedule.processed_rows)} done</span> · <span className="font-bold text-amber-700">{number(schedule.remaining_rows)} remaining</span> · Next: {schedule.enabled ? displayDate(schedule.next_run_at) : "not scheduled"}</p></div><div className="flex items-center gap-1.5"><button type="button" onClick={() => runRowSchedule(schedule)} disabled={Boolean(busy)} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-40"><CirclePlay size={15} />Run next</button><button type="button" onClick={() => toggleRowSchedule(schedule)} disabled={Boolean(busy)} title={schedule.enabled ? "Pause this row schedule" : "Resume this row schedule"} className="rounded-lg border border-slate-300 p-2 text-slate-600 hover:bg-slate-50 disabled:opacity-40">{schedule.enabled ? <CirclePause size={16} /> : <CirclePlay size={16} />}</button><button type="button" onClick={() => removeRowSchedule(schedule)} disabled={Boolean(busy)} className="rounded-lg border border-red-200 p-2 text-red-600 hover:bg-red-50 disabled:opacity-40"><Trash2 size={16} /></button></div></article>)}</div> : <p className="bg-white px-5 py-8 text-center text-sm text-slate-500">No row schedules yet.</p>}
     </section>
     <p className="rounded-xl bg-blue-50 px-4 py-3 text-xs leading-5 text-blue-800"><strong>Mac requirement:</strong> leave the Mac awake and keep <code>npm run dev:local</code> running. If the service is closed at the scheduled time, an overdue job starts when the service is opened again.</p>
   </div>;

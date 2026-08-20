@@ -35,6 +35,12 @@ function formatBytes(bytes) {
   return `${(value / (1024 ** index)).toFixed(index > 1 ? 2 : 1)} ${units[index]}`;
 }
 
+function displayDate(value) {
+  if (!value) return "—";
+  const parsed = new Date(String(value).replace(" ", "T"));
+  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
 function ControlHint({ children, dark = false }) {
   return <span className={`mt-1.5 flex items-start gap-1.5 text-[11px] font-medium normal-case leading-4 tracking-normal ${dark ? "text-slate-300" : "text-slate-500"}`}><CircleHelp className="mt-0.5 shrink-0" size={12} aria-hidden="true" />{children}</span>;
 }
@@ -555,6 +561,7 @@ export default function EnrichmentManager() {
   const [connected, setConnected] = useState(null);
   const [datasets, setDatasets] = useState([]);
   const [jobs, setJobs] = useState([]);
+  const [rowSchedules, setRowSchedules] = useState([]);
   const [stats, setStats] = useState({ parts: 0, families: 0, applications: 0, attributed_variants: 0, compatibility_fitments: 0, compatibility_parts: 0, cached_pages: 0, candidate_attribute_facts: 0, awaiting_review: 0, enriched_candidates: 0 });
   const [quality, setQuality] = useState({ total_parts: 0, incomplete_parts: 0, duplicate_part_keys: 0, low_confidence_parts: 0, total_applications: 0, mapped_applications: 0, applications_with_side: 0, applications_with_position: 0, compatibility_fitments: 0, meaningful_variant_attributes: 0, awaiting_review: 0 });
   const [selectedJobId, setSelectedJobId] = useState("");
@@ -578,12 +585,13 @@ export default function EnrichmentManager() {
 
   const refresh = useCallback(async () => {
     try {
-      const [datasetResult, jobResult, statsResult, qualityResult] = await Promise.all([localDataApi.datasets(), localDataApi.enrichmentJobs(), localDataApi.masterStats(), localDataApi.masterQuality()]);
+      const [datasetResult, jobResult, statsResult, qualityResult, rowScheduleResult] = await Promise.all([localDataApi.datasets(), localDataApi.enrichmentJobs(), localDataApi.masterStats(), localDataApi.masterQuality(), localDataApi.enrichmentSchedules()]);
       setConnected(true);
       setDatasets(datasetResult.datasets);
       setJobs(jobResult.jobs);
       setStats(statsResult.stats);
       setQuality(qualityResult.quality);
+      setRowSchedules(rowScheduleResult.schedules || []);
       setForm((current) => ({ ...current, datasetId: current.datasetId || datasetResult.datasets[0]?.id || "" }));
       setSelectedJobId((current) => current || jobResult.jobs[0]?.id || "");
       setError("");
@@ -670,6 +678,15 @@ export default function EnrichmentManager() {
     try {
       if (action === "pause") await localDataApi.pauseEnrichment(job.id);
       else await localDataApi.resumeEnrichment(job.id);
+      await refresh();
+    } catch (requestError) { setError(requestError.message); }
+  }
+
+  async function controlRowSchedule(schedule, action) {
+    try {
+      if (action === "resume-job" && schedule.last_job_id) await localDataApi.resumeEnrichment(schedule.last_job_id);
+      else if (action === "run") await localDataApi.runEnrichmentSchedule(schedule.id);
+      else await localDataApi.updateEnrichmentSchedule(schedule.id, { enabled: action === "enable" });
       await refresh();
     } catch (requestError) { setError(requestError.message); }
   }
@@ -799,6 +816,8 @@ export default function EnrichmentManager() {
 
     <FullDatasetPipeline />
 
+    {rowSchedules.length > 0 && <section className="rounded-2xl border border-cyan-200 bg-cyan-50/40 p-5 shadow-panel sm:p-6"><div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="flex items-center gap-2 text-lg font-semibold text-slate-950"><RefreshCw className="text-cyan-700" size={21} />Resumable row schedules</h3><p className="mt-1 text-sm text-slate-600">Each schedule advances from its saved source-row checkpoint. Use Resume when a batch was paused or failed.</p></div><span className="rounded-full bg-white px-3 py-1.5 text-xs font-black text-cyan-800 ring-1 ring-cyan-200">{rowSchedules.filter((schedule) => schedule.enabled).length} active</span></div><div className="mt-4 grid gap-3 lg:grid-cols-2">{rowSchedules.map((schedule) => { const needsResume = ["paused", "failed"].includes(schedule.job_status); return <article key={schedule.id} className="rounded-xl border border-cyan-100 bg-white p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-bold text-slate-900">{schedule.name}</p><p className="mt-1 text-xs text-slate-500">{schedule.dataset_name} · {Number(schedule.batch_size).toLocaleString()} rows every {Number(schedule.interval_minutes).toLocaleString()} minutes</p></div><span className={`rounded-full px-2.5 py-1 text-[10px] font-black uppercase ${schedule.enabled ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-600"}`}>{schedule.enabled ? "Active" : "Paused"}</span></div><div className="mt-4 grid grid-cols-3 gap-2"><div className="rounded-lg bg-emerald-50 p-2"><p className="text-[10px] font-bold uppercase text-emerald-700">Done</p><p className="mt-1 font-black text-emerald-950">{Number(schedule.processed_rows).toLocaleString()}</p></div><div className="rounded-lg bg-amber-50 p-2"><p className="text-[10px] font-bold uppercase text-amber-700">Remaining</p><p className="mt-1 font-black text-amber-950">{Number(schedule.remaining_rows).toLocaleString()}</p></div><div className="rounded-lg bg-slate-50 p-2"><p className="text-[10px] font-bold uppercase text-slate-600">Next run</p><p className="mt-1 truncate text-xs font-black text-slate-900" title={displayDate(schedule.next_run_at)}>{schedule.enabled ? displayDate(schedule.next_run_at) : "—"}</p></div></div><div className="mt-4 flex flex-wrap gap-2">{needsResume ? <button type="button" onClick={() => controlRowSchedule(schedule, "resume-job")} className="inline-flex items-center gap-1.5 rounded-lg bg-brand-600 px-3 py-2 text-xs font-bold text-white"><Play size={14} />Resume batch</button> : <button type="button" onClick={() => controlRowSchedule(schedule, "run")} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold text-slate-700"><Play size={14} />Run next batch</button>}<button type="button" onClick={() => controlRowSchedule(schedule, schedule.enabled ? "disable" : "enable")} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold text-slate-700">{schedule.enabled ? <Pause size={14} /> : <Play size={14} />}{schedule.enabled ? "Pause schedule" : "Resume schedule"}</button></div></article>; })}</div></section>}
+
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
       {[{ label: "Canonical parts", value: stats.parts }, { label: "New product facts", value: stats.candidate_attribute_facts }, { label: "Variant families", value: stats.families }, { label: "Compatibility fitments", value: stats.compatibility_fitments }, { label: "Part applications", value: stats.applications }].map((metric) => <article key={metric.label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel"><p className="text-sm font-medium text-slate-500">{metric.label}</p><p className="mt-2 text-3xl font-bold">{Number(metric.value || 0).toLocaleString()}</p></article>)}
     </section>
@@ -806,7 +825,7 @@ export default function EnrichmentManager() {
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel sm:p-6"><div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="flex items-center gap-2 text-lg font-semibold"><BadgeCheck className="text-emerald-600" size={21} />Master data quality</h3><p className="mt-1 text-sm text-slate-500">Integrity checks separate true data problems from optional fitment details that may not apply to every part.</p></div><span className={`rounded-full px-3 py-1.5 text-xs font-bold ${Number(quality.duplicate_part_keys) || Number(quality.incomplete_parts) ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}>{Number(quality.duplicate_part_keys) || Number(quality.incomplete_parts) ? "Needs attention" : "Core master is clean"}</span></div><div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><div className="rounded-xl bg-emerald-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-emerald-700">Core completeness</p><p className="mt-1 text-2xl font-bold text-emerald-950">{canonicalCompleteness}%</p><p className="mt-1 text-xs text-emerald-700">{Number(quality.incomplete_parts).toLocaleString()} incomplete canonical parts</p></div><div className="rounded-xl bg-blue-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-blue-700">Duplicate part keys</p><p className="mt-1 text-2xl font-bold text-blue-950">{Number(quality.duplicate_part_keys).toLocaleString()}</p><p className="mt-1 text-xs text-blue-700">Manufacturer + normalized OEM number</p></div><div className="rounded-xl bg-violet-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-violet-700">Vehicle mapping</p><p className="mt-1 text-2xl font-bold text-violet-950">{vehicleMappingCoverage}%</p><p className="mt-1 text-xs text-violet-700">{Number(quality.mapped_applications).toLocaleString()} of {Number(quality.total_applications).toLocaleString()} applications</p></div><div className="rounded-xl bg-amber-50 p-4"><p className="text-xs font-bold uppercase tracking-wide text-amber-700">Awaiting review</p><p className="mt-1 text-2xl font-bold text-amber-950">{Number(quality.awaiting_review).toLocaleString()}</p><p className="mt-1 text-xs text-amber-700">Held outside the canonical master</p></div></div><p className="mt-4 text-xs leading-5 text-slate-500">Optional evidence coverage: {Number(quality.applications_with_side).toLocaleString()} applications have a confirmed side, {Number(quality.applications_with_position).toLocaleString()} have a position, {Number(quality.compatibility_fitments).toLocaleString()} compatibility fitments are verified, and {Number(quality.meaningful_variant_attributes).toLocaleString()} meaningful variant attributes are stored. Missing optional fields are not treated as duplicates or invented.</p></section>
 
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-panel sm:p-6">
-      <div className="flex flex-wrap items-start justify-between gap-4"><div><h3 className="flex items-center gap-2 text-lg font-semibold"><SearchCheck className="text-brand-600" size={21} />Start a safe test batch</h3><p className="mt-1 max-w-3xl text-sm text-slate-500">The worker deduplicates candidates, checks their source pages, and auto-promotes only high-confidence evidence. Begin with 1,000 unique parts.</p></div><button type="button" onClick={exportMaster} disabled={!Number(stats.parts)} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-40"><Download size={17} />Export master CSVs</button></div>
+      <div className="flex flex-wrap items-start justify-between gap-4"><div><h3 className="flex items-center gap-2 text-lg font-semibold"><SearchCheck className="text-brand-600" size={21} />Start a safe test batch</h3><p className="mt-1 max-w-3xl text-sm text-slate-500">The worker deduplicates candidates, checks their source pages, and auto-promotes only high-confidence evidence. Begin with 1,000 unique parts.</p></div><div className="flex flex-wrap gap-2"><button type="button" onClick={searchMissingOemBatch} disabled={batchSearching} className="inline-flex items-center gap-2 rounded-xl border border-cyan-300 bg-cyan-50 px-4 py-2.5 text-sm font-semibold text-cyan-800 disabled:opacity-40">{batchSearching ? <LoaderCircle className="animate-spin" size={17} /> : <SearchCheck size={17} />}Find missing OEMs</button><button type="button" onClick={exportMaster} disabled={!Number(stats.parts)} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-40"><Download size={17} />Export master CSVs</button></div></div>
       <form onSubmit={startJob} className="mt-5 grid gap-3 lg:grid-cols-6">
         <label className="text-sm font-medium text-slate-700 lg:col-span-2">Dataset<select value={form.datasetId} onChange={(event) => setForm((current) => ({ ...current, datasetId: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5"><option value="">Select imported data…</option>{datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.name} · {Number(dataset.row_count).toLocaleString()} rows</option>)}</select><ControlHint>The imported CSV whose rows will be prepared for evidence review.</ControlHint></label>
         <label className="text-sm font-medium text-slate-700">Candidates<input type="number" min="1" max="10000" value={form.requestedCandidates} onChange={(event) => setForm((current) => ({ ...current, requestedCandidates: Number(event.target.value) }))} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5" /><ControlHint>Maximum unique parts to prepare from the selected source.</ControlHint></label>

@@ -32,6 +32,12 @@ function formatBytes(bytes) {
   return `${(value / (1024 ** index)).toFixed(index > 1 ? 2 : 1)} ${units[index]}`;
 }
 
+function formatScheduleDate(value) {
+  if (!value) return "—";
+  const parsed = new Date(String(value).replace(" ", "T"));
+  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
 function MetricCard({ icon, label, value, detail, tone = "blue" }) {
   const tones = {
     blue: "bg-blue-50 text-blue-700",
@@ -55,6 +61,7 @@ function snapshotToProgress(metrics) {
     generated_at: metrics.generated_at,
     live: false,
     job: null,
+    batchSchedules: [],
     sources,
     summary: {
       discovered_files: sources.length,
@@ -125,8 +132,8 @@ export default function Dashboard({ data, onNavigate }) {
   const [backlogView, setBacklogView] = useState("");
 
   const loadLiveProgress = useCallback(async () => {
-    const [sourceAudit, pipelineJobs] = await Promise.all([localDataApi.pipelineSources(), localDataApi.pipelineJobs()]);
-    setCatalogProgress({ ...sourceAudit, generated_at: new Date().toISOString(), live: true, job: pipelineJobs.jobs?.[0] || null });
+    const [sourceAudit, pipelineJobs, rowScheduleResult] = await Promise.all([localDataApi.pipelineSources(), localDataApi.pipelineJobs(), localDataApi.enrichmentSchedules()]);
+    setCatalogProgress({ ...sourceAudit, generated_at: new Date().toISOString(), live: true, job: pipelineJobs.jobs?.[0] || null, batchSchedules: rowScheduleResult.schedules || [] });
   }, []);
 
   useEffect(() => {
@@ -146,6 +153,7 @@ export default function Dashboard({ data, onNavigate }) {
 
   const progress = catalogProgress?.summary || {};
   const sources = catalogProgress?.sources || [];
+  const rowSchedules = catalogProgress?.batchSchedules || [];
   const rawRows = Number(progress.known_raw_rows || 0);
   const scannedRows = Number(progress.indexed_raw_rows || 0);
   const rawRemaining = Number(progress.pending_scan_rows || 0);
@@ -154,6 +162,7 @@ export default function Dashboard({ data, onNavigate }) {
   const totalBytes = sources.reduce((sum, source) => sum + Number(source.source_bytes || 0), 0);
   const pipelineStatus = catalogProgress?.job?.status || (rawRows && !rawRemaining ? "completed" : "snapshot");
   const activePipeline = ["queued", "running"].includes(catalogProgress?.job?.status);
+  const activeRowBatch = rowSchedules.some((schedule) => ["queued", "running"].includes(schedule.job_status));
   const activeJobProgress = pipelineJobProgress(catalogProgress?.job);
   const activeDatasetIds = String(catalogProgress?.job?.dataset_ids || "").split(",").filter(Boolean);
   const usableRows = Math.max(0, Number(progress.usable_rows || 0));
@@ -170,10 +179,10 @@ export default function Dashboard({ data, onNavigate }) {
   ];
 
   useEffect(() => {
-    if (!catalogProgress?.live || !activePipeline) return undefined;
+    if (!catalogProgress?.live || (!activePipeline && !activeRowBatch)) return undefined;
     const timer = window.setInterval(() => loadLiveProgress().catch(() => {}), 5000);
     return () => window.clearInterval(timer);
-  }, [activePipeline, catalogProgress?.live, loadLiveProgress]);
+  }, [activePipeline, activeRowBatch, catalogProgress?.live, loadLiveProgress]);
 
   function selectedBudget(pagesLeft) {
     return enrichmentRunSize === "all" ? Number(pagesLeft || 0) : Math.min(Number(enrichmentRunSize), Number(pagesLeft || 0));
@@ -244,6 +253,18 @@ export default function Dashboard({ data, onNavigate }) {
     else if (pending?.kind === "all") await runAllSourcesEnrichment();
   }
 
+  async function controlRowSchedule(schedule, action) {
+    setActionBusy(`row-${schedule.id}`); setActionNotice({ type: "", message: "" });
+    try {
+      if (action === "resume-job" && schedule.last_job_id) await localDataApi.resumeEnrichment(schedule.last_job_id);
+      else if (action === "run") await localDataApi.runEnrichmentSchedule(schedule.id);
+      else await localDataApi.updateEnrichmentSchedule(schedule.id, { enabled: action === "enable" });
+      await loadLiveProgress();
+      setActionNotice({ type: "success", message: action === "resume-job" ? `${schedule.name}: saved batch resumed.` : action === "run" ? `${schedule.name}: next row batch started.` : `${schedule.name}: schedule ${action === "enable" ? "resumed" : "paused"}.` });
+    } catch (error) { setActionNotice({ type: "error", message: error.message }); }
+    finally { setActionBusy(""); }
+  }
+
   return <div className="space-y-6">
     <section className="overflow-hidden rounded-3xl bg-gradient-to-br from-slate-950 via-blue-950 to-emerald-950 text-white shadow-panel"><div className="grid gap-8 p-6 sm:p-8 lg:grid-cols-[1.35fr_0.65fr] lg:items-center"><div><div className="flex flex-wrap items-center gap-2"><p className="text-xs font-black uppercase tracking-[0.18em] text-cyan-300">Raw data processing status</p><span className={`rounded-full px-2.5 py-1 text-[10px] font-black uppercase ${catalogProgress?.live ? "bg-emerald-400 text-emerald-950" : "bg-white/10 text-slate-300"}`}>{catalogProgress?.live ? "Live from this Mac" : "Published snapshot"}</span></div><h3 className="mt-3 text-2xl font-black tracking-tight sm:text-3xl">{catalogProgress ? `${number(scannedRows)} of ${number(rawRows)} raw rows scanned` : "Loading catalog progress…"}</h3><p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">This measures CSV consolidation. Parts that still need product facts or online checks are already in Master—they are enrichment work, not unprocessed raw rows.</p><div className="mt-6 h-3 overflow-hidden rounded-full bg-white/15" aria-label={`${Math.round(scanPercent)}% of raw rows scanned`}><div className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-emerald-400 transition-all" style={{ width: `${scanPercent}%` }} /></div><div className="mt-3 flex flex-wrap justify-between gap-2 text-xs font-bold text-slate-300"><span>{scanPercent.toFixed(1)}% scanned</span><span>{number(rawRemaining)} raw rows remaining</span></div></div><div className="grid grid-cols-2 gap-3"><button type="button" onClick={() => onNavigate("master")} className="rounded-xl bg-white px-4 py-4 text-left text-sm font-semibold text-slate-900 hover:bg-cyan-50"><Database className="mb-3 text-emerald-600" size={21} />Open Master Data<ArrowRight className="mt-3" size={17} /></button><button type="button" onClick={() => onNavigate("enrichment")} className="rounded-xl border border-white/20 bg-white/10 px-4 py-4 text-left text-sm font-semibold text-white hover:bg-white/15"><Gauge className="mb-3 text-cyan-300" size={21} />Open Enrichment<ArrowRight className="mt-3" size={17} /></button></div></div></section>
 
@@ -255,6 +276,8 @@ export default function Dashboard({ data, onNavigate }) {
       </section>
 
       {activePipeline && <section className="relative overflow-hidden rounded-3xl border border-cyan-300 bg-slate-950 p-5 text-white shadow-xl sm:p-6" aria-live="polite"><div className="absolute -right-12 -top-12 h-40 w-40 animate-pulse rounded-full bg-cyan-400/20 blur-2xl" /><div className="relative flex flex-wrap items-start justify-between gap-4"><div className="flex items-start gap-3"><span className="relative mt-1 flex h-4 w-4"><span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" /><span className="relative inline-flex h-4 w-4 rounded-full bg-emerald-400" /></span><div><p className="text-xs font-black uppercase tracking-[0.16em] text-cyan-300">Background enrichment is running</p><h3 className="mt-1 text-xl font-black">{catalogProgress.job.name}</h3><p className="mt-1 text-sm text-slate-300">{pipelinePhaseDetails(catalogProgress.job)}</p></div></div><div className="text-right"><p className="text-3xl font-black text-cyan-300">{Math.round(activeJobProgress)}%</p><button type="button" onClick={() => onNavigate("enrichment")} className="mt-1 text-xs font-bold text-slate-300 underline decoration-white/30 underline-offset-4 hover:text-white">Open full job controls</button></div></div><div className="relative mt-5 h-4 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-violet-500 via-cyan-400 to-emerald-400 transition-all duration-700" style={{ width: `${activeJobProgress}%` }}><div className="h-full w-full animate-pulse bg-white/20" /></div></div><div className="relative mt-2 flex flex-wrap justify-between gap-2 text-[11px] font-bold text-slate-400"><span>{catalogProgress.job.current_dataset ? `Working on ${catalogProgress.job.current_dataset}` : "Preparing the next safe checkpoint"}</span><span>Refreshes every 5 seconds</span></div></section>}
+
+      {rowSchedules.length > 0 && <section className="rounded-3xl border border-cyan-200 bg-gradient-to-br from-cyan-50 via-white to-blue-50 p-5 shadow-panel sm:p-6" aria-label="Resumable row batch schedules"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-black uppercase tracking-[0.16em] text-cyan-700">Resumable row automation</p><h3 className="mt-1 text-2xl font-black text-slate-950">Done, remaining, and what runs next</h3><p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">Each schedule processes its configured row batch, waits for the configured interval, and resumes from the last saved source-row checkpoint.</p></div><button type="button" onClick={() => onNavigate("enrichment")} className="inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-4 py-2.5 text-xs font-black text-white hover:bg-cyan-800"><Gauge size={15} />Open enrichment controls</button></div><div className="mt-5 grid gap-3 lg:grid-cols-2">{rowSchedules.map((schedule) => { const needsResume = ["paused", "failed"].includes(schedule.job_status); const actionKey = `row-${schedule.id}`; return <article key={schedule.id} className="rounded-2xl border border-cyan-100 bg-white p-4"><div className="flex flex-wrap items-start justify-between gap-3"><div><h4 className="font-black text-slate-950">{schedule.name}</h4><p className="mt-1 text-xs text-slate-500">{schedule.dataset_name} · {number(schedule.batch_size)} rows every {number(schedule.interval_minutes)} minutes</p></div><span className={`rounded-full px-2.5 py-1 text-[10px] font-black uppercase ${needsResume ? "bg-amber-100 text-amber-800" : schedule.enabled ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-600"}`}>{needsResume ? "Resume needed" : schedule.enabled ? "Active" : "Paused"}</span></div><div className="mt-4 grid grid-cols-3 gap-2"><ProgressMetric label="Done" value={schedule.processed_rows} detail={`of ${number(schedule.total_rows)} source rows`} tone="text-emerald-700" /><ProgressMetric label="Remaining" value={schedule.remaining_rows} detail="Rows not yet prepared" tone="text-amber-700" /><ProgressMetric label="Next run" value={schedule.enabled ? formatScheduleDate(schedule.next_run_at) : "—"} detail={schedule.job_status ? `Last batch: ${schedule.job_status.replaceAll("_", " ")}` : "Waiting for first batch"} tone="text-cyan-700" /></div><div className="mt-4 flex flex-wrap gap-2">{needsResume ? <button type="button" disabled={Boolean(actionBusy)} onClick={() => controlRowSchedule(schedule, "resume-job")} className="inline-flex items-center gap-1.5 rounded-lg bg-brand-600 px-3 py-2 text-xs font-black text-white disabled:opacity-50"><Play size={14} />Resume batch</button> : <button type="button" disabled={Boolean(actionBusy) || activeRowBatch} onClick={() => controlRowSchedule(schedule, "run")} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-2 text-xs font-black text-slate-700 disabled:opacity-50"><Play size={14} />Run next batch</button>}<button type="button" disabled={Boolean(actionBusy)} onClick={() => controlRowSchedule(schedule, schedule.enabled ? "disable" : "enable")} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-black text-slate-700 disabled:opacity-50">{schedule.enabled ? "Pause schedule" : "Resume schedule"}</button>{actionBusy === actionKey && <LoaderCircle className="my-2 animate-spin text-cyan-700" size={16} />}</div></article>; })}</div></section>}
 
       <section className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-panel"><header className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 bg-slate-50 px-5 py-4 sm:px-6"><div className="max-w-2xl"><p className="flex items-center gap-2 text-xs font-black uppercase tracking-wide text-brand-700"><Files size={16} />Progress by raw CSV</p><h3 className="mt-1 text-lg font-black">Completed and remaining work for every source</h3><p className="mt-1 text-xs leading-5 text-slate-500">Choose a run size once, then start one CSV or every source. The persistent background job continues without repeated clicking and can be paused or resumed.</p></div><div className="grid min-w-64 gap-2"><div className="flex items-center justify-between gap-2"><span className={`rounded-full px-3 py-1.5 text-xs font-black ${pipelineStatus === "completed" ? "bg-emerald-100 text-emerald-800" : pipelineStatus === "running" ? "bg-blue-100 text-blue-800" : "bg-slate-200 text-slate-700"}`}>Pipeline {pipelineStatus.replaceAll("_", " ")}</span><span className="text-[10px] font-black uppercase text-slate-500">Persistent job</span></div><label className="text-[10px] font-black uppercase tracking-wide text-slate-500">Enrichment run size<select value={enrichmentRunSize} onChange={(event) => setEnrichmentRunSize(event.target.value)} disabled={activePipeline} className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold normal-case tracking-normal text-slate-800 disabled:opacity-50">{ENRICHMENT_RUN_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>{catalogProgress.live ? <button type="button" onClick={requestAllSourcesEnrichment} disabled={activePipeline || Boolean(actionBusy) || !Number(progress.pending_source_pages)} className="inline-flex items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-2.5 text-xs font-black text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-500">{actionBusy === "__all__" ? <LoaderCircle className="animate-spin" size={15} /> : <Play size={15} />}{activePipeline ? "Background job running" : enrichmentRunSize === "all" ? "Enrich all remaining" : `Run ${number(Math.min(Number(enrichmentRunSize), Number(progress.pending_source_pages || 0)))} pages across all CSVs`}</button> : <a href={LOCAL_DASHBOARD_URL} className="inline-flex items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-2.5 text-xs font-black text-white"><HardDrive size={15} />Open local to run enrichment</a>}</div></header>{actionNotice.message && <div className={`border-b px-5 py-3 text-sm font-bold ${actionNotice.type === "error" ? "border-red-200 bg-red-50 text-red-800" : "border-emerald-200 bg-emerald-50 text-emerald-800"}`} role={actionNotice.type === "error" ? "alert" : "status"}>{actionNotice.message}</div>}<div className="overflow-x-auto"><table className="min-w-full text-xs"><thead className="border-b border-slate-200 text-left uppercase tracking-wide text-slate-500"><tr className="bg-white"><th rowSpan="2" className="whitespace-nowrap border-r border-slate-200 px-3 py-3">CSV source</th><th rowSpan="2" className="whitespace-nowrap px-3 py-3">Size</th><th rowSpan="2" className="whitespace-nowrap px-3 py-3">Raw rows</th><th rowSpan="2" className="whitespace-nowrap border-r border-slate-200 px-3 py-3">Unique raw parts</th><th colSpan="2" className="border-r border-slate-200 bg-blue-50 px-3 py-2 text-center text-blue-700">Raw scan</th><th colSpan="2" className="border-r border-slate-200 bg-emerald-50 px-3 py-2 text-center text-emerald-700">Master identities</th><th colSpan="2" className="border-r border-slate-200 bg-violet-50 px-3 py-2 text-center text-violet-700">Product facts</th><th colSpan="2" className="border-r border-slate-200 bg-cyan-50 px-3 py-2 text-center text-cyan-700">Online pages</th><th rowSpan="2" className="whitespace-nowrap px-3 py-3">Status</th><th rowSpan="2" className="whitespace-nowrap px-3 py-3">Action</th></tr><tr className="border-t border-slate-200 bg-slate-50">{["Completed", "Remaining", "Completed", "Remaining", "Completed", "Remaining", "Completed", "Remaining"].map((heading, index) => <th key={`${heading}-${index}`} className={`whitespace-nowrap px-3 py-2 text-center ${index % 2 === 1 ? "border-r border-slate-200" : ""}`}>{heading}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{sources.map((source) => {
         const indexed = source.import_status === "indexed" || source.is_indexed === true;

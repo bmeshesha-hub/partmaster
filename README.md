@@ -97,6 +97,14 @@ The Mac must remain awake and `npm run dev:local` must keep running. A daily
 limit of 10,000 source pages is the recommended starting point; the UI also
 supports a selected CSV source and an explicit all-remaining mode.
 
+For row-based work, **Settings → Scheduler & jobs → Resumable row batches**
+creates a persistent schedule for one imported CSV. Set the rows per batch and
+the interval (for example, 1,000 rows every 20 minutes). The Dashboard and
+Enrichment pages show total rows, completed rows, rows still open, queued/in-
+progress rows, the next run, and a Resume action for paused or failed batches.
+The schedule advances from the last saved source-row checkpoint and disables
+itself when no further processable candidates remain.
+
 ## Local development
 
 1. Copy `.env.example` to `.env` and adjust the repository values if needed.

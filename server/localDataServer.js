@@ -27,6 +27,7 @@ const compatibilityQueue = [];
 const queuedCompatibilityKeys = new Set();
 let compatibilityWorkerRunning = false;
 let schedulerChecking = false;
+let enrichmentSchedulerChecking = false;
 let shuttingDown = false;
 const ENRICHMENT_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.PARTMASTER_FETCH_TIMEOUT_MS) || 15000);
 const ENRICHMENT_MAX_PAGE_BYTES = Math.max(100000, Number(process.env.PARTMASTER_MAX_PAGE_BYTES) || 2_000_000);
@@ -243,6 +244,23 @@ await withConnection((connection) => connection.run(`
     last_run_at TIMESTAMP,
     last_job_id VARCHAR,
     last_status VARCHAR,
+    created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_enrichment_schedules (
+    id VARCHAR PRIMARY KEY,
+    dataset_id VARCHAR NOT NULL,
+    name VARCHAR NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    batch_size INTEGER NOT NULL DEFAULT 1000,
+    interval_minutes INTEGER NOT NULL DEFAULT 20,
+    next_start_row_id BIGINT NOT NULL DEFAULT 0,
+    next_run_at TIMESTAMP,
+    last_run_at TIMESTAMP,
+    last_job_id VARCHAR,
+    last_status VARCHAR,
+    last_error VARCHAR,
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp
   );
@@ -1462,7 +1480,7 @@ function extractPageEvidence(html, knownPartNumber) {
   if (!productNumber) {
     const numberMatches = [...visibleText.matchAll(/\b\d{4,6}[-–]\d{3,5}\b/g)].map((match) => ({ number: match[0].replace("–", "-"), index: match.index || 0 }));
     const contextWords = cleanText(`${title} ${description}`).toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length >= 4);
-    const scored = numberMatches.map((number, index) => {
+    const scored = numberMatches.map((number) => {
       const window = visibleText.slice(Math.max(0, number.index - 250), number.index + 250).toLowerCase();
       return { number: number.number, score: contextWords.reduce((total, word) => total + (window.includes(word) ? 1 : 0), 0) };
     });
@@ -2890,8 +2908,93 @@ async function createEnrichmentJob(options) {
       await connection.run("ROLLBACK");
       throw error;
     }
-    return { id: jobId, candidateCount: candidates.length };
+    return {
+      id: jobId,
+      candidateCount: candidates.length,
+      lastSourceRowId: candidates.length ? Math.max(...candidates.map((candidate) => Number(candidate.source_row_id || 0))) : startRowId,
+    };
   });
+}
+
+async function enrichmentDatasetProgress(datasetId) {
+  return withConnection(async (connection) => {
+    const dataset = await getDataset(connection, datasetId);
+    const reader = await connection.runAndReadAll(
+      `SELECT count(*) FILTER (WHERE status NOT IN ('pending', 'processing')) AS processed_rows,
+       count(*) FILTER (WHERE status IN ('pending', 'processing')) AS in_progress_rows
+       FROM partmaster_enrichment_candidates WHERE dataset_id = $datasetId`,
+      { datasetId: dataset.id },
+    );
+    const row = reader.getRowObjectsJson()[0] || {};
+    const totalRows = Number(dataset.row_count || 0);
+    const processedRows = Math.min(totalRows, Number(row.processed_rows || 0));
+    const inProgressRows = Number(row.in_progress_rows || 0);
+    return {
+      dataset_id: dataset.id,
+      dataset_name: dataset.name,
+      source_file: dataset.source_file,
+      total_rows: totalRows,
+      processed_rows: processedRows,
+      in_progress_rows: inProgressRows,
+      remaining_rows: Math.max(0, totalRows - processedRows),
+    };
+  });
+}
+
+function nextEnrichmentScheduleRun(schedule, after = new Date()) {
+  const intervalMinutes = Math.max(1, Math.min(1440, Number(schedule.interval_minutes || schedule.intervalMinutes) || 20));
+  return new Date(after.getTime() + intervalMinutes * 60 * 1000);
+}
+
+async function runEnrichmentSchedule(schedule, { manual = false } = {}) {
+  const jobState = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      "SELECT id, status FROM partmaster_enrichment_jobs WHERE id = $id",
+      { id: schedule.last_job_id },
+    );
+    const activeReader = await connection.runAndReadAll(
+      "SELECT id, status FROM partmaster_enrichment_jobs WHERE status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1",
+    );
+    return { existingJob: reader.getRowObjectsJson()[0], activeJob: activeReader.getRowObjectsJson()[0] };
+  });
+  const existingJob = jobState.existingJob;
+  if (existingJob && ["queued", "running", "paused", "failed"].includes(existingJob.status)) {
+    return { jobId: existingJob.status === "paused" || existingJob.status === "failed" ? null : existingJob.id, blocked: true, status: existingJob.status };
+  }
+  if (jobState.activeJob) return { jobId: jobState.activeJob.id, blocked: true, status: jobState.activeJob.status };
+  const progress = await enrichmentDatasetProgress(schedule.dataset_id);
+  if (!progress.remaining_rows) {
+    await withConnection((connection) => connection.run(
+      `UPDATE partmaster_enrichment_schedules SET enabled = false, last_run_at = current_timestamp,
+       last_status = 'complete', next_run_at = NULL, last_error = NULL, updated_at = current_timestamp WHERE id = $id`,
+      { id: schedule.id },
+    ));
+    return { jobId: null, status: "complete", remainingRows: 0 };
+  }
+  const result = await createEnrichmentJob({
+    datasetId: schedule.dataset_id,
+    name: `${schedule.name}${manual ? " — run now" : " — scheduled"}`,
+    requestedCandidates: Math.min(Number(schedule.batch_size || 1000), progress.remaining_rows),
+    startRowId: Number(schedule.next_start_row_id || 0),
+    batchSize: 10,
+    autoAcceptThreshold: 0.94,
+  });
+  const nextRun = nextEnrichmentScheduleRun(schedule, new Date());
+  await withConnection((connection) => connection.run(
+    `UPDATE partmaster_enrichment_schedules SET last_run_at = current_timestamp, last_job_id = $jobId,
+     last_status = $lastStatus, enabled = $enabled, next_start_row_id = $nextStartRowId, next_run_at = $nextRunAt,
+     last_error = NULL, updated_at = current_timestamp WHERE id = $id`,
+    {
+      id: schedule.id,
+      jobId: result.id,
+      lastStatus: result.candidateCount ? "started" : "no_work",
+      enabled: Boolean(result.candidateCount),
+      nextStartRowId: result.lastSourceRowId,
+      nextRunAt: result.candidateCount ? localTimestamp(nextRun) : null,
+    },
+  ));
+  if (result.candidateCount) scheduleEnrichmentJob(result.id);
+  return { jobId: result.candidateCount ? result.id : null, candidateCount: result.candidateCount, remainingRows: progress.remaining_rows };
 }
 
 async function findExistingVariantConflicts(candidate, result) {
@@ -4162,6 +4265,80 @@ app.post("/api/local/pipeline/schedules/:id/run", asyncRoute(async (request, res
   response.status(result.jobId ? 202 : 200).json(result);
 }));
 
+app.get("/api/local/enrichment/schedules", asyncRoute(async (_request, response) => {
+  const schedules = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT schedules.*, jobs.status AS job_status, jobs.processed_count AS job_processed_count,
+       jobs.queued_count AS job_total_count, jobs.last_error AS job_error
+       FROM partmaster_enrichment_schedules schedules
+       LEFT JOIN partmaster_enrichment_jobs jobs ON jobs.id = schedules.last_job_id
+       ORDER BY schedules.enabled DESC, schedules.next_run_at NULLS LAST, schedules.created_at DESC`,
+    );
+    return reader.getRowObjectsJson();
+  });
+  const withProgress = await Promise.all(schedules.map(async (schedule) => {
+    try { return { ...schedule, ...(await enrichmentDatasetProgress(schedule.dataset_id)) }; }
+    catch (error) { return { ...schedule, progress_error: error.message, total_rows: 0, processed_rows: 0, remaining_rows: 0 }; }
+  }));
+  response.json({ schedules: withProgress });
+}));
+
+app.post("/api/local/enrichment/schedules", asyncRoute(async (request, response) => {
+  const datasetId = String(request.body.datasetId || "");
+  if (!datasetId) throw new Error("Choose an imported dataset for the row schedule.");
+  const progress = await enrichmentDatasetProgress(datasetId);
+  const requestedBatchSize = Number(request.body.batchSize);
+  const batchSize = Math.max(1, Math.min(10000, Number.isFinite(requestedBatchSize) ? requestedBatchSize : 1000));
+  const requestedInterval = Number(request.body.intervalMinutes);
+  const intervalMinutes = Math.max(1, Math.min(1440, Number.isFinite(requestedInterval) ? requestedInterval : 20));
+  const id = randomUUID();
+  await withConnection((connection) => connection.run(
+    `INSERT INTO partmaster_enrichment_schedules
+     (id, dataset_id, name, enabled, batch_size, interval_minutes, next_start_row_id, next_run_at)
+     VALUES ($id, $datasetId, $name, true, $batchSize, $intervalMinutes, 0, current_timestamp)`,
+    {
+      id,
+      datasetId,
+      name: String(request.body.name || `${progress.dataset_name} row batches`).trim().slice(0, 200),
+      batchSize,
+      intervalMinutes,
+    },
+  ));
+  response.status(201).json({ id, totalRows: progress.total_rows, remainingRows: progress.remaining_rows, batchSize, intervalMinutes });
+}));
+
+app.patch("/api/local/enrichment/schedules/:id", asyncRoute(async (request, response) => {
+  const existing = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll("SELECT * FROM partmaster_enrichment_schedules WHERE id = $id", { id: request.params.id });
+    return reader.getRowObjectsJson()[0];
+  });
+  if (!existing) return response.status(404).json({ error: "Row schedule not found." });
+  const enabled = request.body.enabled == null ? Boolean(existing.enabled) : Boolean(request.body.enabled);
+  const nextRun = enabled && !existing.enabled ? localTimestamp(new Date()) : enabled ? existing.next_run_at : null;
+  await withConnection((connection) => connection.run(
+    `UPDATE partmaster_enrichment_schedules SET enabled = $enabled, next_run_at = $nextRun,
+     updated_at = current_timestamp WHERE id = $id`,
+    { id: request.params.id, enabled, nextRun },
+  ));
+  response.json({ ok: true, enabled });
+}));
+
+app.delete("/api/local/enrichment/schedules/:id", asyncRoute(async (request, response) => {
+  await withConnection((connection) => connection.run("DELETE FROM partmaster_enrichment_schedules WHERE id = $id", { id: request.params.id }));
+  response.json({ ok: true });
+}));
+
+app.post("/api/local/enrichment/schedules/:id/run", asyncRoute(async (request, response) => {
+  const schedule = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll("SELECT * FROM partmaster_enrichment_schedules WHERE id = $id", { id: request.params.id });
+    return reader.getRowObjectsJson()[0];
+  });
+  if (!schedule) return response.status(404).json({ error: "Row schedule not found." });
+  const result = await runEnrichmentSchedule(schedule, { manual: true });
+  if (result.blocked) return response.status(409).json({ error: `A row enrichment job is ${result.status}. Resume or finish it before starting another batch.` });
+  response.status(result.jobId ? 202 : 200).json(result);
+}));
+
 async function checkPipelineSchedules() {
   if (schedulerChecking || shuttingDown) return;
   schedulerChecking = true;
@@ -4177,6 +4354,24 @@ async function checkPipelineSchedules() {
     if (error.status !== 409) console.error(`Scheduled enrichment check failed: ${error.message}`);
   } finally {
     schedulerChecking = false;
+  }
+}
+
+async function checkEnrichmentSchedules() {
+  if (enrichmentSchedulerChecking || shuttingDown) return;
+  enrichmentSchedulerChecking = true;
+  try {
+    const due = await withConnection(async (connection) => {
+      const reader = await connection.runAndReadAll(
+        "SELECT * FROM partmaster_enrichment_schedules WHERE enabled = true AND next_run_at <= current_timestamp ORDER BY next_run_at LIMIT 1",
+      );
+      return reader.getRowObjectsJson()[0];
+    });
+    if (due) await runEnrichmentSchedule(due);
+  } catch (error) {
+    if (error.status !== 409) console.error(`Scheduled row enrichment check failed: ${error.message}`);
+  } finally {
+    enrichmentSchedulerChecking = false;
   }
 }
 
@@ -5798,8 +5993,12 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   resumableAutopilotJobIds.forEach(scheduleAutopilotJob);
   resumablePipelineJobIds.forEach(scheduleFullPipeline);
   setTimeout(() => checkPipelineSchedules(), 1000);
+  setTimeout(() => checkEnrichmentSchedules(), 1200);
 });
-const schedulerTimer = setInterval(() => checkPipelineSchedules(), 30_000);
+const schedulerTimer = setInterval(() => {
+  checkPipelineSchedules();
+  checkEnrichmentSchedules();
+}, 30_000);
 
 async function shutdown(signal) {
   if (shuttingDown) return;
