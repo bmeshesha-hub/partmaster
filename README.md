@@ -39,6 +39,14 @@ headers, preserves catalog fields as text, and stores imported tables in
 and filtered CSV exports run against that local database. Exports are written
 to `local_data/exports/`.
 
+Master Data includes a **Revalidate part numbers** action. It quarantines
+placeholder, alpha-only, zero-only, and other non-OEM identity values while
+preserving the original source rows. It separately flags extraction punctuation,
+missing descriptions, and fallback classification for review. Availability,
+canceled, and discontinued descriptions do not remove a valid part identity.
+Future full source rebuilds apply the same identity validation before creating
+master identities.
+
 Everything inside `local_data/` except the small directory instructions and
 placeholder files is ignored by Git. The GitHub Pages build includes the UI,
 but the local-data screen can only connect when the Mac service is running.

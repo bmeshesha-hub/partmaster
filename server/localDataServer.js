@@ -333,6 +333,16 @@ await withConnection((connection) => connection.run(`
     status VARCHAR NOT NULL DEFAULT 'quarantined'
   );
 
+  CREATE TABLE IF NOT EXISTS partmaster_master_review_flags (
+    part_key VARCHAR NOT NULL,
+    flag_code VARCHAR NOT NULL,
+    flag_detail VARCHAR,
+    sample_value VARCHAR,
+    detected_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    status VARCHAR NOT NULL DEFAULT 'open',
+    PRIMARY KEY (part_key, flag_code)
+  );
+
   CREATE TABLE IF NOT EXISTS partmaster_offline_source_pages (
     source_url VARCHAR PRIMARY KEY,
     source_host VARCHAR,
@@ -786,14 +796,14 @@ function normalizePartNumber(value) {
 function partNumberValidationSql(column = "part_number_norm") {
   return `length(${column}) BETWEEN 3 AND 50
     AND regexp_matches(${column}, '[0-9]')
-    AND NOT regexp_matches(${column}, '^(NA|NONE|NULL|UNKNOWN|UNAVAILABLE|NOTAVAILABLE|TBD|MISSING|X+)$')`;
+    AND NOT regexp_matches(${column}, '^(0+|NA|NONE|NULL|UNKNOWN|UNAVAILABLE|NOTAVAILABLE|TBD|MISSING|X+)$')`;
 }
 
 function partNumberReasonSql() {
   return `CASE
     WHEN nullif(trim(part_number_norm), '') IS NULL THEN 'missing_part_number'
     WHEN length(part_number_norm) < 3 OR length(part_number_norm) > 50 THEN 'invalid_length'
-    WHEN regexp_matches(part_number_norm, '^(NA|NONE|NULL|UNKNOWN|UNAVAILABLE|NOTAVAILABLE|TBD|MISSING|X+)$') THEN 'placeholder_part_number'
+    WHEN regexp_matches(part_number_norm, '^(0+|NA|NONE|NULL|UNKNOWN|UNAVAILABLE|NOTAVAILABLE|TBD|MISSING|X+)$') THEN 'placeholder_part_number'
     WHEN NOT regexp_matches(part_number_norm, '[0-9]') THEN 'alpha_only_part_number'
     ELSE 'invalid_part_number' END`;
 }
@@ -2477,7 +2487,10 @@ async function scanDatasetOffline(jobId, dataset) {
           SELECT *, ${manufacturerNorm} AS manufacturer_norm, ${partNorm} AS part_number_norm FROM source_rows
          ), valid AS (SELECT * FROM normalized WHERE ${validCondition})
          SELECT manufacturer_norm || ':' || part_number_norm AS part_key, $datasetId,
-          min(source_row_id), arg_max(manufacturer_raw, length(coalesce(manufacturer_raw, ''))),
+          min(source_row_id), CASE manufacturer_norm
+            WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson' WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM'
+            WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha' WHEN 'SUZUKI' THEN 'Suzuki'
+            WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE arg_max(manufacturer_raw, length(coalesce(manufacturer_raw, ''))) END,
           manufacturer_norm, arg_max(part_number, length(coalesce(part_number, ''))), part_number_norm,
           arg_max(description, length(coalesce(description, ''))), arg_max(year, length(coalesce(year, ''))),
           arg_max(model, length(coalesce(model, ''))), arg_max(assembly, length(coalesce(assembly, ''))),
@@ -2534,7 +2547,10 @@ async function rebuildOfflineCatalog(jobId) {
       `INSERT INTO partmaster_offline_parts
        (part_key, manufacturer, manufacturer_norm, part_number, part_number_norm, description,
         occurrence_count, dataset_count, application_count, source_page_count, best_source_url)
-       SELECT part_key, arg_max(manufacturer, length(coalesce(manufacturer, ''))), manufacturer_norm,
+       SELECT part_key, CASE manufacturer_norm
+          WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson' WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM'
+          WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha' WHEN 'SUZUKI' THEN 'Suzuki'
+          WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE arg_max(manufacturer, length(coalesce(manufacturer, ''))) END, manufacturer_norm,
         arg_max(part_number, length(coalesce(part_number, ''))), part_number_norm,
         arg_max(description, length(coalesce(description, ''))), sum(occurrence_count), count(*),
         sum(occurrence_count), count(DISTINCT nullif(trim(source_url), '')),
@@ -4582,7 +4598,9 @@ app.get("/api/local/master-dashboard", asyncRoute(async (_request, response) => 
        coalesce(sum(extracted_attribute_count), 0) AS product_facts,
        count(*) FILTER (WHERE online_status = 'verified') AS online_verified_parts,
        count(*) FILTER (WHERE confidence >= .9) AS high_confidence_parts,
-       count(*) FILTER (WHERE confidence < .7) AS low_confidence_parts
+       count(*) FILTER (WHERE confidence < .7) AS low_confidence_parts,
+       (SELECT count(DISTINCT part_key) FROM partmaster_master_review_flags WHERE status = 'open') AS parts_needing_review,
+       (SELECT count(*) FROM partmaster_master_review_flags WHERE status = 'open') AS review_flags
        FROM partmaster_offline_parts`,
     );
     const manufacturerReader = await connection.runAndReadAll(
@@ -4682,14 +4700,19 @@ app.get("/api/local/master-catalog", asyncRoute(async (request, response) => {
     const countReader = await connection.runAndReadAll(`SELECT count(*) AS count FROM partmaster_offline_parts ${where}`, values);
     const total = Number(countReader.getRowObjectsJson()[0].count);
     const rowsReader = await connection.runAndReadAll(
-      `SELECT part_key, CASE manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
+      `SELECT parts.part_key, CASE parts.manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
         WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM' WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha'
-        WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE manufacturer END AS manufacturer,
-       part_number, description, family_name, component_scope, side, position,
-       extracted_attributes_json, extracted_attribute_count, occurrence_count, dataset_count, application_count,
-       source_page_count, best_source_url, confidence, attribute_status, online_status, updated_at
-       FROM partmaster_offline_parts ${where}
-       ORDER BY ${sort} ${direction} NULLS LAST, manufacturer_norm, part_number_norm
+        WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE parts.manufacturer END AS manufacturer,
+       parts.part_number, parts.description, parts.family_name, parts.component_scope, parts.side, parts.position,
+       parts.extracted_attributes_json, parts.extracted_attribute_count, parts.occurrence_count, parts.dataset_count, parts.application_count,
+       parts.source_page_count, parts.best_source_url, parts.confidence, parts.attribute_status, parts.online_status, parts.updated_at,
+       coalesce(flags.review_flag_count, 0) AS review_flag_count, coalesce(flags.review_flags, '') AS review_flags
+       FROM partmaster_offline_parts parts
+       LEFT JOIN (
+         SELECT part_key, count(*) AS review_flag_count, string_agg(flag_code, ', ' ORDER BY flag_code) AS review_flags
+         FROM partmaster_master_review_flags WHERE status = 'open' GROUP BY part_key
+       ) flags ON flags.part_key = parts.part_key ${where}
+       ORDER BY parts.${sort} ${direction} NULLS LAST, parts.manufacturer_norm, parts.part_number_norm
        LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values,
     );
     return { rows: rowsReader.getRowObjectsJson(), total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)) };
@@ -4716,13 +4739,131 @@ app.post("/api/local/master-catalog/export", asyncRoute(async (request, response
   const hasFilters = Object.entries(filters).some(([key, value]) => !["sort", "direction", "page", "pageSize"].includes(key) && value !== "" && value != null);
   const stamp = Date.now(); const filename = `master-catalog-${hasFilters ? "filtered" : "all"}-${stamp}.csv`; const path = join(EXPORT_ROOT, filename);
   await withConnection((connection) => connection.run(
-    `COPY (SELECT manufacturer AS "Manufacturer", part_number AS "OEM Part Number", description AS "Description", family_name AS "Part Family", component_scope AS "Component Scope", side AS "Side", position AS "Position", occurrence_count AS "Occurrences", dataset_count AS "Datasets", application_count AS "Applications", source_page_count AS "Source Pages", extracted_attribute_count AS "Extracted Facts", confidence AS "Confidence", attribute_status AS "Attribute Status", online_status AS "Online Evidence Status", best_source_url AS "Best Source URL", manufacturer_norm AS "Normalized Manufacturer", part_number_norm AS "Normalized OEM Number", part_key AS "Global Part Key" FROM partmaster_offline_parts ${where} ORDER BY manufacturer_norm, part_number_norm) TO ${quoteString(path)} (FORMAT CSV, HEADER true)`, values,
+    `COPY (SELECT CASE parts.manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
+       WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM' WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha'
+       WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE parts.manufacturer END AS "Manufacturer",
+       parts.part_number AS "OEM Part Number", parts.description AS "Description", parts.family_name AS "Part Family",
+       CASE WHEN coalesce(parts.family_name, 'General Part') = 'General Part' THEN 'needs_classification' ELSE 'classified' END AS "Classification Status",
+       parts.component_scope AS "Component Scope", parts.side AS "Side", parts.position AS "Position",
+       parts.occurrence_count AS "Occurrences", parts.dataset_count AS "Datasets", parts.application_count AS "Applications",
+       parts.source_page_count AS "Source Pages", parts.extracted_attribute_count AS "Extracted Facts", parts.confidence AS "Confidence",
+       parts.attribute_status AS "Attribute Status", parts.online_status AS "Online Evidence Status", parts.best_source_url AS "Best Source URL",
+       coalesce(flags.review_flag_count, 0) AS "Review Flag Count", coalesce(flags.review_flags, '') AS "Review Flags",
+       CASE WHEN coalesce(flags.review_flag_count, 0) > 0 THEN 'needs_review' ELSE 'accepted' END AS "Identity Review Status",
+       parts.manufacturer_norm AS "Normalized Manufacturer", parts.part_number_norm AS "Normalized OEM Number", parts.part_key AS "Global Part Key"
+       FROM partmaster_offline_parts parts
+       LEFT JOIN (
+         SELECT part_key, count(*) AS review_flag_count, string_agg(flag_code, ', ' ORDER BY flag_code) AS review_flags
+         FROM partmaster_master_review_flags WHERE status = 'open' GROUP BY part_key
+       ) flags ON flags.part_key = parts.part_key ${where}
+       ORDER BY parts.manufacturer_norm, parts.part_number_norm) TO ${quoteString(path)} (FORMAT CSV, HEADER true)`, values,
   ));
   const count = await withConnection(async (connection) => {
     const reader = await connection.runAndReadAll(`SELECT count(*) AS count FROM partmaster_offline_parts ${where}`, values);
     return Number(reader.getRowObjectsJson()[0].count);
   });
   response.json({ exports: [{ filename, downloadUrl: `/api/local/exports/${encodeURIComponent(filename)}`, filters }], count });
+}));
+
+app.post("/api/local/master-catalog/revalidate", asyncRoute(async (_request, response) => {
+  const result = await withConnection(async (connection) => {
+    const invalidWhere = `NOT (${partNumberValidationSql("part_number_norm")})`;
+    const reasonReader = await connection.runAndReadAll(
+      `SELECT ${partNumberReasonSql()} AS reason_code, count(*) AS count
+       FROM partmaster_offline_parts WHERE ${invalidWhere} GROUP BY 1 ORDER BY count DESC`,
+    );
+    const sampleReader = await connection.runAndReadAll(
+      `SELECT manufacturer, part_number, part_number_norm, description, ${partNumberReasonSql()} AS reason_code,
+       occurrence_count, best_source_url
+       FROM partmaster_offline_parts WHERE ${invalidWhere}
+       ORDER BY occurrence_count DESC, manufacturer_norm, part_number_norm LIMIT 25`,
+    );
+    const invalidReader = await connection.runAndReadAll(
+      `SELECT count(*) AS invalid_parts, coalesce(sum(occurrence_count), 0) AS invalid_occurrences
+       FROM partmaster_offline_parts WHERE ${invalidWhere}`,
+    );
+    await connection.run(
+      `INSERT INTO partmaster_master_impurities
+       (part_key, manufacturer, part_number, part_number_norm, description, family_name, reason_code,
+        occurrence_count, dataset_count, source_page_count, best_source_url, detected_at, status)
+       SELECT part_key, manufacturer, part_number, part_number_norm, description, family_name,
+        ${partNumberReasonSql()}, occurrence_count, dataset_count, source_page_count, best_source_url,
+        now(), 'quarantined'
+       FROM partmaster_offline_parts WHERE ${invalidWhere}
+       ON CONFLICT (part_key) DO UPDATE SET
+        manufacturer = excluded.manufacturer, part_number = excluded.part_number,
+        part_number_norm = excluded.part_number_norm, description = excluded.description,
+        family_name = excluded.family_name, reason_code = excluded.reason_code,
+        occurrence_count = excluded.occurrence_count, dataset_count = excluded.dataset_count,
+        source_page_count = excluded.source_page_count, best_source_url = excluded.best_source_url,
+        detected_at = now(), status = 'quarantined'`,
+    );
+    await connection.run(`DELETE FROM partmaster_offline_parts WHERE ${invalidWhere}`);
+    await connection.run(
+      `UPDATE partmaster_offline_parts SET manufacturer = CASE manufacturer_norm
+         WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson' WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM'
+         WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha' WHEN 'SUZUKI' THEN 'Suzuki'
+         WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE manufacturer END`,
+    );
+    await connection.run(
+      `INSERT INTO partmaster_master_review_flags
+       (part_key, flag_code, flag_detail, sample_value, detected_at, status)
+       SELECT sources.part_key, 'source_format_artifact',
+        'A source OEM value contains extraction punctuation that should be reviewed.',
+        string_agg(DISTINCT sources.part_number, ' | ' ORDER BY sources.part_number), now(), 'open'
+       FROM partmaster_offline_part_sources sources
+       JOIN partmaster_offline_parts parts ON parts.part_key = sources.part_key
+       WHERE regexp_matches(coalesce(sources.part_number, ''), '[^A-Za-z0-9 ._()/-]')
+       GROUP BY sources.part_key
+       ON CONFLICT (part_key, flag_code) DO UPDATE SET
+        flag_detail = excluded.flag_detail, sample_value = excluded.sample_value,
+        detected_at = now(), status = 'open'`,
+    );
+    await connection.run(
+      `INSERT INTO partmaster_master_review_flags
+       (part_key, flag_code, flag_detail, sample_value, detected_at, status)
+       SELECT part_key, 'missing_description', 'The master identity has no description.', part_number,
+        now(), 'open'
+       FROM partmaster_offline_parts
+       WHERE nullif(trim(description), '') IS NULL
+       ON CONFLICT (part_key, flag_code) DO UPDATE SET
+        flag_detail = excluded.flag_detail, sample_value = excluded.sample_value,
+        detected_at = now(), status = 'open'`,
+    );
+    await connection.run(
+      `UPDATE partmaster_master_review_flags SET status = 'resolved'
+       WHERE status = 'open' AND flag_code = 'source_format_artifact'
+       AND NOT EXISTS (
+         SELECT 1 FROM partmaster_offline_part_sources sources
+         WHERE sources.part_key = partmaster_master_review_flags.part_key
+           AND regexp_matches(coalesce(sources.part_number, ''), '[^A-Za-z0-9 ._()/-]'))`,
+    );
+    await connection.run(
+      `UPDATE partmaster_master_review_flags SET status = 'resolved'
+       WHERE status = 'open' AND flag_code = 'missing_description'
+       AND NOT EXISTS (
+         SELECT 1 FROM partmaster_offline_parts parts
+         WHERE parts.part_key = partmaster_master_review_flags.part_key
+           AND nullif(trim(parts.description), '') IS NULL)`,
+    );
+    const reviewReader = await connection.runAndReadAll(
+      `SELECT count(DISTINCT part_key) AS review_parts, count(*) AS review_flags
+       FROM partmaster_master_review_flags WHERE status = 'open'`,
+    );
+    const remainingReader = await connection.runAndReadAll("SELECT count(*) AS remaining_parts FROM partmaster_offline_parts");
+    const invalid = invalidReader.getRowObjectsJson()[0] || {};
+    const review = reviewReader.getRowObjectsJson()[0] || {};
+    return {
+      quarantined: Number(invalid.invalid_parts || 0),
+      quarantined_occurrences: Number(invalid.invalid_occurrences || 0),
+      remaining_parts: Number(remainingReader.getRowObjectsJson()[0]?.remaining_parts || 0),
+      review_parts: Number(review.review_parts || 0),
+      review_flags: Number(review.review_flags || 0),
+      reasons: reasonReader.getRowObjectsJson(),
+      sample: sampleReader.getRowObjectsJson(),
+    };
+  });
+  response.json(result);
 }));
 
 app.post("/api/local/pipeline/exports", asyncRoute(async (_request, response) => {
@@ -5834,16 +5975,27 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const autopilotJobsPath = join(EXPORT_ROOT, autopilotJobsFilename);
     const autopilotItemsPath = join(EXPORT_ROOT, autopilotItemsFilename);
     await connection.run(
-      `COPY (SELECT manufacturer AS "Manufacturer", part_number AS "OEM Part Number",
-       description AS "Description", family_name AS "Part Family", component_scope AS "Component Scope",
-       side AS "Side", position AS "Position", extracted_attributes_json AS "Extracted Attributes JSON",
-       extracted_attribute_count AS "Extracted Facts", occurrence_count AS "Raw Occurrences",
-       dataset_count AS "Source Datasets", application_count AS "Applications", source_page_count AS "Source Pages",
-       best_source_url AS "Best Source URL", confidence AS "Confidence", attribute_status AS "Attribute Status",
-       online_status AS "Online Evidence Status", updated_at AS "Updated At",
-       manufacturer_norm AS "Normalized Manufacturer", part_number_norm AS "Normalized OEM Number",
-       part_key AS "Global Part Key"
-       FROM partmaster_offline_parts ORDER BY manufacturer_norm, part_number_norm)
+      `COPY (SELECT CASE parts.manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
+       WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM' WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha'
+       WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE parts.manufacturer END AS "Manufacturer",
+       parts.part_number AS "OEM Part Number", parts.description AS "Description", parts.family_name AS "Part Family",
+       CASE WHEN coalesce(parts.family_name, 'General Part') = 'General Part' THEN 'needs_classification' ELSE 'classified' END AS "Classification Status",
+       parts.component_scope AS "Component Scope", parts.side AS "Side", parts.position AS "Position",
+       parts.extracted_attributes_json AS "Extracted Attributes JSON", parts.extracted_attribute_count AS "Extracted Facts",
+       parts.occurrence_count AS "Raw Occurrences", parts.dataset_count AS "Source Datasets",
+       parts.application_count AS "Applications", parts.source_page_count AS "Source Pages",
+       parts.best_source_url AS "Best Source URL", parts.confidence AS "Confidence", parts.attribute_status AS "Attribute Status",
+       parts.online_status AS "Online Evidence Status", parts.updated_at AS "Updated At",
+       coalesce(flags.review_flag_count, 0) AS "Review Flag Count", coalesce(flags.review_flags, '') AS "Review Flags",
+       CASE WHEN coalesce(flags.review_flag_count, 0) > 0 THEN 'needs_review' ELSE 'accepted' END AS "Identity Review Status",
+       parts.manufacturer_norm AS "Normalized Manufacturer", parts.part_number_norm AS "Normalized OEM Number",
+       parts.part_key AS "Global Part Key"
+       FROM partmaster_offline_parts parts
+       LEFT JOIN (
+         SELECT part_key, count(*) AS review_flag_count, string_agg(flag_code, ', ' ORDER BY flag_code) AS review_flags
+         FROM partmaster_master_review_flags WHERE status = 'open' GROUP BY part_key
+       ) flags ON flags.part_key = parts.part_key
+       ORDER BY parts.manufacturer_norm, parts.part_number_norm)
        TO ${quoteString(catalogPath)} (FORMAT CSV, HEADER true)`,
     );
     await connection.run(
