@@ -4370,11 +4370,22 @@ app.post("/api/local/enrichment/schedules", asyncRoute(async (request, response)
       return reader.getRowObjectsJson().map((dataset) => dataset.id);
     });
   if (!datasetIds.length) throw new Error("Import at least one CSV before creating a row schedule.");
+  const existingSchedule = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      "SELECT * FROM partmaster_enrichment_schedules WHERE enabled = true AND dataset_ids = $datasetIds ORDER BY created_at DESC LIMIT 1",
+      { datasetIds: datasetIds.join(",") },
+    );
+    return reader.getRowObjectsJson()[0];
+  });
+  if (existingSchedule) {
+    const progress = await enrichmentScheduleProgress(existingSchedule);
+    return response.json({ id: existingSchedule.id, alreadyQueued: true, datasetIds, totalRows: progress.total_rows, remainingRows: progress.remaining_rows, batchSize: existingSchedule.batch_size, intervalMinutes: existingSchedule.interval_minutes });
+  }
   const progress = await enrichmentScheduleProgress({ dataset_ids: datasetIds });
   const requestedBatchSize = Number(request.body.batchSize);
   const batchSize = Math.max(1, Math.min(10000, Number.isFinite(requestedBatchSize) ? requestedBatchSize : 1000));
   const requestedInterval = Number(request.body.intervalMinutes);
-  const intervalMinutes = Math.max(1, Math.min(1440, Number.isFinite(requestedInterval) ? requestedInterval : 20));
+  const intervalMinutes = Math.max(1, Math.min(1440, Number.isFinite(requestedInterval) ? requestedInterval : 5));
   const id = randomUUID();
   await withConnection((connection) => connection.run(
     `INSERT INTO partmaster_enrichment_schedules
@@ -4529,7 +4540,9 @@ app.get("/api/local/pipeline/sources", asyncRoute(async (_request, response) => 
         (SELECT coalesce(sum(extracted_attribute_count), 0) FROM partmaster_offline_parts) AS product_facts,
         (SELECT count(*) FROM partmaster_offline_source_pages) AS source_pages,
         (SELECT count(*) FROM partmaster_offline_source_pages WHERE status != 'pending') AS processed_source_pages,
-        (SELECT count(*) FROM partmaster_offline_source_pages WHERE status = 'pending') AS pending_source_pages
+        (SELECT count(*) FROM partmaster_offline_source_pages WHERE status = 'pending') AS pending_source_pages,
+        (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status NOT IN ('pending', 'processing')) AS enriched_rows,
+        (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status IN ('pending', 'processing')) AS queued_rows
        FROM partmaster_offline_part_sources sources
        LEFT JOIN partmaster_offline_parts parts ON parts.part_key = sources.part_key`,
     );
@@ -4582,6 +4595,9 @@ app.get("/api/local/pipeline/sources", asyncRoute(async (_request, response) => 
       source_pages: Number(databaseCoverage.summary.source_pages || 0),
       processed_source_pages: Number(databaseCoverage.summary.processed_source_pages || 0),
       pending_source_pages: Number(databaseCoverage.summary.pending_source_pages || 0),
+      enriched_rows: Number(databaseCoverage.summary.enriched_rows || 0),
+      queued_rows: Number(databaseCoverage.summary.queued_rows || 0),
+      remaining_enrichment_rows: Math.max(0, knownRawRows - Number(databaseCoverage.summary.enriched_rows || 0)),
     },
   });
 }));

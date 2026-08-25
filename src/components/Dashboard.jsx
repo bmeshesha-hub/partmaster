@@ -16,12 +16,7 @@ import { buildPartsLibrary } from "../utils/libraryUtils.js";
 import { localDataApi } from "../utils/localDataApi.js";
 
 const LOCAL_DASHBOARD_URL = "http://127.0.0.1:5173/partmaster/";
-const ENRICHMENT_RUN_OPTIONS = [
-  ["250", "Safe batch · 250 pages"],
-  ["1250", "5 cycles · 1,250 pages"],
-  ["5000", "Large run · 5,000 pages"],
-  ["all", "Run all remaining pages"],
-];
+const ENRICHMENT_RUN_OPTIONS = [["all", "Queue all remaining enrichment · 1,000 rows / 5 min"]];
 
 function number(value) { return Number(value || 0).toLocaleString(); }
 
@@ -88,6 +83,8 @@ function snapshotToProgress(metrics) {
       source_pages: pages.source_pages,
       processed_source_pages: pages.processed_pages,
       pending_source_pages: pages.pending_pages,
+      enriched_rows: 0,
+      remaining_enrichment_rows: summary.raw_rows,
     },
   };
 }
@@ -166,6 +163,8 @@ export default function Dashboard({ data, onNavigate, onOpenSettings }) {
   const rawRows = Number(progress.known_raw_rows || 0);
   const scannedRows = Number(progress.indexed_raw_rows || 0);
   const rawRemaining = Number(progress.pending_scan_rows || 0);
+  const enrichedRows = Number(progress.parts_with_facts || 0);
+  const enrichmentRemaining = Number(progress.remaining_fact_parts || 0);
   const masterRemaining = Number(progress.remaining_master_parts || 0);
   const scanPercent = rawRows ? Math.min(100, (scannedRows / rawRows) * 100) : 0;
   const totalBytes = sources.reduce((sum, source) => sum + Number(source.source_bytes || 0), 0);
@@ -180,9 +179,9 @@ export default function Dashboard({ data, onNavigate, onOpenSettings }) {
   const verifiedParts = Number(progress.online_verified_parts || 0);
   const totalPages = Number(progress.source_pages || 0);
   const trackedSchedule = rowSchedules[0] || null;
-  const chartDone = trackedSchedule ? Number(trackedSchedule.processed_rows || 0) : scannedRows;
-  const chartRemaining = trackedSchedule ? Number(trackedSchedule.remaining_rows || 0) : rawRemaining;
-  const chartLabel = trackedSchedule ? "Rows complete" : "Rows scanned";
+  const chartDone = enrichedRows;
+  const chartRemaining = enrichmentRemaining;
+  const chartLabel = "Parts enriched";
   const scheduleNeedsResume = ["paused", "failed"].includes(trackedSchedule?.job_status);
   const stages = [
     { label: "Combined CSV rows", done: scannedRows, total: rawRows, left: rawRemaining, tone: "bg-cyan-500", detail: "Rows scanned from all source files" },
@@ -206,17 +205,14 @@ export default function Dashboard({ data, onNavigate, onOpenSettings }) {
     if (!catalogProgress?.live) return;
     setActionBusy(source.source_file); setActionNotice({ type: "", message: "" });
     try {
-      const continueOnline = !needsProcessing;
-      const onlineBudget = continueOnline ? selectedBudget(pagesLeft) : Math.min(250, Math.max(0, pagesLeft));
-      await localDataApi.startPipeline({
-        name: `${source.name || source.source_file} — ${continueOnline && onlineBudget >= pagesLeft ? "all remaining enrichment" : continueOnline ? `next ${number(onlineBudget)} enrichment pages` : "source processing"}`,
-        importMissing: needsProcessing,
-        continueOnline,
-        onlineBudget,
-        datasetIds: source.dataset_id ? [source.dataset_id] : [],
-      });
+      if (!source.dataset_id) throw new Error("This CSV must be imported before it can be queued.");
+      if (!needsProcessing) {
+        await localDataApi.createEnrichmentSchedule({ datasetId: source.dataset_id, name: `${source.name || source.source_file} — all remaining enrichment`, batchSize: 1000, intervalMinutes: 5 });
+      } else {
+        await localDataApi.startPipeline({ name: `${source.name || source.source_file} — source processing`, importMissing: true, continueOnline: false, onlineBudget: 0, datasetIds: [source.dataset_id] });
+      }
       await loadLiveProgress();
-      setActionNotice({ type: "success", message: `${source.source_file}: ${continueOnline ? `${number(onlineBudget)}-page enrichment run` : "source processing"} started. Progress will refresh here automatically.` });
+      setActionNotice({ type: "success", message: `${source.source_file}: queued all remaining enrichment in 1,000-row batches with a 5-minute pause.` });
     } catch (error) {
       setActionNotice({ type: "error", message: error.message });
     } finally { setActionBusy(""); }
@@ -224,19 +220,11 @@ export default function Dashboard({ data, onNavigate, onOpenSettings }) {
 
   async function runAllSourcesEnrichment() {
     if (!catalogProgress?.live) return;
-    const pagesLeft = Number(progress.pending_source_pages || 0);
-    const onlineBudget = selectedBudget(pagesLeft);
     setActionBusy("__all__"); setActionNotice({ type: "", message: "" });
     try {
-      await localDataApi.startPipeline({
-        name: onlineBudget >= pagesLeft ? "All sources — complete remaining enrichment" : `All sources — next ${number(onlineBudget)} enrichment pages`,
-        importMissing: false,
-        continueOnline: true,
-        onlineBudget,
-        datasetIds: [],
-      });
+      await localDataApi.createEnrichmentSchedule({ datasetId: "all", name: "All raw CSVs — all remaining enrichment", batchSize: 1000, intervalMinutes: 5 });
       await loadLiveProgress();
-      setActionNotice({ type: "success", message: `All sources: ${number(onlineBudget)}-page enrichment run started. It will continue without more clicks and can be paused or resumed from Enrichment.` });
+      setActionNotice({ type: "success", message: "All imported raw CSVs queued. The worker will process 1,000 rows every 5 minutes until complete." });
     } catch (error) {
       setActionNotice({ type: "error", message: error.message });
     } finally { setActionBusy(""); }
@@ -251,14 +239,7 @@ export default function Dashboard({ data, onNavigate, onOpenSettings }) {
     runSourceAction(source, needsProcessing, pagesLeft);
   }
 
-  function requestAllSourcesEnrichment() {
-    const budget = selectedBudget(progress.pending_source_pages);
-    if (enrichmentRunSize === "all" && budget > 5000) {
-      setConfirmRun({ kind: "all", budget });
-      return;
-    }
-    runAllSourcesEnrichment();
-  }
+  function requestAllSourcesEnrichment() { runAllSourcesEnrichment(); }
 
   async function confirmLongRun() {
     const pending = confirmRun;
@@ -288,11 +269,11 @@ export default function Dashboard({ data, onNavigate, onOpenSettings }) {
   }
 
    return <div className="space-y-6">
-    <section className="overflow-hidden rounded-3xl bg-gradient-to-br from-slate-950 via-blue-950 to-emerald-950 text-white shadow-panel"><div className="grid gap-8 p-6 sm:p-8 lg:grid-cols-[1.35fr_0.65fr] lg:items-center"><div><div className="flex flex-wrap items-center gap-2"><p className="text-xs font-black uppercase tracking-[0.18em] text-cyan-300">Raw data processing status</p><span className={`rounded-full px-2.5 py-1 text-[10px] font-black uppercase ${catalogProgress?.live ? "bg-emerald-400 text-emerald-950" : "bg-white/10 text-slate-300"}`}>{catalogProgress?.live ? "Live from this Mac" : "Published snapshot"}</span></div><h3 className="mt-3 text-2xl font-black tracking-tight sm:text-3xl">{catalogProgress ? `${number(scannedRows)} of ${number(rawRows)} raw rows scanned` : "Loading catalog progress…"}</h3><p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">This measures CSV consolidation. Parts that still need product facts or online checks are already in Master—they are enrichment work, not unprocessed raw rows.</p><div className="mt-6 h-3 overflow-hidden rounded-full bg-white/15" aria-label={`${Math.round(scanPercent)}% of raw rows scanned`}><div className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-emerald-400 transition-all" style={{ width: `${scanPercent}%` }} /></div><div className="mt-3 flex flex-wrap justify-between gap-2 text-xs font-bold text-slate-300"><span>{scanPercent.toFixed(1)}% scanned</span><span>{number(rawRemaining)} raw rows remaining</span></div></div><div className="grid grid-cols-2 gap-3"><button type="button" onClick={() => onNavigate("master")} className="rounded-xl bg-white px-4 py-4 text-left text-sm font-semibold text-slate-900 hover:bg-cyan-50"><Database className="mb-3 text-emerald-600" size={21} />Open Master Data<ArrowRight className="mt-3" size={17} /></button><button type="button" onClick={() => onNavigate("enrichment")} className="rounded-xl border border-white/20 bg-white/10 px-4 py-4 text-left text-sm font-semibold text-white hover:bg-white/15"><Gauge className="mb-3 text-cyan-300" size={21} />Open Enrichment<ArrowRight className="mt-3" size={17} /></button></div></div></section>
+    <section className="overflow-hidden rounded-3xl bg-gradient-to-br from-slate-950 via-blue-950 to-emerald-950 text-white shadow-panel"><div className="grid gap-8 p-6 sm:p-8 lg:grid-cols-[1.35fr_0.65fr] lg:items-center"><div><div className="flex flex-wrap items-center gap-2"><p className="text-xs font-black uppercase tracking-[0.18em] text-cyan-300">All raw CSV enrichment status</p><span className={`rounded-full px-2.5 py-1 text-[10px] font-black uppercase ${catalogProgress?.live ? "bg-emerald-400 text-emerald-950" : "bg-white/10 text-slate-300"}`}>{catalogProgress?.live ? "Live from this Mac" : "Published snapshot"}</span></div><h3 className="mt-3 text-2xl font-black tracking-tight sm:text-3xl">{catalogProgress ? `${number(enrichedRows)} of ${number(masterParts)} unique parts enriched` : "Loading catalog progress…"}</h3><p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">Raw rows are source occurrences. Enrichment is measured on deduplicated master parts, so duplicate rows are not counted repeatedly.</p><div className="mt-6 h-3 overflow-hidden rounded-full bg-white/15" aria-label={`${Math.round((masterParts ? enrichedRows / masterParts : 0) * 100)}% of unique parts enriched`}><div className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-emerald-400 transition-all" style={{ width: `${masterParts ? Math.min(100, enrichedRows / masterParts * 100) : 0}%` }} /></div><div className="mt-3 flex flex-wrap justify-between gap-2 text-xs font-bold text-slate-300"><span>{(masterParts ? Math.min(100, enrichedRows / masterParts * 100) : 0).toFixed(1)}% of parts enriched</span><span>{number(enrichmentRemaining)} unique parts still need facts</span></div></div><div className="grid grid-cols-2 gap-3"><button type="button" onClick={() => onNavigate("master")} className="rounded-xl bg-white px-4 py-4 text-left text-sm font-semibold text-slate-900 hover:bg-cyan-50"><Database className="mb-3 text-emerald-600" size={21} />Open Master Data<ArrowRight className="mt-3" size={17} /></button><button type="button" onClick={() => onNavigate("enrichment")} className="rounded-xl border border-white/20 bg-white/10 px-4 py-4 text-left text-sm font-semibold text-white hover:bg-white/15"><Gauge className="mb-3 text-cyan-300" size={21} />Open Enrichment<ArrowRight className="mt-3" size={17} /></button></div></div></section>
     <section className="rounded-3xl border border-emerald-200 bg-white p-5 shadow-panel sm:p-6" aria-label="Done and remaining progress"><div className="grid gap-6 lg:grid-cols-[auto_1fr_auto] lg:items-center"><ProgressDonut done={chartDone} remaining={chartRemaining} label={chartLabel} /><div><p className="text-xs font-black uppercase tracking-[0.16em] text-emerald-700">Visual completion</p><h3 className="mt-1 text-2xl font-black text-slate-950">{trackedSchedule ? trackedSchedule.name : "Overall row processing"}</h3><p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">{trackedSchedule ? `${number(chartDone)} rows are done and ${number(chartRemaining)} remain. The schedule runs ${number(trackedSchedule.batch_size)} rows every ${number(trackedSchedule.interval_minutes)} minutes.` : `${number(chartDone)} rows are done and ${number(chartRemaining)} remain in the current raw-row scan. Create a row schedule to process the remaining rows automatically.`}</p><div className="mt-4 flex flex-wrap gap-3 text-xs font-black"><span className="rounded-full bg-emerald-100 px-3 py-1.5 text-emerald-800">Done: {number(chartDone)}</span><span className="rounded-full bg-amber-100 px-3 py-1.5 text-amber-800">Remaining: {number(chartRemaining)}</span>{trackedSchedule?.in_progress_rows > 0 && <span className="rounded-full bg-blue-100 px-3 py-1.5 text-blue-800">In progress: {number(trackedSchedule.in_progress_rows)}</span>}</div></div><div className="flex min-w-52 flex-col gap-2">{scheduleNeedsResume ? <button type="button" disabled={Boolean(actionBusy)} onClick={progressAction} className="inline-flex items-center justify-center gap-2 rounded-xl bg-brand-600 px-4 py-3 text-sm font-black text-white disabled:opacity-50"><Play size={17} />Resume batch</button> : <button type="button" disabled={Boolean(actionBusy) || activeRowBatch} onClick={progressAction} className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-3 text-sm font-black text-white disabled:opacity-50"><Timer size={17} />{trackedSchedule ? chartRemaining ? activeRowBatch ? "Open active batch" : "Run next batch" : "Open enrichment" : "Set up row schedule"}</button>}<button type="button" onClick={() => onNavigate("enrichment")} className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 px-4 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50"><Gauge size={17} />Open enrichment</button></div></div></section>
 
     {!catalogProgress ? <div className="grid min-h-40 place-items-center rounded-3xl border border-slate-200 bg-white"><LoaderCircle className="animate-spin text-brand-600" size={28} /></div> : <>
-      <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8" aria-label="Raw data and master progress metrics"><ProgressMetric label="CSV files" value={progress.discovered_files} detail={`${number(progress.indexed_files)} fully scanned`} /><ProgressMetric label="Source size" value={formatBytes(totalBytes)} detail="Combined raw CSV size" /><ProgressMetric label="Raw rows" value={rawRows} detail={`${number(scannedRows)} scanned`} /><ProgressMetric label="Rows remaining" value={rawRemaining} detail="Still waiting for scan" tone={rawRemaining ? "text-amber-700" : "text-emerald-700"} /><ProgressMetric label="Unique Master parts" value={progress.master_parts} detail={`${number(masterRemaining)} known parts missing`} tone="text-blue-700" /><ProgressMetric label="Need product facts" value={progress.remaining_fact_parts} detail="Already in Master" tone="text-violet-700" /><ProgressMetric label="Pages checked" value={progress.processed_source_pages} detail={`${number(progress.source_pages)} linked pages total`} tone="text-cyan-700" /><ProgressMetric label="Pages remaining" value={progress.pending_source_pages} detail="Controlled online checks" tone="text-amber-700" /></section>
+      <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8" aria-label="Raw data and master progress metrics"><ProgressMetric label="CSV files" value={progress.discovered_files} detail={`${number(progress.indexed_files)} fully scanned`} /><ProgressMetric label="Source size" value={formatBytes(totalBytes)} detail="Combined raw CSV size" /><ProgressMetric label="Raw rows" value={rawRows} detail={`${number(scannedRows)} scanned`} /><ProgressMetric label="Unique parts enriched" value={enrichedRows} detail="With product facts" tone="text-emerald-700" /><ProgressMetric label="Parts still to enrich" value={enrichmentRemaining} detail="Need product facts" tone="text-amber-700" /><ProgressMetric label="Unique Master parts" value={progress.master_parts} detail={`${number(masterRemaining)} known parts missing`} tone="text-blue-700" /><ProgressMetric label="Pages checked" value={progress.processed_source_pages} detail="Online evidence" tone="text-cyan-700" /><ProgressMetric label="Pages remaining" value={progress.pending_source_pages} detail="Controlled online checks" tone="text-amber-700" /></section>
 
       <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-panel sm:p-7" aria-label="Master data completion funnel"><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-xs font-black uppercase tracking-[0.16em] text-brand-700">End-to-end completion funnel</p><h3 className="mt-1 text-2xl font-black text-slate-950">Where every combined CSV row stands</h3><p className="mt-1 text-sm text-slate-500">Counts are separated by unit: raw rows, unique parts, enriched parts, and verified parts.</p></div><span className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-black text-slate-600">{number(totalPages)} linked pages in scope</span></div><div className="mt-6 grid gap-3 lg:grid-cols-5">{stages.map((stage) => { const percent = stage.total ? Math.min(100, (stage.done / stage.total) * 100) : 0; return <article key={stage.label} className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><div className="flex items-start justify-between gap-2"><p className="text-xs font-black uppercase tracking-wide text-slate-500">{stage.label}</p><span className="text-sm font-black text-slate-900">{percent.toFixed(1)}%</span></div><p className="mt-3 text-2xl font-black tabular-nums text-slate-950">{number(stage.done)}</p><p className="mt-1 text-[11px] leading-4 text-slate-500">{stage.detail}</p><div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-200"><div className={`h-full rounded-full ${stage.tone}`} style={{ width: `${percent}%` }} /></div><p className="mt-2 text-xs font-bold text-amber-700">{number(stage.left)} left</p></article>; })}</div><div className="mt-5 grid gap-3 sm:grid-cols-3"><button type="button" onClick={() => setBacklogView("repair")} className={`rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-left transition hover:-translate-y-0.5 hover:shadow-md ${backlogView === "repair" ? "ring-2 ring-amber-400" : ""}`}><p className="text-[10px] font-black uppercase tracking-wide text-amber-700">Held out for repair</p><p className="mt-1 text-xl font-black text-amber-950">{number(progress.invalid_rows)}</p><p className="mt-1 text-xs text-amber-800">Rows without usable identity · View action table →</p></button><button type="button" onClick={() => setBacklogView("facts")} className={`rounded-xl border border-violet-200 bg-violet-50 px-4 py-3 text-left transition hover:-translate-y-0.5 hover:shadow-md ${backlogView === "facts" ? "ring-2 ring-violet-400" : ""}`}><p className="text-[10px] font-black uppercase tracking-wide text-violet-700">Enrichment backlog</p><p className="mt-1 text-xl font-black text-violet-950">{number(progress.remaining_fact_parts)}</p><p className="mt-1 text-xs text-violet-800">Master parts still needing facts · View action table →</p></button><button type="button" onClick={() => setBacklogView("evidence")} className={`rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-left transition hover:-translate-y-0.5 hover:shadow-md ${backlogView === "evidence" ? "ring-2 ring-cyan-400" : ""}`}><p className="text-[10px] font-black uppercase tracking-wide text-cyan-700">Evidence backlog</p><p className="mt-1 text-xl font-black text-cyan-950">{number(progress.pending_source_pages)}</p><p className="mt-1 text-xs text-cyan-800">Supplier pages still to check · View action table →</p></button></div>
       {backlogView && <div className="mt-5 overflow-hidden rounded-2xl border border-slate-200"><header className="flex flex-wrap items-center justify-between gap-3 bg-slate-950 px-4 py-4 text-white"><div><p className="text-xs font-black uppercase tracking-widest text-cyan-300">Action table</p><h4 className="mt-1 text-lg font-black">{backlogView === "repair" ? "Rows held out for repair" : backlogView === "facts" ? "Parts still needing product facts" : "Supplier evidence still to check"}</h4></div><button type="button" onClick={() => setBacklogView("")} className="rounded-lg border border-white/20 px-3 py-1.5 text-xs font-bold text-slate-300">Close</button></header><div className="overflow-x-auto"><table className="min-w-full text-xs"><thead className="border-b border-slate-200 bg-slate-50 text-left uppercase tracking-wide text-slate-500"><tr><th className="px-4 py-3">Source CSV</th><th className="px-4 py-3">Rows / parts</th><th className="px-4 py-3">Remaining</th><th className="px-4 py-3">Status</th><th className="px-4 py-3">Action</th></tr></thead><tbody className="divide-y divide-slate-100">{sources.map((source) => { const indexed = source.import_status === "indexed" || source.is_indexed === true; const value = backlogView === "repair" ? Number(source.invalid_rows || 0) : backlogView === "facts" ? Number(source.remaining_fact_parts || 0) : Number(source.pending_source_pages || 0); const total = backlogView === "repair" ? Number(source.raw_rows || 0) : backlogView === "facts" ? Number(source.master_parts || 0) : Number(source.source_pages || 0); return <tr key={source.source_file} className="hover:bg-slate-50"><td className="max-w-72 px-4 py-3 font-bold"><span className="break-all">{source.source_file}</span></td><td className="px-4 py-3">{number(total)}</td><td className="px-4 py-3 font-black text-amber-700">{number(value)}</td><td className="px-4 py-3"><span className={`rounded-full px-2 py-1 font-bold ${!indexed ? "bg-amber-100 text-amber-800" : value ? "bg-violet-100 text-violet-800" : "bg-emerald-100 text-emerald-800"}`}>{!indexed ? "Needs processing" : value ? "Action needed" : "Complete"}</span></td><td className="px-4 py-3">{backlogView === "repair" ? <button type="button" onClick={() => onNavigate("review")} className="rounded-lg bg-brand-600 px-3 py-1.5 font-bold text-white">Open repair queue</button> : backlogView === "facts" ? <button type="button" onClick={() => onNavigate("enrichment")} className="rounded-lg bg-violet-600 px-3 py-1.5 font-bold text-white">Enrich parts</button> : <button type="button" disabled={!catalogProgress.live || activePipeline || !value} onClick={() => requestSourceAction(source, false, value)} className="rounded-lg bg-cyan-600 px-3 py-1.5 font-bold text-white disabled:opacity-40">Check pages</button>}</td></tr>; })}</tbody></table></div></div>}
