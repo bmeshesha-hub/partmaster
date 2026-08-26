@@ -261,7 +261,7 @@ function FullDatasetPipeline() {
   const [pipelineSources, setPipelineSources] = useState([]);
   const [sourceCoverage, setSourceCoverage] = useState({});
   const [rawDataPath, setRawDataPath] = useState("");
-  const [onlineBudget, setOnlineBudget] = useState(250);
+  const [onlineBudget] = useState(250);
   const [busy, setBusy] = useState(false);
   const [pipelineError, setPipelineError] = useState("");
   const [pipelineExports, setPipelineExports] = useState([]);

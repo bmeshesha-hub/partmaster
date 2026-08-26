@@ -166,7 +166,6 @@ export default function Dashboard({ data, onNavigate, onOpenSettings }) {
   const enrichedRows = Number(progress.parts_with_facts || 0);
   const enrichmentRemaining = Number(progress.remaining_fact_parts || 0);
   const masterRemaining = Number(progress.remaining_master_parts || 0);
-  const scanPercent = rawRows ? Math.min(100, (scannedRows / rawRows) * 100) : 0;
   const totalBytes = sources.reduce((sum, source) => sum + Number(source.source_bytes || 0), 0);
   const pipelineStatus = catalogProgress?.job?.status || (rawRows && !rawRemaining ? "completed" : "snapshot");
   const activePipeline = ["queued", "running"].includes(catalogProgress?.job?.status);
@@ -201,7 +200,7 @@ export default function Dashboard({ data, onNavigate, onOpenSettings }) {
     return enrichmentRunSize === "all" ? Number(pagesLeft || 0) : Math.min(Number(enrichmentRunSize), Number(pagesLeft || 0));
   }
 
-  async function runSourceAction(source, needsProcessing, pagesLeft) {
+  async function runSourceAction(source, needsProcessing, _pagesLeft) {
     if (!catalogProgress?.live) return;
     setActionBusy(source.source_file); setActionNotice({ type: "", message: "" });
     try {

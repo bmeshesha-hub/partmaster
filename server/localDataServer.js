@@ -4722,12 +4722,22 @@ app.get("/api/local/master-catalog", asyncRoute(async (request, response) => {
        parts.part_number, parts.description, parts.family_name, parts.component_scope, parts.side, parts.position,
        parts.extracted_attributes_json, parts.extracted_attribute_count, parts.occurrence_count, parts.dataset_count, parts.application_count,
        parts.source_page_count, parts.best_source_url, parts.confidence, parts.attribute_status, parts.online_status, parts.updated_at,
+       applications.vehicle_summary, applications.epid_summary, applications.assembly_summary, applications.mapping_confidence,
        coalesce(flags.review_flag_count, 0) AS review_flag_count, coalesce(flags.review_flags, '') AS review_flags
        FROM partmaster_offline_parts parts
        LEFT JOIN (
          SELECT part_key, count(*) AS review_flag_count, string_agg(flag_code, ', ' ORDER BY flag_code) AS review_flags
          FROM partmaster_master_review_flags WHERE status = 'open' GROUP BY part_key
-       ) flags ON flags.part_key = parts.part_key ${where}
+       ) flags ON flags.part_key = parts.part_key
+       LEFT JOIN LATERAL (
+         SELECT string_agg(DISTINCT concat_ws(' · ', applications.year, applications.vehicle_make, applications.vehicle_model, applications.vehicle_type, applications.vehicle_motorcycle_type), ' | ') AS vehicle_summary,
+                string_agg(DISTINCT applications.epid, ', ') FILTER (WHERE applications.epid IS NOT NULL AND trim(applications.epid) != '') AS epid_summary,
+                string_agg(DISTINCT applications.assembly, ' | ') FILTER (WHERE applications.assembly IS NOT NULL AND trim(applications.assembly) != '') AS assembly_summary,
+                min(applications.vehicle_mapping_confidence) AS mapping_confidence
+         FROM partmaster_canonical_parts canonical
+         JOIN partmaster_part_applications applications ON applications.part_id = canonical.id
+         WHERE canonical.manufacturer_norm = parts.manufacturer_norm AND canonical.part_number_norm = parts.part_number_norm
+       ) applications ON true ${where}
        ORDER BY parts.${sort} ${direction} NULLS LAST, parts.manufacturer_norm, parts.part_number_norm
        LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values,
     );
@@ -4779,6 +4789,41 @@ app.post("/api/local/master-catalog/export", asyncRoute(async (request, response
     return Number(reader.getRowObjectsJson()[0].count);
   });
   response.json({ exports: [{ filename, downloadUrl: `/api/local/exports/${encodeURIComponent(filename)}`, filters }], count });
+}));
+
+app.post("/api/local/master/fpa-export", asyncRoute(async (_request, response) => {
+  const stamp = Date.now();
+  const filename = `partmaster_fpa_export-${stamp}.csv`;
+  const path = join(EXPORT_ROOT, filename);
+  await withConnection((connection) => connection.run(
+    `COPY (SELECT parts.id AS "part_id", parts.part_number AS "oem_part_number", parts.manufacturer AS "manufacturer_name",
+       parts.description AS "part_description", families.family_name AS "part_category", parts.component_scope,
+       applications.year AS "year", applications.vehicle_make AS "make", applications.vehicle_model AS "model",
+       applications.vehicle_trim AS "trim", applications.vehicle_type, applications.vehicle_motorcycle_type AS "motorcycle_type",
+       applications.epid, applications.assembly, applications.position, applications.side,
+       applications.quantity AS "quantity_per_vehicle", applications.source_url, applications.evidence_url,
+       applications.vehicle_mapping_method, applications.vehicle_mapping_confidence,
+       parts.extracted_attributes_json AS "product_attributes", parts.occurrence_count, parts.confidence,
+       parts.online_status AS "evidence_status", parts.updated_at,
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'heated' LIMIT 1) AS heated,
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'auto_dimming' LIMIT 1) AS auto_dimming,
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'power_folding' LIMIT 1) AS power_folding,
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'memory' LIMIT 1) AS memory,
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'blind_spot' LIMIT 1) AS blind_spot,
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'camera' LIMIT 1) AS camera,
+       (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'turn_signal' LIMIT 1) AS turn_signal
+       FROM partmaster_part_applications applications
+       JOIN partmaster_canonical_parts parts ON parts.id = applications.part_id
+       LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       WHERE parts.verification_status != 'rejected'
+       ORDER BY parts.manufacturer_norm, parts.part_number_norm, applications.year, applications.model)
+       TO ${quoteString(path)} (FORMAT CSV, HEADER true)`,
+  ));
+  const count = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll("SELECT count(*) AS count FROM partmaster_part_applications applications JOIN partmaster_canonical_parts parts ON parts.id = applications.part_id WHERE parts.verification_status != 'rejected'");
+    return Number(reader.getRowObjectsJson()[0].count);
+  });
+  response.json({ exports: [{ filename, downloadUrl: `/api/local/exports/${encodeURIComponent(filename)}` }], count });
 }));
 
 app.post("/api/local/master-catalog/revalidate", asyncRoute(async (_request, response) => {
