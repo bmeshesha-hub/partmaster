@@ -2649,8 +2649,13 @@ async function checkOfflineSourcePages(jobId, budget, datasetIds = []) {
       const jobReader = await connection.runAndReadAll("SELECT status FROM partmaster_pipeline_jobs WHERE id = $jobId", { jobId });
       if (jobReader.getRowObjectsJson()[0]?.status !== "running") return null;
       const pageReader = await connection.runAndReadAll(
-        `SELECT * FROM partmaster_offline_source_pages WHERE status = 'pending' ${datasetScope}
-         ORDER BY priority_score DESC LIMIT 1`,
+         `SELECT pages.* FROM partmaster_offline_source_pages pages
+          WHERE pages.status = 'pending' ${datasetScope}
+            AND EXISTS (SELECT 1 FROM partmaster_offline_part_sources scoped
+              JOIN partmaster_offline_parts scoped_parts ON scoped_parts.part_key = scoped.part_key
+              WHERE scoped.source_url = pages.source_url
+                AND (scoped_parts.attribute_status != 'complete' OR scoped_parts.online_status != 'verified' OR scoped_parts.confidence < .94))
+          ORDER BY pages.priority_score DESC LIMIT 1`,
       );
       const page = pageReader.getRowObjectsJson()[0];
       if (!page) return null;
@@ -2664,9 +2669,11 @@ async function checkOfflineSourcePages(jobId, budget, datasetIds = []) {
       const byNumber = new Map(items.map((item) => [normalizePartNumber(item.partNumber), item]));
       const parts = await withConnection(async (connection) => {
         const reader = await connection.runAndReadAll(
-          `SELECT DISTINCT parts.* FROM partmaster_offline_parts parts
+           `SELECT DISTINCT parts.* FROM partmaster_offline_parts parts
            JOIN partmaster_offline_part_sources sources ON sources.part_key = parts.part_key
-           WHERE sources.source_url = $url LIMIT 10000`, { url: context.source_url },
+           WHERE sources.source_url = $url
+             AND (parts.attribute_status != 'complete' OR parts.online_status != 'verified' OR parts.confidence < .94)
+           LIMIT 10000`, { url: context.source_url },
         );
         return reader.getRowObjectsJson();
       });
@@ -2883,6 +2890,14 @@ async function createEnrichmentJob(options) {
           AND NOT EXISTS (
             SELECT 1 FROM partmaster_enrichment_candidates prior
             WHERE prior.dataset_id = $datasetId AND prior.source_row_id = source._row_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM partmaster_offline_parts complete_part
+            WHERE complete_part.manufacturer_norm = upper(regexp_replace(coalesce(${manufacturer}, ''), '[^A-Za-z0-9]', '', 'g'))
+              AND complete_part.part_number_norm = upper(regexp_replace(coalesce(${partNumber}, ''), '[^A-Za-z0-9]', '', 'g'))
+              AND complete_part.attribute_status = 'complete'
+              AND complete_part.online_status = 'verified'
+              AND complete_part.confidence >= .94
           )
         -- Spend each enrichment batch on rows that cannot currently enter the
         -- master first. This closes the gap where valid rows consumed the
@@ -4616,7 +4631,8 @@ app.get("/api/local/master-dashboard", asyncRoute(async (_request, response) => 
        count(*) FILTER (WHERE confidence >= .9) AS high_confidence_parts,
        count(*) FILTER (WHERE confidence < .7) AS low_confidence_parts,
        (SELECT count(DISTINCT part_key) FROM partmaster_master_review_flags WHERE status = 'open') AS parts_needing_review,
-       (SELECT count(*) FROM partmaster_master_review_flags WHERE status = 'open') AS review_flags
+       (SELECT count(*) FROM partmaster_master_review_flags WHERE status = 'open') AS review_flags,
+       (SELECT count(*) FROM partmaster_part_applications) AS total_applications
        FROM partmaster_offline_parts`,
     );
     const manufacturerReader = await connection.runAndReadAll(
