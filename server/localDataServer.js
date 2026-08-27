@@ -851,7 +851,14 @@ function vehicleModelVariants(value) {
   const variants = [normalizeApplicationValue(raw)];
   const base = raw.split("(")[0].trim();
   if (base && base !== raw) variants.push(normalizeApplicationValue(base));
+  const suffixStripped = base.replace(/\s+(ABS|US|SE|KRT|CAFE|BASE)$/i, "").trim();
+  if (suffixStripped && suffixStripped !== base) variants.push(normalizeApplicationValue(suffixStripped));
   return [...new Set(variants.filter(Boolean))];
+}
+
+function vehicleModelCodeStem(value) {
+  const code = String(value || "").match(/\(([^)]+)\)/)?.[1] || "";
+  return normalizeApplicationValue(code).match(/^[A-Z]+\d+/)?.[0] || "";
 }
 
 const CATEGORY_ATTRIBUTE_SCHEMAS = [
@@ -1287,15 +1294,21 @@ async function lookupVehicleMapping({ epid, year, make, model }) {
       const makeNorm = normalizeApplicationValue(make);
       const modelNorms = vehicleModelVariants(model);
       const modelPredicates = modelNorms.map((_value, index) => `$model${index}`);
+      const codeStem = vehicleModelCodeStem(model);
+      const codePredicate = codeStem
+        ? ` OR regexp_replace(trim(coalesce(trim_name, '')), '[^A-Za-z0-9]', '', 'g') LIKE $codeStem || '%'`
+        : "";
+      const modelBindings = Object.fromEntries(modelNorms.map((value, index) => [`model${index}`, value]));
+      if (codeStem) modelBindings.codeStem = codeStem;
       const candidateReader = await connection.runAndReadAll(
         `SELECT DISTINCT epid FROM (
           SELECT epid FROM partmaster_vehicle_master
-          WHERE year_norm = $year AND make_norm = $make AND model_norm IN (${modelPredicates.join(", ")})
+          WHERE year_norm = $year AND make_norm = $make AND (model_norm IN (${modelPredicates.join(", ")})${codePredicate})
           UNION
           SELECT epid FROM partmaster_vehicle_source_aliases
-          WHERE year_norm = $year AND make_norm = $make AND model_norm IN (${modelPredicates.join(", ")})
+          WHERE year_norm = $year AND make_norm = $make AND (model_norm IN (${modelPredicates.join(", ")})${codePredicate})
         ) matches LIMIT 2`,
-        { year: yearNorm, make: makeNorm, ...Object.fromEntries(modelNorms.map((value, index) => [`model${index}`, value])) },
+        { year: yearNorm, make: makeNorm, ...modelBindings },
       );
       const candidates = candidateReader.getRowObjectsJson();
       if (candidates.length === 1) {
@@ -1497,15 +1510,15 @@ async function processFitmentEnrichmentBatch(jobId) {
           message = `Mapped ${vehicle.year} ${vehicle.make_name} ${vehicle.model_name}${vehicle.trim_name && vehicle.trim_name !== "--" ? ` ${vehicle.trim_name}` : ""}.`;
           await connection.run(
             `UPDATE partmaster_part_applications SET epid = $epid, year = $year, model = $model,
-             vehicle_make = $make, vehicle_model = $model, vehicle_trim = $trim, vehicle_type = $type,
-             vehicle_motorcycle_type = $motorcycleType, vehicle_mapping_method = $method,
+             vehicle_make = $make, vehicle_model = $model, vehicle_trim = nullif($trim, ''), vehicle_type = nullif($type, ''),
+             vehicle_motorcycle_type = nullif($motorcycleType, ''), vehicle_mapping_method = $method,
              vehicle_mapping_confidence = $confidence,
              fitment_explanation = coalesce(fitment_explanation || ' ', '') || $explanation,
              updated_at = current_timestamp WHERE id = $applicationId`,
             {
               applicationId: item.application_id, epid: vehicle.epid, year: vehicle.year, model: vehicle.model_name,
-              make: vehicle.make_name, trim: vehicle.trim_name && vehicle.trim_name !== "--" ? vehicle.trim_name : null,
-              type: vehicle.vehicle_type, motorcycleType: vehicle.motorcycle_type, method: vehicle.method,
+              make: vehicle.make_name, trim: vehicle.trim_name && vehicle.trim_name !== "--" ? vehicle.trim_name : "",
+              type: vehicle.vehicle_type || "", motorcycleType: vehicle.motorcycle_type || "", method: vehicle.method,
               confidence: vehicle.confidence, explanation: `Vehicle mapping: ${message}`,
             },
           );
@@ -1544,13 +1557,19 @@ async function processFitmentEnrichmentBatch(jobId) {
     return { completed: false, delay: nextRun.getTime() - Date.now() };
   });
   if (!next.completed) {
-    const timer = setTimeout(() => {
-      fitmentEnrichmentTimers.delete(jobId);
-      scheduleFitmentEnrichmentJob(jobId);
-    }, Math.max(1000, next.delay));
-    fitmentEnrichmentTimers.set(jobId, timer);
+    scheduleFitmentEnrichmentJobAt(jobId, next.delay);
   }
   return true;
+}
+
+function scheduleFitmentEnrichmentJobAt(jobId, delay = 0) {
+  const previous = fitmentEnrichmentTimers.get(jobId);
+  if (previous) clearTimeout(previous);
+  const timer = setTimeout(() => {
+    fitmentEnrichmentTimers.delete(jobId);
+    scheduleFitmentEnrichmentJob(jobId);
+  }, Math.max(1000, Number(delay) || 0));
+  fitmentEnrichmentTimers.set(jobId, timer);
 }
 
 function scheduleFitmentEnrichmentJob(jobId) {
@@ -5545,7 +5564,15 @@ app.get("/api/local/fitment-enrichment/jobs/:id", asyncRoute(async (request, res
     return reader.getRowObjectsJson()[0];
   });
   if (!job) return response.status(404).json({ error: "Fitment enrichment job not found." });
-  response.json({ job });
+  const detail = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT status, message, count(*) AS count FROM partmaster_fitment_enrichment_items
+       WHERE job_id = $id GROUP BY status, message ORDER BY count DESC LIMIT 20`,
+      { id: request.params.id },
+    );
+    return reader.getRowObjectsJson();
+  });
+  response.json({ job, detail });
 }));
 
 app.post("/api/local/fitment-enrichment/jobs/:id/pause", asyncRoute(async (request, response) => {
@@ -6658,6 +6685,13 @@ const resumableFitmentEnrichmentJobIds = await withConnection(async (connection)
   return reader.getRowObjectsJson().map((job) => job.id);
 });
 
+const waitingFitmentEnrichmentJobs = await withConnection(async (connection) => {
+  const reader = await connection.runAndReadAll(
+    "SELECT id, next_run_at FROM partmaster_fitment_enrichment_jobs WHERE status = 'waiting'",
+  );
+  return reader.getRowObjectsJson();
+});
+
 const resumablePipelineJobIds = await withConnection(async (connection) => {
   await connection.run("UPDATE partmaster_pipeline_jobs SET status = 'queued', phase = 'queued' WHERE status = 'running'");
   const reader = await connection.runAndReadAll("SELECT id FROM partmaster_pipeline_jobs WHERE status = 'queued'");
@@ -6681,6 +6715,10 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   resumableRowEnhancementJobIds.forEach(scheduleRowEnhancementJob);
   resumableAutopilotJobIds.forEach(scheduleAutopilotJob);
   resumableFitmentEnrichmentJobIds.forEach(scheduleFitmentEnrichmentJob);
+  waitingFitmentEnrichmentJobs.forEach((job) => {
+    const nextRun = new Date(String(job.next_run_at || "").replace(" ", "T")).getTime();
+    scheduleFitmentEnrichmentJobAt(job.id, Number.isFinite(nextRun) ? Math.max(0, nextRun - Date.now()) : 0);
+  });
   resumablePipelineJobIds.forEach(scheduleFullPipeline);
   setTimeout(() => checkPipelineSchedules(), 1000);
   setTimeout(() => checkEnrichmentSchedules(), 1200);
