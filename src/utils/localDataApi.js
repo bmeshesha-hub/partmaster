@@ -50,6 +50,7 @@ export const localDataApi = {
   },
   exportMasterCatalog: (parameters = {}) => request("/master-catalog/export", { method: "POST", body: JSON.stringify(parameters) }),
   exportFpa: () => request("/master/fpa-export", { method: "POST", body: "{}" }),
+  masterQuickView: (kind, query = "") => request(`/master/quick-view/${encodeURIComponent(kind)}${query ? `?q=${encodeURIComponent(query)}` : ""}`),
   revalidateMasterCatalog: () => request("/master-catalog/revalidate", { method: "POST", body: "{}" }),
   exportPipelineCatalog: () => request("/pipeline/exports", { method: "POST", body: "{}" }),
   enrichmentJobs: () => request("/enrichment/jobs"),

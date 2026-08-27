@@ -4842,6 +4842,23 @@ app.post("/api/local/master/fpa-export", asyncRoute(async (_request, response) =
   response.json({ exports: [{ filename, downloadUrl: `/api/local/exports/${encodeURIComponent(filename)}` }], count });
 }));
 
+app.get("/api/local/master/quick-view/:kind", asyncRoute(async (request, response) => {
+  const kind = String(request.params.kind || "");
+  const query = String(request.query.q || "").trim().toLowerCase();
+  const like = `%${query}%`;
+  const result = await withConnection(async (connection) => {
+    let sql;
+    if (kind === "parts") sql = `SELECT part_key, manufacturer, part_number, description, family_name, component_scope, extracted_attribute_count, occurrence_count, online_status, confidence FROM partmaster_offline_parts WHERE $query = '' OR lower(concat_ws(' ', manufacturer, part_number, description, family_name)) LIKE $like ORDER BY occurrence_count DESC LIMIT 50`;
+    else if (kind === "fitments") sql = `SELECT parts.manufacturer, parts.part_number, applications.year, applications.vehicle_make, applications.vehicle_model, applications.vehicle_trim, applications.vehicle_type, applications.vehicle_motorcycle_type, applications.epid, applications.assembly, applications.position, applications.side, applications.vehicle_mapping_confidence FROM partmaster_part_applications applications JOIN partmaster_canonical_parts parts ON parts.id = applications.part_id WHERE $query = '' OR lower(concat_ws(' ', parts.manufacturer, parts.part_number, applications.year, applications.vehicle_make, applications.vehicle_model, applications.vehicle_type, applications.vehicle_motorcycle_type, applications.assembly)) LIKE $like ORDER BY parts.manufacturer_norm, parts.part_number_norm LIMIT 50`;
+    else if (kind === "attributes") sql = `SELECT parts.manufacturer, parts.part_number, attributes.attribute_name, attributes.attribute_value, attributes.source_method, attributes.confidence FROM partmaster_variant_attributes attributes JOIN partmaster_canonical_parts parts ON parts.id = attributes.part_id WHERE $query = '' OR lower(concat_ws(' ', parts.manufacturer, parts.part_number, attributes.attribute_name, attributes.attribute_value)) LIKE $like ORDER BY parts.manufacturer_norm, parts.part_number_norm, attributes.attribute_name LIMIT 50`;
+    else if (kind === "sources") sql = `SELECT sources.manufacturer, sources.part_number, sources.source_url, sources.dataset_id, sources.source_row_id, sources.occurrence_count FROM partmaster_offline_part_sources sources WHERE $query = '' OR lower(concat_ws(' ', sources.manufacturer, sources.part_number, sources.source_url)) LIKE $like ORDER BY sources.occurrence_count DESC LIMIT 50`;
+    else throw new Error("Unknown master quick-view table.");
+    const reader = await connection.runAndReadAll(sql, { query, like });
+    return reader.getRowObjectsJson();
+  });
+  response.json({ kind, rows: result, query });
+}));
+
 app.post("/api/local/master-catalog/revalidate", asyncRoute(async (_request, response) => {
   const result = await withConnection(async (connection) => {
     const invalidWhere = `NOT (${partNumberValidationSql("part_number_norm")})`;
