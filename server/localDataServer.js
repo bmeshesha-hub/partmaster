@@ -883,6 +883,10 @@ function vehicleModelCodeStem(value) {
 function vehicleModelLookupVariants(value, assembly = "") {
   const raw = String(value || "").trim();
   const variants = new Set(vehicleModelVariants(raw));
+  for (const match of raw.matchAll(/\(([^)]+)\)/g)) {
+    const parenthetical = normalizeApplicationValue(match[1]);
+    if (parenthetical) variants.add(parenthetical);
+  }
   const normalizedRaw = normalizeApplicationValue(raw);
   const assemblyNorm = normalizeApplicationValue(assembly);
   if (assemblyNorm && normalizedRaw.includes(assemblyNorm)) {
@@ -1372,6 +1376,8 @@ async function lookupVehicleMapping({ epid, year, make, model, assembly }) {
             if (queryVariant === referenceVariant) candidateScore = 100;
             else if (queryVariant.includes(referenceVariant)) {
               candidateScore = 70 + Math.min(20, (referenceVariant.length / queryVariant.length) * 20);
+            } else if (referenceVariant.startsWith(queryVariant) && queryVariant.length >= 6 && referenceVariant.length - queryVariant.length <= 12) {
+              candidateScore = 82 + Math.min(8, (queryVariant.length / referenceVariant.length) * 8);
             }
             if (candidateScore > score) {
               score = candidateScore;
