@@ -55,6 +55,7 @@ export const localDataApi = {
   exportPipelineCatalog: () => request("/pipeline/exports", { method: "POST", body: "{}" }),
   enrichmentJobs: () => request("/enrichment/jobs"),
   fitmentEnrichmentJobs: () => request("/fitment-enrichment/jobs"),
+  startFitmentEnrichment: (options = {}) => request("/fitment-enrichment/jobs", { method: "POST", body: JSON.stringify(options) }),
   pauseFitmentEnrichment: (jobId) => request(`/fitment-enrichment/jobs/${encodeURIComponent(jobId)}/pause`, { method: "POST", body: "{}" }),
   resumeFitmentEnrichment: (jobId) => request(`/fitment-enrichment/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST", body: "{}" }),
   enrichmentJob: (jobId) => request(`/enrichment/jobs/${encodeURIComponent(jobId)}`),

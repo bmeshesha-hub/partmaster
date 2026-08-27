@@ -24,6 +24,7 @@ const activeAutopilotJobs = new Set();
 const activePipelineJobs = new Set();
 const activeFitmentEnrichmentJobs = new Set();
 const fitmentEnrichmentTimers = new Map();
+const vehicleLookupCache = new Map();
 const fitmentDatasetContexts = new Map();
 const networkEvents = [];
 const compatibilityQueue = [];
@@ -272,6 +273,7 @@ await withConnection((connection) => connection.run(`
     id VARCHAR PRIMARY KEY,
     name VARCHAR NOT NULL,
     status VARCHAR NOT NULL,
+    mode VARCHAR NOT NULL DEFAULT 'local_mapping',
     batch_size INTEGER NOT NULL DEFAULT 1000,
     interval_minutes INTEGER NOT NULL DEFAULT 5,
     total_count BIGINT NOT NULL DEFAULT 0,
@@ -297,6 +299,15 @@ await withConnection((connection) => connection.run(`
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     processed_at TIMESTAMP,
     UNIQUE (job_id, application_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS partmaster_fitment_online_cache (
+    query_key VARCHAR PRIMARY KEY,
+    query_text VARCHAR NOT NULL,
+    results_json VARCHAR,
+    status VARCHAR NOT NULL,
+    message VARCHAR,
+    fetched_at TIMESTAMP NOT NULL DEFAULT current_timestamp
   );
 
   CREATE TABLE IF NOT EXISTS partmaster_offline_part_sources (
@@ -625,6 +636,11 @@ await withConnection((connection) => connection.run(`
     ON partmaster_vehicle_source_aliases (epid)
 `));
 
+await withConnection(async (connection) => {
+  await connection.run("ALTER TABLE partmaster_fitment_enrichment_jobs ADD COLUMN IF NOT EXISTS mode VARCHAR");
+  await connection.run("UPDATE partmaster_fitment_enrichment_jobs SET mode = 'local_mapping' WHERE mode IS NULL");
+});
+
 await withConnection((connection) => connection.run(`
   INSERT OR IGNORE INTO partmaster_source_processing
     (dataset_id, raw_rows, usable_rows, invalid_rows, unique_parts, scanned_at)
@@ -857,8 +873,43 @@ function vehicleModelVariants(value) {
 }
 
 function vehicleModelCodeStem(value) {
-  const code = String(value || "").match(/\(([^)]+)\)/)?.[1] || "";
+  const raw = String(value || "").trim();
+  const code = raw.match(/\(([^)]+)\)/)?.[1]
+    || raw.match(/\b([A-Z]{2,}\d+[A-Z0-9]*)$/i)?.[1]
+    || "";
   return normalizeApplicationValue(code).match(/^[A-Z]+\d+/)?.[0] || "";
+}
+
+function vehicleModelLookupVariants(value, assembly = "") {
+  const raw = String(value || "").trim();
+  const variants = new Set(vehicleModelVariants(raw));
+  const normalizedRaw = normalizeApplicationValue(raw);
+  const assemblyNorm = normalizeApplicationValue(assembly);
+  if (assemblyNorm && normalizedRaw.includes(assemblyNorm)) {
+    const withoutAssembly = normalizedRaw.replace(assemblyNorm, "");
+    if (withoutAssembly) variants.add(withoutAssembly);
+  }
+  const removableSuffixes = [
+    "CLUTCH", "REAR", "FRONT", "CRANKCASE", "SHIFTER", "STEERING", "VALVE",
+    "CYLINDER", "PISTON", "GASKET", "COVER", "BRAKE", "FORK", "FRAME",
+    "WHEEL", "CARBURETOR", "TURNSIGNAL", "CHASSIS", "ENGINE",
+  ];
+  let words = raw.split(/\s+/).filter(Boolean);
+  while (words.length && removableSuffixes.includes(words.at(-1).toUpperCase())) words.pop();
+  if (words.length) variants.add(normalizeApplicationValue(words.join(" ")));
+  const leadingCode = raw.match(/^([A-Z]{2,}\d+[A-Z0-9]*)\b/i)?.[1];
+  if (leadingCode) variants.add(normalizeApplicationValue(leadingCode));
+  return [...variants].filter((variant) => variant.length >= 4);
+}
+
+function vehicleReferenceVariants(model, trim) {
+  const modelNorm = normalizeApplicationValue(model);
+  const trimNorm = normalizeApplicationValue(trim);
+  return [...new Set([
+    modelNorm,
+    trimNorm,
+    modelNorm && trimNorm && trimNorm !== "--" ? `${modelNorm}${trimNorm}` : "",
+  ])].filter((variant) => variant.length >= 5 && (variant.length >= 6 || /\d/.test(variant)));
 }
 
 const CATEGORY_ATTRIBUTE_SCHEMAS = [
@@ -1283,7 +1334,7 @@ async function backfillApplicationVehicleMappings() {
   });
 }
 
-async function lookupVehicleMapping({ epid, year, make, model }) {
+async function lookupVehicleMapping({ epid, year, make, model, assembly }) {
   const exactEpid = String(epid || "").trim();
   return withConnection(async (connection) => {
     let matchedEpid = exactEpid;
@@ -1292,29 +1343,59 @@ async function lookupVehicleMapping({ epid, year, make, model }) {
     if (!matchedEpid && year && make && model) {
       const yearNorm = normalizeApplicationValue(year);
       const makeNorm = normalizeApplicationValue(make);
-      const modelNorms = vehicleModelVariants(model);
-      const modelPredicates = modelNorms.map((_value, index) => `$model${index}`);
-      const codeStem = vehicleModelCodeStem(model);
-      const codePredicate = codeStem
-        ? ` OR regexp_replace(trim(coalesce(trim_name, '')), '[^A-Za-z0-9]', '', 'g') LIKE $codeStem || '%'`
-        : "";
-      const modelBindings = Object.fromEntries(modelNorms.map((value, index) => [`model${index}`, value]));
-      if (codeStem) modelBindings.codeStem = codeStem;
+      const cacheKey = [yearNorm, makeNorm, normalizeApplicationValue(model), normalizeApplicationValue(assembly)].join("|");
+      if (vehicleLookupCache.has(cacheKey)) return vehicleLookupCache.get(cacheKey);
       const candidateReader = await connection.runAndReadAll(
-        `SELECT DISTINCT epid FROM (
-          SELECT epid FROM partmaster_vehicle_master
-          WHERE year_norm = $year AND make_norm = $make AND (model_norm IN (${modelPredicates.join(", ")})${codePredicate})
-          UNION
-          SELECT epid FROM partmaster_vehicle_source_aliases
-          WHERE year_norm = $year AND make_norm = $make AND (model_norm IN (${modelPredicates.join(", ")})${codePredicate})
-        ) matches LIMIT 2`,
-        { year: yearNorm, make: makeNorm, ...modelBindings },
+        `SELECT DISTINCT epid, year, make_name, model_name, trim_name, vehicle_type, motorcycle_type
+         FROM (
+           SELECT epid, year, make_name, model_name, trim_name, vehicle_type, motorcycle_type
+           FROM partmaster_vehicle_master
+           WHERE year_norm = $year AND make_norm = $make
+           UNION
+           SELECT aliases.epid, aliases.year, aliases.make_name, aliases.model_name, aliases.trim_name,
+            master.vehicle_type, master.motorcycle_type
+           FROM partmaster_vehicle_source_aliases aliases
+           LEFT JOIN partmaster_vehicle_master master ON master.epid = aliases.epid
+           WHERE aliases.year_norm = $year AND aliases.make_norm = $make
+         ) ref_candidates`,
+        { year: yearNorm, make: makeNorm },
       );
-      const candidates = candidateReader.getRowObjectsJson();
-      if (candidates.length === 1) {
-        matchedEpid = candidates[0].epid;
-        method = "unique_vehicle_text";
-        confidence = 0.92;
+      const queryVariants = vehicleModelLookupVariants(model, assembly);
+      const scored = new Map();
+      for (const reference of candidateReader.getRowObjectsJson()) {
+        const referenceVariants = vehicleReferenceVariants(reference.model_name, reference.trim_name);
+        let score = -1;
+        let matchedVariant = "";
+        for (const queryVariant of queryVariants) {
+          for (const referenceVariant of referenceVariants) {
+            let candidateScore = -1;
+            if (queryVariant === referenceVariant) candidateScore = 100;
+            else if (queryVariant.includes(referenceVariant)) {
+              candidateScore = 70 + Math.min(20, (referenceVariant.length / queryVariant.length) * 20);
+            }
+            if (candidateScore > score) {
+              score = candidateScore;
+              matchedVariant = referenceVariant;
+            }
+          }
+        }
+        if (score >= 0) {
+          const existing = scored.get(reference.epid);
+          if (!existing || score > existing.score) scored.set(reference.epid, { reference, score, matchedVariant });
+        }
+      }
+      if (scored.size) {
+        const bestScore = Math.max(...[...scored.values()].map((candidate) => candidate.score));
+        const best = [...scored.entries()].filter(([, candidate]) => candidate.score === bestScore);
+        if (best.length === 1) {
+          matchedEpid = best[0][0];
+          method = best[0][1].score === 100 ? "local_vehicle_reference_exact" : "local_vehicle_reference_alias";
+          confidence = best[0][1].score === 100 ? 0.99 : 0.96;
+        }
+      }
+      if (!matchedEpid) {
+        vehicleLookupCache.set(cacheKey, null);
+        return null;
       }
     }
     if (!matchedEpid) return null;
@@ -1329,7 +1410,12 @@ async function lookupVehicleMapping({ epid, year, make, model }) {
       { epid: matchedEpid },
     );
     const vehicle = reader.getRowObjectsJson()[0];
-    return vehicle ? { ...vehicle, method, confidence } : null;
+    const result = vehicle ? { ...vehicle, method, confidence } : null;
+    if (!exactEpid && year && make && model) {
+      const cacheKey = [normalizeApplicationValue(year), normalizeApplicationValue(make), normalizeApplicationValue(model), normalizeApplicationValue(assembly)].join("|");
+      vehicleLookupCache.set(cacheKey, result);
+    }
+    return result;
   });
 }
 
@@ -1425,12 +1511,13 @@ async function createFitmentEnrichmentJob(options = {}) {
     const applicationIds = itemsReader.getRowObjectsJson().map((row) => row.id);
     const id = randomUUID();
     await connection.run(
-      `INSERT INTO partmaster_fitment_enrichment_jobs (id, name, status, batch_size, interval_minutes, total_count)
-       VALUES ($id, $name, $status, $batchSize, $intervalMinutes, $total)`,
+      `INSERT INTO partmaster_fitment_enrichment_jobs (id, name, status, mode, batch_size, interval_minutes, total_count)
+       VALUES ($id, $name, $status, $mode, $batchSize, $intervalMinutes, $total)`,
       {
         id,
         name: String(options.name || "Targeted missing fitment enrichment").slice(0, 200),
         status: applicationIds.length ? "queued" : "completed",
+        mode: options.mode === "online_recovery" ? "online_recovery" : "local_mapping",
         batchSize,
         intervalMinutes,
         total: applicationIds.length,
@@ -1489,7 +1576,24 @@ async function processFitmentEnrichmentBatch(jobId) {
       const model = source.model || item.vehicle_model || item.model;
       const year = source.year || item.year;
       const epid = source.epid || item.epid;
-      const vehicle = await lookupVehicleMapping({ epid, year, make: manufacturer, model });
+      const online = state.job.mode === "online_recovery"
+        ? await searchOnlineFitmentMapping({
+          manufacturer,
+          part_number: item.part_number,
+          description_raw: item.assembly,
+          year,
+          model,
+          assembly: source.assembly || item.assembly,
+        })
+        : { mapping: await lookupVehicleMapping({
+          epid,
+          year,
+          make: manufacturer,
+          model,
+          assembly: source.assembly || item.assembly,
+        }), checked: false, message: "" };
+      const vehicle = online.mapping;
+      if (online.message) message = online.message;
       await withConnection(async (connection) => {
         await connection.run(
           `UPDATE partmaster_part_applications SET
@@ -1512,21 +1616,21 @@ async function processFitmentEnrichmentBatch(jobId) {
             `UPDATE partmaster_part_applications SET epid = $epid, year = $year, model = $model,
              vehicle_make = $make, vehicle_model = $model, vehicle_trim = nullif($trim, ''), vehicle_type = nullif($type, ''),
              vehicle_motorcycle_type = nullif($motorcycleType, ''), vehicle_mapping_method = $method,
-             vehicle_mapping_confidence = $confidence,
-             fitment_explanation = coalesce(fitment_explanation || ' ', '') || $explanation,
+           vehicle_mapping_confidence = $confidence, evidence_url = coalesce(nullif($evidenceUrl, ''), evidence_url),
+           fitment_explanation = coalesce(fitment_explanation || ' ', '') || $explanation,
              updated_at = current_timestamp WHERE id = $applicationId`,
             {
               applicationId: item.application_id, epid: vehicle.epid, year: vehicle.year, model: vehicle.model_name,
               make: vehicle.make_name, trim: vehicle.trim_name && vehicle.trim_name !== "--" ? vehicle.trim_name : "",
               type: vehicle.vehicle_type || "", motorcycleType: vehicle.motorcycle_type || "", method: vehicle.method,
-              confidence: vehicle.confidence, explanation: `Vehicle mapping: ${message}`,
+              confidence: vehicle.confidence, evidenceUrl: String(online.evidenceUrl || ""), explanation: `Vehicle mapping: ${message}`,
             },
           );
         } else if (model || year || source.assembly) {
           await connection.run(
             `UPDATE partmaster_part_applications SET fitment_explanation = coalesce(fitment_explanation || ' ', '') || $explanation,
              updated_at = current_timestamp WHERE id = $applicationId`,
-            { applicationId: item.application_id, explanation: "Source fitment fields recovered; vehicle reference mapping remains unresolved." },
+            { applicationId: item.application_id, explanation: online.message || "Source fitment fields recovered; vehicle reference mapping remains unresolved." },
           );
         }
         await connection.run(
@@ -2138,22 +2242,162 @@ async function fetchEvidence(url) {
 }
 
 async function searchCandidateSources(candidate) {
-  const query = [candidate.manufacturer_raw, candidate.year, candidate.model, candidate.description_raw, candidate.assembly].filter(Boolean).join(" ");
+  const query = String(candidate.search_query || [candidate.manufacturer_raw, candidate.year, candidate.model, candidate.description_raw, candidate.assembly].filter(Boolean).join(" ")).trim();
   const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const response = await fetch(searchUrl, { headers: { Accept: "text/html", "User-Agent": "Mozilla/5.0" } });
-  if (!response.ok) throw new Error(`Search returned HTTP ${response.status}.`);
-  const html = (await response.text()).slice(0, 500000);
+  let response = await fetch(searchUrl, { headers: { Accept: "text/html", "User-Agent": "Mozilla/5.0" } });
+  let html;
+  if (response.ok) {
+    html = (await response.text()).slice(0, 500000);
+  } else {
+    const bingUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
+    response = await fetch(bingUrl, { headers: { Accept: "text/html", "User-Agent": "Mozilla/5.0" } });
+    if (!response.ok) throw new Error(`Search providers returned HTTP ${response.status}.`);
+    html = (await response.text()).slice(0, 500000);
+  }
   const results = [];
-  for (const match of html.matchAll(/<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)) {
-    let url = match[1];
-    try { url = new URL(url, searchUrl).searchParams.get("uddg") || url; } catch { /* keep original */ }
-    const title = cleanText(match[2]);
-    const context = html.slice(Math.max(0, match.index - 300), match.index + 900);
-    const partNumber = context.match(/\b\d{4,6}[-–]\d{3,5}\b/)?.[0]?.replace("–", "-") || "";
-    if (title && /^https?:/i.test(url)) results.push({ title, url, partNumber, confidence: partNumber ? 0.55 : 0.25 });
-    if (results.length >= 8) break;
+  const ddgResults = [...html.matchAll(/<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)];
+  if (ddgResults.length) {
+    for (const match of ddgResults) {
+      let url = match[1];
+      try { url = new URL(url, searchUrl).searchParams.get("uddg") || url; } catch { /* keep original */ }
+      const title = cleanText(match[2]);
+      const context = html.slice(Math.max(0, match.index - 300), match.index + 900);
+      const partNumber = context.match(/\b\d{4,6}[-–]\d{3,5}\b/)?.[0]?.replace("–", "-") || "";
+      const snippet = cleanText(context);
+      if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, confidence: partNumber ? 0.55 : 0.25 });
+      if (results.length >= 8) break;
+    }
+  } else {
+    for (const block of html.split(/<li class="b_algo"/i).slice(1)) {
+      const match = block.match(/<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/h2>/i);
+      if (!match) continue;
+      let url = match[1].replaceAll("&amp;", "&");
+      try {
+        const encoded = new URL(url).searchParams.get("u");
+        if (encoded?.startsWith("a1")) url = Buffer.from(encoded.slice(2), "base64url").toString("utf8");
+      } catch { /* Keep the result URL if Bing changes its redirect format. */ }
+      const title = cleanText(match[2]);
+      const snippet = cleanText(block.match(/<p[^>]*>([\s\S]*?)<\/p>/i)?.[1] || "");
+      const partNumber = `${title} ${snippet}`.match(/\b\d{4,6}[-–]\d{3,5}\b/)?.[0]?.replace("–", "-") || "";
+      if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, confidence: partNumber ? 0.55 : 0.25 });
+      if (results.length >= 8) break;
+    }
   }
   return { query, results };
+}
+
+function onlineModelTokens(value) {
+  return String(value || "")
+    .toUpperCase()
+    .split(/[^A-Z0-9]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2 && !/^(ABS|US|SE|KRT|BASE|MODEL|MOTORCYCLE|PARTS?)$/.test(token));
+}
+
+function catalogVehicleSlugs(url, year) {
+  try {
+    const segments = decodeURIComponent(new URL(url).pathname).split("/").filter(Boolean);
+    const yearIndex = segments.findIndex((segment) => segment === String(year));
+    if (yearIndex < 0 || !segments[yearIndex + 1]) return [];
+    const slug = segments[yearIndex + 1]
+      .replace(/-parts?$/i, "")
+      .replace(/\.(?:html?|php)$/i, "");
+    if (!slug || /^(parts|oemparts|catalog|motorcycle|atv|scooter)$/i.test(slug)) return [];
+    const readable = slug.replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
+    return readable ? [readable] : [];
+  } catch {
+    return [];
+  }
+}
+
+function onlineResultMatchesFitment(result, candidate) {
+  const partNumber = normalizePartNumber(candidate.part_number || candidate.part_number_raw);
+  const text = normalizeApplicationValue(`${result.title || ""} ${result.snippet || ""} ${result.url || ""}`);
+  if (!partNumber || !text.includes(partNumber)) return false;
+  if (candidate.year && !text.includes(String(candidate.year))) return false;
+  const tokens = onlineModelTokens(candidate.model);
+  const matchedTokens = tokens.filter((token) => text.includes(normalizeApplicationValue(token)));
+  return matchedTokens.length >= Math.min(2, Math.max(1, tokens.length));
+}
+
+async function searchOnlineFitmentMapping(candidate) {
+  const manufacturer = String(candidate.manufacturer || candidate.manufacturer_raw || "").trim();
+  const partNumber = String(candidate.part_number || candidate.part_number_raw || "").trim();
+  const year = String(candidate.year || "").trim();
+  const model = String(candidate.model || "").trim();
+  const query = [manufacturer, partNumber, year, model, candidate.assembly, "OEM parts"].filter(Boolean).join(" ");
+  const queryKey = normalizeApplicationValue(query);
+  if (!queryKey) return { mapping: null, checked: false, message: "Not enough source fields to search online." };
+
+  const cached = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT results_json, status, message FROM partmaster_fitment_online_cache
+       WHERE query_key = $queryKey AND fetched_at >= now() - INTERVAL '30 days'`,
+      { queryKey },
+    );
+    return reader.getRowObjectsJson()[0];
+  });
+  let search;
+  if (cached?.status === "success") {
+    try { search = { query, results: JSON.parse(cached.results_json || "[]"), cacheHit: true }; } catch { search = { query, results: [], cacheHit: true }; }
+  } else {
+    try {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.max(250, Number(process.env.PARTMASTER_ONLINE_SEARCH_DELAY_MS) || 1200)));
+      search = await searchCandidateSources({
+        search_query: query,
+        manufacturer_raw: manufacturer,
+        year,
+        model,
+        assembly: candidate.assembly,
+        description_raw: candidate.description_raw,
+      });
+      await withConnection((connection) => connection.run(
+        `INSERT INTO partmaster_fitment_online_cache (query_key, query_text, results_json, status, message)
+         VALUES ($queryKey, $queryText, $results, 'success', NULL)
+         ON CONFLICT (query_key) DO UPDATE SET query_text = excluded.query_text,
+          results_json = excluded.results_json, status = excluded.status, message = excluded.message,
+          fetched_at = now()`,
+        { queryKey, queryText: query, results: JSON.stringify(search.results || []) },
+      ));
+    } catch (error) {
+      await withConnection((connection) => connection.run(
+        `INSERT INTO partmaster_fitment_online_cache (query_key, query_text, results_json, status, message)
+         VALUES ($queryKey, $queryText, '[]', 'failed', $message)
+         ON CONFLICT (query_key) DO UPDATE SET status = excluded.status, message = excluded.message,
+          fetched_at = now()`,
+        { queryKey, queryText: query, message: error.message },
+      )).catch(() => {});
+      return { mapping: null, checked: true, message: `Online search failed: ${error.message}` };
+    }
+  }
+
+  const candidates = (search.results || [])
+    .filter((result) => isSafeEvidenceUrl(result.url) && onlineResultMatchesFitment(result, { ...candidate, manufacturer, part_number: partNumber, year, model }))
+    .slice(0, 6);
+  const mapped = new Map();
+  const evidenceUrls = new Map();
+  for (const result of candidates) {
+    const variants = catalogVehicleSlugs(result.url, year);
+    const modelVariants = [...new Set([model, ...variants])].filter(Boolean);
+    for (const modelVariant of modelVariants) {
+      const vehicle = await lookupVehicleMapping({ epid: "", year, make: manufacturer, model: modelVariant });
+      if (!vehicle) continue;
+      mapped.set(String(vehicle.epid), vehicle);
+      evidenceUrls.set(String(vehicle.epid), result.url);
+    }
+  }
+  if (mapped.size === 1) {
+    const vehicle = [...mapped.values()][0];
+    return {
+      mapping: vehicle,
+      evidenceUrl: evidenceUrls.get(String(vehicle.epid)) || null,
+      checked: true,
+      cacheHit: Boolean(search.cacheHit),
+      message: `Online catalog evidence resolved a unique vehicle: ${vehicle.year} ${vehicle.make_name} ${vehicle.model_name}${vehicle.trim_name && vehicle.trim_name !== "--" ? ` ${vehicle.trim_name}` : ""}.`,
+    };
+  }
+  if (mapped.size > 1) return { mapping: null, checked: true, cacheHit: Boolean(search.cacheHit), message: `Online evidence matched ${mapped.size} possible vehicle identities; no value was guessed.` };
+  return { mapping: null, checked: true, cacheHit: Boolean(search.cacheHit), message: candidates.length ? "Online results matched the part but did not resolve to a unique vehicle reference." : "No matching online catalog result was found." };
 }
 
 async function getEvidencePage(url, { force = false } = {}) {
@@ -5550,6 +5794,7 @@ app.post("/api/local/fitment-enrichment/jobs", asyncRoute(async (request, respon
     name: request.body?.name,
     batchSize: request.body?.batchSize,
     intervalMinutes: request.body?.intervalMinutes,
+    mode: request.body?.mode,
   });
   if (result.candidateCount) scheduleFitmentEnrichmentJob(result.id);
   response.status(result.alreadyQueued ? 200 : 202).json({ jobId: result.id, ...result });
@@ -5588,6 +5833,9 @@ app.post("/api/local/fitment-enrichment/jobs/:id/pause", asyncRoute(async (reque
 app.post("/api/local/fitment-enrichment/jobs/:id/resume", asyncRoute(async (request, response) => {
   const resumable = await withConnection(async (connection) => {
     await connection.run("UPDATE partmaster_fitment_enrichment_items SET status = 'pending' WHERE job_id = $id AND status = 'processing'", { id: request.params.id });
+    if (request.body?.retryUnresolved) {
+      await connection.run("UPDATE partmaster_fitment_enrichment_items SET status = 'pending', message = NULL, mapping_method = NULL, mapping_confidence = NULL, processed_at = NULL WHERE job_id = $id AND status IN ('unresolved', 'failed')", { id: request.params.id });
+    }
     await connection.run("UPDATE partmaster_fitment_enrichment_jobs SET status = 'queued', completed_at = NULL, last_error = NULL, next_run_at = NULL WHERE id = $id AND status IN ('paused', 'failed')", { id: request.params.id });
     const reader = await connection.runAndReadAll("SELECT status FROM partmaster_fitment_enrichment_jobs WHERE id = $id", { id: request.params.id });
     return reader.getRowObjectsJson()[0]?.status === "queued";

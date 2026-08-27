@@ -20,7 +20,7 @@ function progress(type, job) {
     if (job.phase === "extracting_attributes") return 60 + (Number(job.attribute_processed || 0) / Math.max(1, Number(job.unique_parts || 1))) * 30;
     return job.phase === "normalizing_and_deduplicating" ? 5 + (Number(job.scanned_rows || 0) / Math.max(1, Number(job.total_rows || 1))) * 55 : 3;
   }
-  if (type === "fitment") return job.status === "waiting" ? "Waiting for the next 5-minute batch" : job.status === "queued" ? "Queued for fitment mapping" : "Recovering source fields and mapping vehicles";
+  if (type === "fitment") return job.status === "waiting" ? "Waiting for the next 5-minute batch" : job.status === "queued" ? "Queued for fitment mapping" : job.mode === "online_recovery" ? "Fetching targeted online fitment evidence" : "Recovering source fields and mapping vehicles";
   return Number(job.queued_count) ? (Number(job.processed_count || job.completed_count || 0) / Number(job.queued_count)) * 100 : 0;
 }
 
@@ -28,14 +28,14 @@ function actionLabel(type, job, isActive) {
   if (!isActive) return job.status === "completed" ? "Finished successfully" : job.status === "paused" ? "Paused at a safe checkpoint" : job.status === "failed" ? "Needs attention" : "Ready";
   if (type === "pipeline") return { importing_sources: "Importing source files", normalizing_and_deduplicating: "Normalizing and removing duplicates", extracting_attributes: "Extracting product facts", checking_shared_sources: "Checking shared supplier sources", queued: "Waiting for worker" }[job.phase] || "Processing the local catalog";
   if (type === "enrichment") return job.status === "queued" ? "Queued for enrichment" : "Reading evidence and enriching parts";
-  if (type === "fitment") return job.status === "waiting" ? "Waiting for the next batch" : job.status === "queued" ? "Queued for fitment mapping" : "Recovering source fields and mapping vehicles";
+  if (type === "fitment") return job.status === "waiting" ? "Waiting for the next batch" : job.status === "queued" ? "Queued for fitment mapping" : job.mode === "online_recovery" ? "Fetching targeted online fitment evidence" : "Recovering source fields and mapping vehicles";
   return job.status === "queued" ? "Queued for intelligence checks" : "Checking part quality and evidence";
 }
 
 function activityHints(type, job) {
   if (type === "pipeline") return { importing_sources: ["Opening source files", "Reading catalog rows", "Preparing records"], normalizing_and_deduplicating: ["Cleaning identifiers", "Comparing duplicates", "Building the master index"], extracting_attributes: ["Classifying parts", "Extracting product facts", "Checking category clues"], checking_shared_sources: ["Opening supplier pages", "Matching evidence", "Saving verified findings"] }[job.phase] || ["Starting worker", "Preparing next batch", "Processing locally"];
   if (type === "enrichment") return ["Reading source evidence", "Comparing part details", "Scoring confidence"];
-  if (type === "fitment") return ["Recovering raw vehicle fields", "Matching make, model, and year", "Saving evidence-backed mappings"];
+  if (type === "fitment") return job.mode === "online_recovery" ? ["Searching exact OEM fitment evidence", "Opening a matching catalog result", "Saving only unique vehicle mappings"] : ["Recovering raw vehicle fields", "Matching make, model, and year", "Saving evidence-backed mappings"];
   return ["Finding priority parts", "Checking quality signals", "Updating intelligence"];
 }
 
