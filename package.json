@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "dev:local": "concurrently -k -n DATA,WEB -c magenta,cyan \"npm:local:data\" \"npm:dev\"",
-    "local:data": "node --env-file-if-exists=.env server/localDataServer.js",
+    "dev:local": "concurrently -n DATA,WEB -c magenta,cyan \"npm:local:data\" \"node scripts/wait-for-local-data.mjs && npm run dev\"",
+    "local:data": "node scripts/start-local-data.mjs",
     "vehicle:mapping:extract": "python3 scripts/extract_vehicle_mapping.py",
     "build": "vite build",
     "preview": "vite preview",

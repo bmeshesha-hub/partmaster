@@ -17,6 +17,11 @@ const VEHICLE_ALIASES_PATH = join(REFERENCE_ROOT, "vehicle_source_aliases.csv");
 const MPSOV_INBOX_PATH = join(INBOX_ROOT, "MPSOV.csv");
 const DATABASE_PATH = resolve(process.env.PARTMASTER_DATABASE_PATH || join(DATA_ROOT, "partmaster.duckdb"));
 const PORT = Number(process.env.PARTMASTER_DATA_PORT || 8787);
+// Keep the control plane available even when the database contains a very large
+// resumable job. Heavy recovery/backfill work must be explicitly enabled instead
+// of running before app.listen() and making the API appear dead.
+const AUTO_RESUME_JOBS = String(process.env.PARTMASTER_AUTO_RESUME_JOBS || "false").toLowerCase() === "true";
+const STARTUP_BACKFILL = String(process.env.PARTMASTER_STARTUP_BACKFILL || "false").toLowerCase() === "true";
 const importJobs = new Map();
 const activeEnrichmentJobs = new Set();
 const activeRowEnhancementJobs = new Set();
@@ -33,6 +38,19 @@ let compatibilityWorkerRunning = false;
 let schedulerChecking = false;
 let enrichmentSchedulerChecking = false;
 let shuttingDown = false;
+let onlineDbWriteQueue = Promise.resolve();
+let instance;
+let databaseReady = false;
+// Bind the control plane before DuckDB initialization. This keeps health and
+// process-monitor requests reachable while the local database is opening.
+const app = express();
+const server = await new Promise((resolve, reject) => {
+  const candidate = app.listen(PORT, "127.0.0.1", () => resolve(candidate));
+  candidate.once("error", reject);
+});
+app.get("/api/local/health", (_request, response) => {
+  response.json({ ok: true, initializing: !databaseReady, databaseReady, dataRoot: DATA_ROOT, databasePath: DATABASE_PATH });
+});
 const ENRICHMENT_FETCH_TIMEOUT_MS = Math.max(3000, Number(process.env.PARTMASTER_FETCH_TIMEOUT_MS) || 15000);
 const ENRICHMENT_MAX_PAGE_BYTES = Math.max(100000, Number(process.env.PARTMASTER_MAX_PAGE_BYTES) || 2_000_000);
 const PIPELINE_MAX_ONLINE_BUDGET = Math.max(5000, Number(process.env.PARTMASTER_MAX_ONLINE_BUDGET) || 500_000);
@@ -44,10 +62,12 @@ await Promise.all([
   mkdir(REFERENCE_ROOT, { recursive: true }),
 ]);
 
-const instance = await DuckDBInstance.create(DATABASE_PATH, {
+instance = await DuckDBInstance.create(DATABASE_PATH, {
   threads: String(Math.max(1, Math.min(4, Number(process.env.PARTMASTER_THREADS) || 2))),
   memory_limit: process.env.PARTMASTER_MEMORY_LIMIT || "4GB",
 });
+databaseReady = true;
+console.log(`Partmaster local data service ready: http://127.0.0.1:${PORT}`);
 
 async function withConnection(callback) {
   const connection = await instance.connect();
@@ -57,6 +77,17 @@ async function withConnection(callback) {
   } finally {
     connection.closeSync();
   }
+}
+
+// DuckDB permits concurrent readers, but concurrent write transactions can
+// conflict. Network work may run in parallel; this small FIFO keeps page
+// claims and result commits single-writer without serializing HTTP requests.
+async function withOnlineDbWrite(callback) {
+  const previous = onlineDbWriteQueue;
+  let release;
+  onlineDbWriteQueue = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try { return await callback(); } finally { release(); }
 }
 
 await withConnection((connection) => connection.run(`
@@ -608,14 +639,10 @@ await withConnection((connection) => connection.run(`
     ON partmaster_part_applications (part_id);
   CREATE INDEX IF NOT EXISTS variant_attributes_part_idx
     ON partmaster_variant_attributes (part_id);
-  CREATE INDEX IF NOT EXISTS offline_parts_status_idx
-    ON partmaster_offline_parts (attribute_status, online_status);
   CREATE INDEX IF NOT EXISTS offline_sources_dataset_idx
     ON partmaster_offline_part_sources (dataset_id);
   CREATE INDEX IF NOT EXISTS offline_sources_url_idx
     ON partmaster_offline_part_sources (source_url);
-  CREATE INDEX IF NOT EXISTS offline_pages_status_idx
-    ON partmaster_offline_source_pages (status, priority_score);
   CREATE INDEX IF NOT EXISTS part_aliases_lookup_idx
     ON partmaster_part_aliases (alias_norm);
   CREATE INDEX IF NOT EXISTS field_evidence_part_idx
@@ -641,16 +668,8 @@ await withConnection(async (connection) => {
   await connection.run("UPDATE partmaster_fitment_enrichment_jobs SET mode = 'local_mapping' WHERE mode IS NULL");
 });
 
-await withConnection((connection) => connection.run(`
-  INSERT OR IGNORE INTO partmaster_source_processing
-    (dataset_id, raw_rows, usable_rows, invalid_rows, unique_parts, scanned_at)
-  SELECT datasets.id, datasets.row_count, coalesce(sum(sources.occurrence_count), 0),
-    greatest(0, datasets.row_count - coalesce(sum(sources.occurrence_count), 0)), count(DISTINCT sources.part_key),
-    coalesce(max(datasets.imported_at), current_timestamp)
-  FROM partmaster_datasets datasets
-  JOIN partmaster_offline_part_sources sources ON sources.dataset_id = datasets.id
-  GROUP BY datasets.id, datasets.row_count;
-`));
+// Rebuilt databases are loaded as plain tables, so they intentionally do not
+// rely on legacy INSERT OR IGNORE constraints during startup.
 
 await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_pipeline_jobs ADD COLUMN IF NOT EXISTS attribute_processed BIGINT DEFAULT 0;
@@ -706,11 +725,11 @@ await withConnection((connection) => connection.run(`
     ON partmaster_canonical_parts (family_id)
 `));
 
-await withConnection((connection) => connection.run(`
-  DELETE FROM partmaster_variant_attributes
-  WHERE attribute_name = 'component_scope'
-    OR lower(trim(coalesce(attribute_value, ''))) IN ('', 'unknown', 'none_known');
-`));
+// Do not run bulk cleanup mutations during startup.  A previous enrichment
+// crash could leave DuckDB's indexes invalidated; replaying a large DELETE
+// here makes every restart fail before the health endpoint is usable.  The
+// cleanup is now handled by the enrichment write path and can be retried
+// explicitly once the service is healthy.
 
 function asyncRoute(handler) {
   return (request, response, next) => Promise.resolve(handler(request, response, next)).catch(next);
@@ -2470,6 +2489,25 @@ async function getEvidencePage(url, { force = false } = {}) {
   }
 }
 
+// Keep a failing source from monopolising a batch. This is deliberately a
+// circuit breaker, not a Cloudflare bypass: protected hosts are deferred and
+// healthy hosts continue to be processed.
+const sourceHostHealth = new Map();
+function sourceHost(url) { try { return new URL(String(url || "")).hostname.toLowerCase(); } catch { return ""; } }
+function sourceHostPaused(host) { return Boolean(host && (sourceHostHealth.get(host)?.pausedUntil || 0) > Date.now()); }
+function noteSourceHostResult(url, error) {
+  const host = sourceHost(url);
+  if (!host) return;
+  const text = String(error?.message || error || "").toLowerCase();
+  const blocked = /http (403|429)|cloudflare|cf-ray|challenge|captcha|timed out|aborterror|fetch failed/.test(text);
+  if (!blocked) { sourceHostHealth.delete(host); return; }
+  const previous = sourceHostHealth.get(host) || { failures: 0 };
+  const failures = previous.failures + 1;
+  const minutes = /http 429/.test(text) ? 10 : /http 403|cloudflare|challenge|captcha/.test(text) ? 30 : Math.min(15, failures * 2);
+  sourceHostHealth.set(host, { failures, pausedUntil: Date.now() + minutes * 60 * 1000, lastError: String(error?.message || error) });
+  console.warn(`Source host ${host} deferred for ${minutes} minutes: ${error?.message || error}`);
+}
+
 function compatibilityListUrl(candidate) {
   const source = String(candidate.source_url || candidate.evidence_url || "");
   const partNumber = String(candidate.enriched_part_number || candidate.part_number_raw || "").trim();
@@ -3210,8 +3248,15 @@ async function checkOfflineSourcePages(jobId, budget, datasetIds = []) {
   await withConnection((connection) => connection.run(
     "UPDATE partmaster_pipeline_jobs SET phase = 'checking_shared_sources' WHERE id = $jobId", { jobId },
   ));
-  for (let index = 0; index < budget && !shuttingDown; index += 1) {
-    const context = await withConnection(async (connection) => {
+  // Fetch pages concurrently, while keeping each page's database claim and
+  // write transaction isolated. The old single-worker loop made a large
+  // shared-source run effectively serial (and spent most of its time waiting
+  // on network responses). Keep this bounded so supplier hosts and DuckDB are
+  // not overwhelmed.
+  const concurrency = Math.max(1, Math.min(8, Number(process.env.PARTMASTER_ONLINE_CONCURRENCY) || 6));
+  async function worker(workerIndex) {
+    for (let index = workerIndex; index < budget && !shuttingDown; index += concurrency) {
+    const context = await withOnlineDbWrite(() => withConnection(async (connection) => {
       const jobReader = await connection.runAndReadAll("SELECT status FROM partmaster_pipeline_jobs WHERE id = $jobId", { jobId });
       if (jobReader.getRowObjectsJson()[0]?.status !== "running") return null;
       const pageReader = await connection.runAndReadAll(
@@ -3227,7 +3272,7 @@ async function checkOfflineSourcePages(jobId, budget, datasetIds = []) {
       if (!page) return null;
       await connection.run("UPDATE partmaster_offline_source_pages SET status = 'checking' WHERE source_url = $url", { url: page.source_url });
       return page;
-    });
+    }));
     if (!context) break;
     try {
       const page = await getEvidencePage(context.source_url);
@@ -3244,7 +3289,7 @@ async function checkOfflineSourcePages(jobId, budget, datasetIds = []) {
         return reader.getRowObjectsJson();
       });
       let verified = 0;
-      await withConnection(async (connection) => {
+      await withOnlineDbWrite(() => withConnection(async (connection) => {
         await connection.run("BEGIN TRANSACTION");
         try {
           for (const part of parts) {
@@ -3277,19 +3322,21 @@ async function checkOfflineSourcePages(jobId, budget, datasetIds = []) {
           `UPDATE partmaster_pipeline_jobs SET online_checked = online_checked + 1,
            online_verified_parts = online_verified_parts + $verified WHERE id = $jobId`, { jobId, verified },
         );
-      });
+      }));
       if (!page.cacheHit) await new Promise((resolvePromise) => setTimeout(resolvePromise, 350));
     } catch (error) {
-      await withConnection(async (connection) => {
+      await withOnlineDbWrite(() => withConnection(async (connection) => {
         await connection.run(
           `UPDATE partmaster_offline_source_pages SET status = 'failed', error_message = $error,
            checked_at = current_timestamp WHERE source_url = $url`,
           { url: context.source_url, error: error.message },
         );
         await connection.run("UPDATE partmaster_pipeline_jobs SET online_checked = online_checked + 1 WHERE id = $jobId", { jobId });
-      });
+      }));
+    }
     }
   }
+  await Promise.all(Array.from({ length: Math.min(concurrency, budget) }, (_, index) => worker(index)));
 }
 
 async function runFullPipeline(jobId) {
@@ -3577,7 +3624,24 @@ function scheduleDatasetIds(schedule) {
 }
 
 async function enrichmentScheduleProgress(schedule) {
-  const datasetIds = scheduleDatasetIds(schedule);
+  const requestedDatasetIds = scheduleDatasetIds(schedule);
+  // A previous version created duplicate dataset records when the same CSV was
+  // imported more than once. Do not count those copies multiple times in the
+  // all-sources schedule; use the newest dataset for each source file.
+  const datasetIds = await withConnection(async (connection) => {
+    const reader = await connection.runAndReadAll(
+      `SELECT id, source_file FROM partmaster_datasets
+       WHERE id IN (${requestedDatasetIds.map((_, index) => `$dataset${index}`).join(",")})
+       ORDER BY imported_at DESC`,
+      Object.fromEntries(requestedDatasetIds.map((id, index) => [`dataset${index}`, id])),
+    );
+    const seenFiles = new Set();
+    return reader.getRowObjectsJson().filter((dataset) => {
+      if (seenFiles.has(dataset.source_file)) return false;
+      seenFiles.add(dataset.source_file);
+      return true;
+    }).map((dataset) => dataset.id);
+  });
   const progress = await Promise.all(datasetIds.map((datasetId) => enrichmentDatasetProgress(datasetId)));
   return {
     dataset_ids: datasetIds,
@@ -4068,12 +4132,18 @@ async function runEnrichmentJob(jobId) {
         const candidateReader = await connection.runAndReadAll(
           `SELECT * FROM partmaster_enrichment_candidates
            WHERE job_id = $jobId AND status = 'pending'
-           ORDER BY source_row_id LIMIT ${Math.max(1, Math.min(50, Number(job.batch_size) || 10))}`,
+           ORDER BY source_row_id LIMIT ${Math.max(50, Math.min(500, Number(job.batch_size) * 5 || 50))}`,
           { jobId },
         );
-        return { job, candidates: candidateReader.getRowObjectsJson() };
+        const candidates = candidateReader.getRowObjectsJson();
+        const usable = candidates.filter((candidate) => !sourceHostPaused(sourceHost(candidate.source_url)));
+        return { job, candidates: usable.slice(0, Math.max(1, Math.min(50, Number(job.batch_size) || 10))), skippedHosts: candidates.length - usable.length };
       });
       if (state.done) break;
+      if (!state.candidates.length && state.skippedHosts) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 5000));
+        continue;
+      }
       if (!state.candidates.length) {
         await withConnection(async (connection) => {
           const stats = await refreshEnrichmentJobStats(connection, jobId);
@@ -4208,6 +4278,7 @@ async function runEnrichmentJob(jobId) {
             }).catch(() => null);
           }
         } catch (error) {
+          noteSourceHostResult(candidate.source_url, error);
           const status = candidate.attempts >= 2 ? "failed" : "needs_review";
           await withConnection((connection) => connection.run(
             `UPDATE partmaster_enrichment_candidates SET status = $status, decision_notes = $error,
@@ -4720,15 +4791,10 @@ async function createPipelineJob(options = {}) {
   return id;
 }
 
-const app = express();
 app.get("/api/local/processes/network-log", (_request, response) => {
   response.json({ events: networkEvents.slice(-250) });
 });
 app.use(express.json({ limit: "1mb" }));
-
-app.get("/api/local/health", (_request, response) => {
-  response.json({ ok: true, dataRoot: DATA_ROOT, databasePath: DATABASE_PATH });
-});
 
 app.get("/api/local/vehicle-mappings", asyncRoute(async (_request, response) => {
   const stats = await vehicleMappingStats();
@@ -4947,7 +5013,12 @@ app.post("/api/local/enrichment/schedules", asyncRoute(async (request, response)
   const datasetIds = requestedDatasetId && requestedDatasetId !== "all"
     ? [requestedDatasetId]
     : await withConnection(async (connection) => {
-      const reader = await connection.runAndReadAll("SELECT id FROM partmaster_datasets ORDER BY imported_at, id");
+        const reader = await connection.runAndReadAll(
+          `SELECT id FROM (
+             SELECT id, source_file, row_number() OVER (PARTITION BY source_file ORDER BY imported_at DESC, id DESC) AS rank
+             FROM partmaster_datasets
+           ) latest WHERE rank = 1 ORDER BY source_file`,
+        );
       return reader.getRowObjectsJson().map((dataset) => dataset.id);
     });
   if (!datasetIds.length) throw new Error("Import at least one CSV before creating a row schedule.");
@@ -5117,12 +5188,20 @@ app.get("/api/local/pipeline/sources", asyncRoute(async (_request, response) => 
       `SELECT
         count(DISTINCT sources.part_key) AS raw_unique_parts,
         count(DISTINCT sources.part_key) FILTER (WHERE parts.part_key IS NOT NULL) AS master_parts,
-        count(DISTINCT sources.part_key) FILTER (WHERE parts.extracted_attribute_count > 0) AS parts_with_facts,
+        greatest(
+          count(DISTINCT sources.part_key) FILTER (WHERE parts.extracted_attribute_count > 0),
+          (SELECT count(DISTINCT manufacturer_norm || ':' || part_number_norm)
+           FROM partmaster_enrichment_candidates
+           WHERE status NOT IN ('pending', 'processing', 'failed', 'not_found')
+             AND extracted_attribute_count > 0)
+        ) AS parts_with_facts,
         (SELECT coalesce(sum(extracted_attribute_count), 0) FROM partmaster_offline_parts) AS product_facts,
         (SELECT count(*) FROM partmaster_offline_source_pages) AS source_pages,
         (SELECT count(*) FROM partmaster_offline_source_pages WHERE status != 'pending') AS processed_source_pages,
         (SELECT count(*) FROM partmaster_offline_source_pages WHERE status = 'pending') AS pending_source_pages,
         (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status NOT IN ('pending', 'processing')) AS enriched_rows,
+        (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status = 'enriched') AS verified_enrichment_rows,
+        (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status IN ('needs_review', 'conflict')) AS review_enrichment_rows,
         (SELECT count(*) FROM partmaster_enrichment_candidates WHERE status IN ('pending', 'processing')) AS queued_rows
        FROM partmaster_offline_part_sources sources
        LEFT JOIN partmaster_offline_parts parts ON parts.part_key = sources.part_key`,
@@ -5177,6 +5256,8 @@ app.get("/api/local/pipeline/sources", asyncRoute(async (_request, response) => 
       processed_source_pages: Number(databaseCoverage.summary.processed_source_pages || 0),
       pending_source_pages: Number(databaseCoverage.summary.pending_source_pages || 0),
       enriched_rows: Number(databaseCoverage.summary.enriched_rows || 0),
+      verified_enrichment_rows: Number(databaseCoverage.summary.verified_enrichment_rows || 0),
+      review_enrichment_rows: Number(databaseCoverage.summary.review_enrichment_rows || 0),
       queued_rows: Number(databaseCoverage.summary.queued_rows || 0),
       remaining_enrichment_rows: Math.max(0, knownRawRows - Number(databaseCoverage.summary.enriched_rows || 0)),
     },
@@ -5380,13 +5461,24 @@ app.post("/api/local/master/fpa-export", asyncRoute(async (_request, response) =
   await withConnection((connection) => connection.run(
     `COPY (SELECT parts.id AS "part_id", parts.part_number AS "oem_part_number", parts.manufacturer AS "manufacturer_name",
        parts.description AS "part_description", families.family_name AS "part_category", parts.component_scope,
-       applications.year AS "year", applications.vehicle_make AS "make", applications.vehicle_model AS "model",
+       applications.year AS "year",
+       coalesce(nullif(applications.vehicle_make, ''), CASE WHEN regexp_replace(lower(coalesce(parts.manufacturer_norm, '')), '[^a-z0-9]', '', 'g') IN ('harleydavison', 'harleydavidson') THEN 'Harley-Davidson' END) AS "make",
+       coalesce(nullif(applications.vehicle_model, ''), applications.model) AS "model",
        applications.vehicle_trim AS "trim", applications.vehicle_type, applications.vehicle_motorcycle_type AS "motorcycle_type",
        applications.epid, applications.assembly, applications.position, applications.side,
        applications.quantity AS "quantity_per_vehicle", applications.source_url, applications.evidence_url,
        applications.vehicle_mapping_method, applications.vehicle_mapping_confidence,
-       parts.extracted_attributes_json AS "product_attributes", parts.occurrence_count, parts.confidence,
-       parts.online_status AS "evidence_status", parts.updated_at,
+       (SELECT offline.extracted_attributes_json FROM partmaster_offline_parts offline
+        WHERE regexp_replace(lower(coalesce(offline.manufacturer_norm, '')), '[^a-z0-9]', '', 'g') = regexp_replace(lower(coalesce(parts.manufacturer_norm, '')), '[^a-z0-9]', '', 'g')
+          AND regexp_replace(lower(coalesce(offline.part_number_norm, '')), '[^a-z0-9]', '', 'g') = regexp_replace(lower(coalesce(parts.part_number_norm, '')), '[^a-z0-9]', '', 'g') LIMIT 1) AS "product_attributes",
+       (SELECT offline.occurrence_count FROM partmaster_offline_parts offline
+        WHERE regexp_replace(lower(coalesce(offline.manufacturer_norm, '')), '[^a-z0-9]', '', 'g') = regexp_replace(lower(coalesce(parts.manufacturer_norm, '')), '[^a-z0-9]', '', 'g')
+          AND regexp_replace(lower(coalesce(offline.part_number_norm, '')), '[^a-z0-9]', '', 'g') = regexp_replace(lower(coalesce(parts.part_number_norm, '')), '[^a-z0-9]', '', 'g') LIMIT 1) AS occurrence_count,
+       parts.confidence,
+       (SELECT offline.online_status FROM partmaster_offline_parts offline
+        WHERE regexp_replace(lower(coalesce(offline.manufacturer_norm, '')), '[^a-z0-9]', '', 'g') = regexp_replace(lower(coalesce(parts.manufacturer_norm, '')), '[^a-z0-9]', '', 'g')
+          AND regexp_replace(lower(coalesce(offline.part_number_norm, '')), '[^a-z0-9]', '', 'g') = regexp_replace(lower(coalesce(parts.part_number_norm, '')), '[^a-z0-9]', '', 'g') LIMIT 1) AS "evidence_status",
+       parts.updated_at,
        (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'heated' LIMIT 1) AS heated,
        (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'auto_dimming' LIMIT 1) AS auto_dimming,
        (SELECT attribute_value FROM partmaster_variant_attributes WHERE part_id = parts.id AND attribute_name = 'power_folding' LIMIT 1) AS power_folding,
@@ -6059,6 +6151,7 @@ app.get("/api/local/enrichment/candidates", asyncRoute(async (request, response)
     const priority = request.query.priority === "impact";
     const clause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const limit = Math.max(10, Math.min(500, Number(request.query.limit) || 100));
+    const offset = Math.max(0, Number(request.query.offset) || 0);
     const reader = await connection.runAndReadAll(
       `SELECT candidates.*,
        coalesce((SELECT sum(sources.occurrence_count) FROM partmaster_offline_part_sources sources
@@ -6066,7 +6159,7 @@ app.get("/api/local/enrichment/candidates", asyncRoute(async (request, response)
            AND sources.part_number_norm = coalesce(nullif(candidates.part_number_norm, ''), nullif(candidates.enriched_part_number, ''))), 0) AS source_impact
        FROM partmaster_enrichment_candidates candidates ${clause ? `${clause} AND` : "WHERE"}
        ${priority ? "true" : "true"}
-       ORDER BY ${priority ? "source_impact DESC, coalesce(candidates.confidence, 0) ASC, candidates.created_at ASC" : "coalesce(candidates.processed_at, candidates.created_at) DESC, candidates.source_row_id"} LIMIT ${limit}`,
+       ORDER BY ${priority ? "source_impact DESC, coalesce(candidates.confidence, 0) ASC, candidates.created_at ASC, candidates.id" : "coalesce(candidates.processed_at, candidates.created_at) DESC, candidates.source_row_id, candidates.id"} LIMIT ${limit} OFFSET ${offset}`,
       values,
     );
     const countReader = await connection.runAndReadAll(
@@ -6906,38 +6999,40 @@ app.use((error, _request, response, _next) => {
 });
 
 const vehicleMappingLoadResult = await loadVehicleMappingReferences().catch((error) => ({ loaded: false, reason: error.message }));
-const vehicleMappingBackfillResult = vehicleMappingLoadResult.loaded
+const vehicleMappingBackfillResult = STARTUP_BACKFILL && vehicleMappingLoadResult.loaded
   ? await backfillApplicationVehicleMappings().catch((error) => ({ backfilled: 0, reason: error.message }))
   : { backfilled: 0 };
-await backfillVariantIntelligence();
-const intelligenceBackfillResult = await refreshPartIntelligence().catch((error) => ({ partsScored: 0, reason: error.message }));
+if (STARTUP_BACKFILL) await backfillVariantIntelligence();
+const intelligenceBackfillResult = STARTUP_BACKFILL
+  ? await refreshPartIntelligence().catch((error) => ({ partsScored: 0, reason: error.message }))
+  : { partsScored: 0, reason: "Startup backfill disabled; run it explicitly when the control plane is idle." };
 
-const resumableJobIds = await withConnection(async (connection) => {
+const resumableJobIds = AUTO_RESUME_JOBS ? await withConnection(async (connection) => {
   await connection.run("UPDATE partmaster_enrichment_candidates SET status = 'pending' WHERE status = 'processing'");
   await connection.run("UPDATE partmaster_enrichment_jobs SET status = 'queued' WHERE status = 'running'");
   const reader = await connection.runAndReadAll("SELECT id FROM partmaster_enrichment_jobs WHERE status = 'queued'");
   return reader.getRowObjectsJson().map((job) => job.id);
-});
+}) : [];
 
-const resumableRowEnhancementJobIds = await withConnection(async (connection) => {
+const resumableRowEnhancementJobIds = AUTO_RESUME_JOBS ? await withConnection(async (connection) => {
   await connection.run("UPDATE partmaster_row_enhancement_jobs SET status = 'queued' WHERE status = 'running'");
   const reader = await connection.runAndReadAll("SELECT id FROM partmaster_row_enhancement_jobs WHERE status = 'queued'");
   return reader.getRowObjectsJson().map((job) => job.id);
-});
+}) : [];
 
-const resumableAutopilotJobIds = await withConnection(async (connection) => {
+const resumableAutopilotJobIds = AUTO_RESUME_JOBS ? await withConnection(async (connection) => {
   await connection.run("UPDATE partmaster_autopilot_items SET status = 'pending' WHERE status = 'processing'");
   await connection.run("UPDATE partmaster_autopilot_jobs SET status = 'queued' WHERE status = 'running'");
   const reader = await connection.runAndReadAll("SELECT id FROM partmaster_autopilot_jobs WHERE status = 'queued'");
   return reader.getRowObjectsJson().map((job) => job.id);
-});
+}) : [];
 
-const resumableFitmentEnrichmentJobIds = await withConnection(async (connection) => {
+const resumableFitmentEnrichmentJobIds = AUTO_RESUME_JOBS ? await withConnection(async (connection) => {
   await connection.run("UPDATE partmaster_fitment_enrichment_items SET status = 'pending' WHERE status = 'processing'");
   await connection.run("UPDATE partmaster_fitment_enrichment_jobs SET status = 'queued', next_run_at = NULL WHERE status = 'running'");
   const reader = await connection.runAndReadAll("SELECT id FROM partmaster_fitment_enrichment_jobs WHERE status = 'queued'");
   return reader.getRowObjectsJson().map((job) => job.id);
-});
+}) : [];
 
 const waitingFitmentEnrichmentJobs = await withConnection(async (connection) => {
   const reader = await connection.runAndReadAll(
@@ -6946,13 +7041,12 @@ const waitingFitmentEnrichmentJobs = await withConnection(async (connection) => 
   return reader.getRowObjectsJson();
 });
 
-const resumablePipelineJobIds = await withConnection(async (connection) => {
-  await connection.run("UPDATE partmaster_pipeline_jobs SET status = 'queued', phase = 'queued' WHERE status = 'running'");
+const resumablePipelineJobIds = AUTO_RESUME_JOBS ? await withConnection(async (connection) => {
   const reader = await connection.runAndReadAll("SELECT id FROM partmaster_pipeline_jobs WHERE status = 'queued'");
   return reader.getRowObjectsJson().map((job) => job.id);
-});
+}) : [];
 
-const server = app.listen(PORT, "127.0.0.1", () => {
+const startupTasks = () => {
   console.log(`Partmaster local data service: http://127.0.0.1:${PORT}`);
   console.log(`Local data directory: ${DATA_ROOT}`);
   if (vehicleMappingLoadResult.loaded) {
@@ -6976,7 +7070,8 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   resumablePipelineJobIds.forEach(scheduleFullPipeline);
   setTimeout(() => checkPipelineSchedules(), 1000);
   setTimeout(() => checkEnrichmentSchedules(), 1200);
-});
+};
+startupTasks();
 const schedulerTimer = setInterval(() => {
   checkPipelineSchedules();
   checkEnrichmentSchedules();

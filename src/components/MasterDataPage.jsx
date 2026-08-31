@@ -118,16 +118,18 @@ export default function MasterDataPage() {
   async function exportAllMasterData() {
     setFullExporting(true); setExportMessage("");
     try {
-      const result = await localDataApi.exportMasterCatalog({});
-      const catalogExport = (result.exports || [])[0];
-      if (!catalogExport) throw new Error("The full master catalog export did not return a CSV file.");
-      const link = document.createElement("a");
-      link.href = catalogExport.downloadUrl || `/api/local/exports/${encodeURIComponent(catalogExport.filename)}`;
-      link.download = catalogExport.filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setExportMessage(`Exported ${number(result.count)} master rows to ${catalogExport.filename}.`);
+      const result = await localDataApi.exportMaster();
+      const exports = result.exports || [];
+      if (!exports.length) throw new Error("No master-data exports were generated.");
+      exports.forEach((item) => {
+        const link = document.createElement("a");
+        link.href = item.downloadUrl || `/api/local/exports/${encodeURIComponent(item.filename)}`;
+        link.download = item.filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      });
+      setExportMessage(`Generated ${exports.length} separate master-data CSV files.`);
     }
     catch (error) { setExportMessage(error.message); } finally { setFullExporting(false); }
   }
