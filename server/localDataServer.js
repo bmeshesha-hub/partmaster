@@ -703,6 +703,7 @@ await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_mapping_method VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_mapping_confidence DOUBLE;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS extracted_attributes_json VARCHAR;
+  ALTER TABLE partmaster_offline_parts ADD COLUMN IF NOT EXISTS record_type VARCHAR DEFAULT 'product';
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS extracted_attribute_count INTEGER DEFAULT 0;
   ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS family_id VARCHAR;
   ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS component_scope VARCHAR;
@@ -723,6 +724,40 @@ await withConnection((connection) => connection.run(`
     ON partmaster_part_applications (application_key);
   CREATE INDEX IF NOT EXISTS canonical_parts_family_idx
     ON partmaster_canonical_parts (family_id)
+`));
+
+await withConnection((connection) => connection.run(`
+  UPDATE partmaster_offline_parts
+  SET record_type = 'reference_document', family_name = NULL,
+      attribute_status = 'needs_review', extracted_attribute_count = 0,
+      extracted_attributes_json = '{}', online_status = NULL,
+      confidence = least(coalesce(confidence, 0.2), 0.2), updated_at = current_timestamp
+  WHERE (
+    lower(coalesce(description, '')) LIKE '%installation instruction%'
+    OR lower(coalesce(description, '')) LIKE '%inst. instr%'
+    OR lower(coalesce(description, '')) LIKE '%inst instr%'
+    OR lower(coalesce(description, '')) LIKE '%behelf%catalog%'
+    OR lower(coalesce(description, '')) LIKE '%catalog%'
+    OR lower(coalesce(description, '')) LIKE '%test report%'
+    OR lower(coalesce(description, '')) LIKE '% report %'
+    OR lower(coalesce(description, '')) LIKE '%manual%'
+    OR lower(coalesce(description, '')) LIKE '%booklet%'
+    OR lower(coalesce(description, '')) LIKE '%owner%manual%'
+    OR lower(coalesce(description, '')) LIKE '%service manual%'
+    OR lower(coalesce(description, '')) LIKE '%workshop manual%'
+    OR lower(coalesce(description, '')) LIKE '%brochure%'
+    OR lower(coalesce(description, '')) LIKE '%certificate%'
+    OR lower(coalesce(description, '')) LIKE '%insertion sheet%'
+  )
+    AND coalesce(record_type, 'product') <> 'reference_document'
+`));
+
+await withConnection((connection) => connection.run(`
+  UPDATE partmaster_offline_parts
+  SET attribute_status = 'needs_review'
+  WHERE coalesce(record_type, 'product') = 'product'
+    AND coalesce(extracted_attribute_count, 0) = 0
+    AND attribute_status = 'complete'
 `));
 
 // Do not run bulk cleanup mutations during startup.  A previous enrichment
@@ -821,7 +856,7 @@ async function getColumns(connection, tableName) {
 }
 
 function buildWhere(columns, input = {}) {
-  const conditions = [];
+  const conditions = ["coalesce(record_type, 'product') = 'product'"];
   const values = {};
   const searchable = ["year", "brand", "model", "part_number", "category", "part_name", "msrp", "url", "epid", "source"].filter((column) => columns.includes(column));
   if (input.q && searchable.length) {
@@ -5343,10 +5378,11 @@ app.get("/api/local/master-catalog/filters", asyncRoute(async (_request, respons
       `SELECT CASE manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
        WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM' WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha'
        WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE manufacturer_norm END AS value, count(*) AS count
-       FROM partmaster_offline_parts GROUP BY manufacturer_norm ORDER BY value`,
+       FROM partmaster_offline_parts WHERE coalesce(record_type, 'product') = 'product'
+       GROUP BY manufacturer_norm ORDER BY value`,
     );
     const families = await connection.runAndReadAll(
-      "SELECT coalesce(family_name, 'Unclassified') AS value, count(*) AS count FROM partmaster_offline_parts GROUP BY family_name ORDER BY count DESC, value LIMIT 200",
+      "SELECT coalesce(family_name, 'Unclassified') AS value, count(*) AS count FROM partmaster_offline_parts WHERE coalesce(record_type, 'product') = 'product' GROUP BY family_name ORDER BY count DESC, value LIMIT 200",
     );
     return { manufacturers: manufacturers.getRowObjectsJson(), families: families.getRowObjectsJson() };
   });
@@ -5411,7 +5447,7 @@ app.get("/api/local/master-catalog", asyncRoute(async (request, response) => {
 
 app.post("/api/local/master-catalog/export", asyncRoute(async (request, response) => {
   const filters = request.body || {};
-  const conditions = []; const values = {};
+  const conditions = ["coalesce(record_type, 'product') = 'product'"]; const values = {};
   const query = String(filters.q || "").trim().toLowerCase();
   if (query) { conditions.push("lower(concat_ws(' ', manufacturer, part_number, description, family_name, side, position, extracted_attributes_json)) LIKE $query"); values.query = `%${query}%`; }
   if (filters.manufacturer) { conditions.push("manufacturer_norm = $manufacturer"); values.manufacturer = normalizePartNumber(normalizeManufacturer(filters.manufacturer)); }
@@ -5641,7 +5677,7 @@ app.post("/api/local/pipeline/exports", asyncRoute(async (_request, response) =>
        attribute_status AS "Attribute Status", online_status AS "Online Evidence Status",
        best_source_url AS "Best Source URL", manufacturer_norm AS "Normalized Manufacturer",
        part_number_norm AS "Normalized OEM Number", part_key AS "Global Part Key"
-       FROM partmaster_offline_parts ORDER BY manufacturer_norm, part_number_norm)
+       FROM partmaster_offline_parts WHERE coalesce(record_type, 'product') = 'product' ORDER BY manufacturer_norm, part_number_norm)
        TO ${quoteString(catalogPath)} (FORMAT CSV, HEADER true)`,
     );
     await connection.run(
