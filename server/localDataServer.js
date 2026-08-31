@@ -6849,6 +6849,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
          SELECT part_key, count(*) AS review_flag_count, string_agg(flag_code, ', ' ORDER BY flag_code) AS review_flags
          FROM partmaster_master_review_flags WHERE status = 'open' GROUP BY part_key
        ) flags ON flags.part_key = parts.part_key
+       WHERE coalesce(parts.record_type, 'product') = 'product'
        ORDER BY parts.manufacturer_norm, parts.part_number_norm)
        TO ${quoteString(catalogPath)} (FORMAT CSV, HEADER true)`,
     );
