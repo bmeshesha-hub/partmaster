@@ -6145,7 +6145,9 @@ app.post("/api/local/enrichment/candidates/:id/source-search/resolve", asyncRout
   const side = text.match(/\b(left|right|center)\b/i)?.[1] || "";
   const position = text.match(/\b(front|rear|upper|lower|inner|outer)\b/i)?.[1] || "";
   const familyName = text.match(/\b(mirror|clutch|brake|suspension|steering|electrical|ignition|air cleaner|molding|fuel tank|filter|washer|bolt|nut)\b/i)?.[1] || "";
-  response.json({ url, title, candidates, partNumber: candidates.length === 1 ? candidates[0] : "", partNumbers: candidates, partSpecific: candidates.length > 0, fields: { ...(side ? { side } : {}), ...(position ? { position } : {}), ...(familyName ? { familyName } : {}), ...(title ? { description: title } : {}) } });
+  const childParts = extractCatalogItems(html).slice(0, 100).map((item) => ({ partNumber: item.partNumber, description: item.description, brand: item.brand }));
+  const assemblyReference = childParts.length > 1 || /\b(diagram|parts list|starter motor|exploded view|assembly)\b/i.test(`${title} ${text}`);
+  response.json({ url, title, candidates, partNumber: candidates.length === 1 && !assemblyReference ? candidates[0] : "", partNumbers: candidates, childParts, assemblyReference, partSpecific: candidates.length > 0 && !assemblyReference, fields: { ...(side ? { side } : {}), ...(position ? { position } : {}), ...(familyName ? { familyName } : {}), ...(title ? { description: title } : {}), ...(assemblyReference ? { componentScope: "complete_assembly" } : {}) } });
 }));
 
 app.post("/api/local/enrichment/candidates/source-search-batch", asyncRoute(async (request, response) => {
@@ -6720,7 +6722,8 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
       evidence_url: String(request.body.evidenceUrl || candidate.evidence_url || candidate.source_url || "").trim() || null,
     };
     let reviewedPartId = null;
-    if (decision === "approve") {
+    const assemblyReference = edited.component_scope === "complete_assembly" && !normalizePartNumber(edited.enriched_part_number);
+    if (decision === "approve" && !assemblyReference) {
       if (!normalizePartNumber(edited.enriched_part_number)) throw new Error("An OEM part number is required before approval.");
       reviewedPartId = await promoteCandidate(connection, edited, "human_verified");
     }
@@ -6759,7 +6762,7 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
         variantSummary: edited.variant_summary,
         fitmentExplanation: edited.fitment_explanation,
         evidenceUrl: edited.evidence_url,
-        status: decision === "approve" ? "enriched" : "rejected",
+        status: decision === "approve" ? (assemblyReference ? "assembly_reference" : "enriched") : "rejected",
         decision,
         notes: String(request.body.notes || "").trim() || null,
       },

@@ -80,7 +80,8 @@ function sideApplies(candidate) {
 
 function candidateMissingFields(candidate) {
   const missing = [];
-  if (!normalizeCandidateNumber(candidate)) missing.push("OEM number");
+  const assemblyReference = candidate.component_scope === "complete_assembly" || /\b(diagram|parts list|starter motor|complete assembly)\b/i.test(`${candidate.family_name || ""} ${candidate.assembly || ""} ${candidate.description_raw || ""}`);
+  if (!normalizeCandidateNumber(candidate) && !assemblyReference) missing.push("OEM number");
   if (!String(candidate.enriched_description || candidate.description_raw || "").trim()) missing.push("description");
   if (!String(candidate.source_url || candidate.evidence_url || "").trim()) missing.push("source page");
   if (sideApplies(candidate) && (!String(candidate.side || "").trim() || String(candidate.side).toLowerCase() === "unknown")) missing.push("side");
@@ -490,6 +491,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
       ...(resolved.fields?.side && (!current.side || current.side === "Unknown") ? { side: resolved.fields.side } : {}),
       ...(resolved.fields?.position && !current.position ? { position: resolved.fields.position } : {}),
       ...(resolved.fields?.familyName && !current.familyName ? { familyName: resolved.fields.familyName } : {}),
+      ...(resolved.fields?.componentScope ? { componentScope: resolved.fields.componentScope } : {}),
       ...(result.url ? { evidenceUrl: result.url } : {}),
       ...(selectedPartNumber ? { partNumber: selectedPartNumber } : {}),
       ...(result.title ? { notes: `${current.notes ? `${current.notes}\n` : ""}Selected source: ${result.title}${resolvedCandidates.length > 1 ? ` · OEM candidates: ${resolvedCandidates.join(", ")}` : selectedPartNumber ? ` · OEM: ${selectedPartNumber}` : " · no OEM number detected"}` } : {}),
@@ -536,6 +538,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
   const missingFields = candidateMissingFields(candidate);
   const actionPlan = candidateActionPlan(candidate);
   const fieldNeedsAttention = (field) => missingFields.includes(field);
+  const assemblyReference = !normalizeCandidateNumber(candidate) && (values.componentScope === "complete_assembly" || /\b(diagram|parts list|starter motor|complete assembly)\b/i.test(`${candidate.family_name || ""} ${candidate.assembly || ""} ${candidate.description_raw || ""}`));
   const fieldClass = (field) => fieldNeedsAttention(field) ? "border-red-400 bg-red-50/40 ring-2 ring-red-200 placeholder:text-red-300" : "border-slate-300 bg-white";
 
   return <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/55 p-4">
@@ -610,7 +613,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
       </div>
       <footer className="sticky bottom-0 flex flex-wrap justify-end gap-3 border-t border-slate-200 bg-white px-5 py-4">
         <button type="button" disabled={saving} onClick={() => decide("reject")} className="rounded-xl border border-red-200 px-4 py-2 text-sm font-semibold text-red-700 disabled:opacity-50">Reject</button>
-        <button type="button" disabled={saving || !values.partNumber.trim()} onClick={() => decide("approve")} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{saving ? <LoaderCircle className="animate-spin" size={16} /> : <Check size={16} />}Approve and promote</button>
+        <button type="button" disabled={saving || (!values.partNumber.trim() && !assemblyReference)} onClick={() => decide("approve")} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{saving ? <LoaderCircle className="animate-spin" size={16} /> : <Check size={16} />}{assemblyReference ? "Save assembly reference" : "Approve and promote"}</button>
       </footer>
     </div>
   </div>;
