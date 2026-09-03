@@ -449,12 +449,19 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
     setSearchingSources(true); setReviewError("");
     const candidates = [...new Set([...(result.partNumbers || []), result.partNumber, result.part_number, result.oemNumber].map((value) => String(value || "").trim()).filter(Boolean))];
     let resolved = result;
+    let resolutionUnavailable = false;
     try {
       if (result.url && !candidates.length) resolved = await localDataApi.resolveCandidateSource(candidate.id, result.url);
     } catch (requestError) {
-      setReviewError(requestError.message || "The source page could not be verified.");
-      setSearchingSources(false);
-      return;
+      // Older local workers do not have the page-resolution route yet. Keep
+      // the selected evidence usable instead of turning that compatibility
+      // gap into a blocking review error.
+      if (!String(requestError.message || "").includes("404")) {
+        setReviewError(requestError.message || "The source page could not be verified.");
+        setSearchingSources(false);
+        return;
+      }
+      resolutionUnavailable = true;
     }
     const resolvedCandidates = [...new Set([...(resolved.partNumbers || []), resolved.partNumber, resolved.part_number, resolved.oemNumber].map((value) => String(value || "").trim()).filter(Boolean))];
     const selectedPartNumber = resolvedCandidates.length === 1 ? resolvedCandidates[0] : "";
@@ -467,7 +474,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
     }));
     // A result without an OEM is an informational outcome, not a save error.
     // The required-field styling already tells the reviewer what remains.
-    setReviewError(resolvedCandidates.length > 1 ? "Multiple OEM numbers were found. Confirm the exact number manually before approval." : !selectedPartNumber ? "The page was checked, but no OEM number was found. Enter the exact OEM number manually." : "");
+    setReviewError(resolutionUnavailable ? "" : resolvedCandidates.length > 1 ? "Multiple OEM numbers were found. Confirm the exact number manually before approval." : !selectedPartNumber ? "The page was checked, but no OEM number was found. Enter the exact OEM number manually." : "");
     setSearchingSources(false);
   }
 
