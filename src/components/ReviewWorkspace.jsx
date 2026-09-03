@@ -98,6 +98,7 @@ export default function ReviewWorkspace() {
   const [loadingQueue, setLoadingQueue] = useState(false);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [notice, setNotice] = useState({ type: "", message: "" });
+  const [bulkReport, setBulkReport] = useState(null);
 
   const loadOverview = useCallback(async () => {
     try {
@@ -181,11 +182,25 @@ export default function ReviewWorkspace() {
     const selected = candidates.filter((candidate) => selectedIds.includes(candidate.id));
     if (!selected.length) return;
     const byJob = selected.reduce((groups, candidate) => { (groups[candidate.job_id] ||= []).push(candidate.id); return groups; }, {});
-    setBulkBusy(true); setNotice({ type: "", message: "" });
+    setBulkBusy(true); setNotice({ type: "", message: "" }); setBulkReport(null);
     try {
+      const searches = await Promise.all(selected.map(async (candidate) => {
+        try { return { candidate, result: await localDataApi.searchCandidateSources(candidate.id) }; }
+        catch { return { candidate, result: { results: [] } }; }
+      }));
+      const report = searches.reduce((summary, item) => {
+        const results = item.result.results || [];
+        const fields = results.flatMap((result) => Object.keys(result.fields || {}));
+        summary.records += 1; summary.sources += results.length;
+        if (results.some((result) => (result.partNumbers || []).length)) summary.oem += 1;
+        ["description", "side", "position", "familyName"].forEach((field) => { if (fields.includes(field)) summary[field] += 1; });
+        if (new Set(results.flatMap((result) => result.partNumbers || [])).size > 1) summary.ambiguous += 1;
+        return summary;
+      }, { records: 0, sources: 0, oem: 0, description: 0, side: 0, position: 0, familyName: 0, ambiguous: 0 });
+      setBulkReport(report);
       for (const [jobId, ids] of Object.entries(byJob)) await localDataApi.reprocessEnrichmentReview(jobId, ids);
       setSelectedIds([]);
-      setNotice({ type: "success", message: `${number(selected.length)} selected records queued for source recheck. Existing master records were not changed.` });
+      setNotice({ type: "success", message: `${number(selected.length)} selected records searched and queued for source recheck. No values were changed automatically.` });
     } catch (error) { setNotice({ type: "error", message: error.message }); }
     finally { setBulkBusy(false); await Promise.all([loadOverview(), loadQueue()]); }
   }
@@ -220,6 +235,7 @@ export default function ReviewWorkspace() {
     </section>
 
     {notice.message && <div className={`flex items-start justify-between gap-4 rounded-2xl border-2 px-5 py-4 text-sm font-bold shadow-lg ${notice.type === "error" ? "border-red-300 bg-red-50 text-red-900" : "border-emerald-300 bg-emerald-50 text-emerald-900"}`} role={notice.type === "error" ? "alert" : "status"}><span className="flex items-start gap-2">{notice.type === "error" ? <AlertTriangle className="shrink-0" size={19} /> : <Check className="shrink-0" size={19} />}{notice.message}</span><button type="button" onClick={() => setNotice({ type: "", message: "" })}><X size={18} /></button></div>}
+    {bulkReport && <section className="rounded-2xl border border-cyan-200 bg-cyan-50 p-5"><div className="flex flex-wrap items-center justify-between gap-3"><div><h4 className="font-black text-cyan-950">Bulk enrichment results</h4><p className="mt-1 text-xs text-cyan-800">Suggestions were found, but nothing was applied without human confirmation.</p></div><button type="button" onClick={() => setBulkReport(null)} className="text-cyan-700"><X size={17} /></button></div><div className="mt-4 grid gap-2 sm:grid-cols-3 lg:grid-cols-6">{[["Records searched", bulkReport.records], ["Sources found", bulkReport.sources], ["OEM suggestions", bulkReport.oem], ["Descriptions", bulkReport.description], ["Side / position", bulkReport.side + bulkReport.position], ["Ambiguous", bulkReport.ambiguous]].map(([label, value]) => <div key={label} className="rounded-xl bg-white p-3"><p className="text-[10px] font-black uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 text-xl font-black text-slate-900">{number(value)}</p></div>)}</div><p className="mt-3 text-xs font-semibold text-cyan-900">Open each record’s Review panel to choose the exact field value and apply it.</p></section>}
 
     <section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-xs font-black uppercase tracking-[0.16em] text-brand-700">Brand review rooms</p><h3 className="mt-1 text-2xl font-black text-slate-900">Choose where your expertise is needed</h3><p className="mt-1 text-sm text-slate-500">{connected ? "Each card is a live count from the local evidence queue." : "Published counts show where review work is concentrated; open the local app to decide individual records."}</p></div>{brand && <button type="button" onClick={() => setBrand("")} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-700">Show every brand</button>}</div>
       <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">{(overview.brands || []).map((item) => <BrandCard key={item.brand} brand={item} selected={brand === item.brand} onSelect={() => selectBrand(item.brand)} />)}</div>
