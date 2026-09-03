@@ -475,6 +475,10 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
     setSelectedSourceResult(result);
     setValues((current) => ({
       ...current,
+      ...(resolved.fields?.description && !current.description ? { description: resolved.fields.description } : {}),
+      ...(resolved.fields?.side && (!current.side || current.side === "Unknown") ? { side: resolved.fields.side } : {}),
+      ...(resolved.fields?.position && !current.position ? { position: resolved.fields.position } : {}),
+      ...(resolved.fields?.familyName && !current.familyName ? { familyName: resolved.fields.familyName } : {}),
       ...(result.url ? { evidenceUrl: result.url } : {}),
       ...(selectedPartNumber ? { partNumber: selectedPartNumber } : {}),
       ...(result.title ? { notes: `${current.notes ? `${current.notes}\n` : ""}Selected source: ${result.title}${resolvedCandidates.length > 1 ? ` · OEM candidates: ${resolvedCandidates.join(", ")}` : selectedPartNumber ? ` · OEM: ${selectedPartNumber}` : " · no OEM number detected"}` } : {}),

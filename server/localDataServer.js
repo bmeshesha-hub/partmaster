@@ -2302,9 +2302,17 @@ async function fetchEvidence(url) {
 }
 
 async function searchCandidateSources(candidate) {
-  const extractOemNumbers = (value) => [...new Set(String(value || "").match(/\b[A-Z0-9]{2,8}[-–][A-Z0-9]{1,8}[-–][A-Z0-9]{2,8}\b/gi)?.map((item) => item.replace("–", "-")) || [])];
+  const extractOemNumbers = (value) => [...new Set(String(value || "").match(/\b(?=[A-Z0-9-]*\d)[A-Z0-9]{2,8}[-–][A-Z0-9]{1,8}[-–][A-Z0-9]{2,8}\b/gi)?.map((item) => item.replace("–", "-")) || [])];
+  const extractFields = (value, title) => {
+    const text = `${title} ${value}`;
+    const side = text.match(/\b(left|right|center)\b/i)?.[1] || "";
+    const position = text.match(/\b(front|rear|upper|lower|inner|outer)\b/i)?.[1] || "";
+    const family = text.match(/\b(mirror|clutch|brake|suspension|steering|electrical|ignition|air cleaner|molding|fastener|washer|bolt|nut)\b/i)?.[1] || "";
+    return { ...(side ? { side } : {}), ...(position ? { position } : {}), ...(family ? { familyName: family } : {}), ...(title ? { description: cleanText(title) } : {}) };
+  };
   const sourcePartNumber = candidate.enriched_part_number || candidate.part_number_raw || "";
-  const query = String(candidate.search_query || [sourcePartNumber, candidate.manufacturer_raw, candidate.year, candidate.model, candidate.description_raw, candidate.assembly].filter(Boolean).join(" ")).trim();
+  const missingFields = [!sourcePartNumber && "OEM part number", !candidate.description_raw && "part description", !candidate.side && "left right side", !candidate.position && "part position", !candidate.family_name && "part family"].filter(Boolean);
+  const query = String(candidate.search_query || [sourcePartNumber, candidate.manufacturer_raw, candidate.year, candidate.model, candidate.description_raw, candidate.assembly, ...missingFields].filter(Boolean).join(" ")).trim();
   const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
   let response = await fetch(searchUrl, { headers: { Accept: "text/html", "User-Agent": "Mozilla/5.0" } });
   let html;
@@ -2327,7 +2335,7 @@ async function searchCandidateSources(candidate) {
       const snippet = cleanText(context);
       const partNumbers = extractOemNumbers(`${title} ${snippet} ${url}`);
       const partNumber = partNumbers[0] || "";
-      if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, partNumbers, confidence: partNumber ? 0.55 : 0.25 });
+      if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, partNumbers, fields: extractFields(snippet, title), confidence: partNumber ? 0.55 : 0.25 });
       if (results.length >= 8) break;
     }
   } else {
@@ -2343,7 +2351,7 @@ async function searchCandidateSources(candidate) {
       const snippet = cleanText(block.match(/<p[^>]*>([\s\S]*?)<\/p>/i)?.[1] || "");
       const partNumbers = extractOemNumbers(`${title} ${snippet} ${url}`);
       const partNumber = partNumbers[0] || "";
-      if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, partNumbers, confidence: partNumber ? 0.55 : 0.25 });
+      if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, partNumbers, fields: extractFields(snippet, title), confidence: partNumber ? 0.55 : 0.25 });
       if (results.length >= 8) break;
     }
   }
