@@ -26,6 +26,13 @@ input {
   font: inherit;
 }
 
+/* Keep wide operational tables inside their own scroll viewport instead of
+   expanding the page on laptop and mobile widths. */
+.overflow-x-auto {
+  min-width: 0;
+  max-width: 100%;
+}
+
 button:focus-visible,
 input:focus-visible {
   outline: 3px solid rgba(22, 131, 216, 0.25);

@@ -2324,9 +2324,9 @@ async function searchCandidateSources(candidate) {
       try { url = new URL(url, searchUrl).searchParams.get("uddg") || url; } catch { /* keep original */ }
       const title = cleanText(match[2]);
       const context = html.slice(Math.max(0, match.index - 300), match.index + 900);
+      const snippet = cleanText(context);
       const partNumbers = extractOemNumbers(`${title} ${snippet} ${url}`);
       const partNumber = partNumbers[0] || "";
-      const snippet = cleanText(context);
       if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, partNumbers, confidence: partNumber ? 0.55 : 0.25 });
       if (results.length >= 8) break;
     }

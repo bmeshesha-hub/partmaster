@@ -130,7 +130,7 @@ export default function App() {
       </aside>
       <div className={`transition-all ${sidebarCollapsed ? "lg:pl-20" : "lg:pl-60"}`}>
       <header className="sticky top-0 z-20 border-b border-slate-200/80 bg-white/95 backdrop-blur">
-        <div className="mx-auto flex max-w-[100rem] items-center gap-4 px-4 py-3 sm:px-6 lg:px-8">
+        <div className="flex w-full items-center gap-4 px-3 py-3 sm:px-5 lg:px-6">
           <button type="button" onClick={() => setView("dashboard")} className="flex items-center gap-2 lg:hidden"><span className="grid h-9 w-9 place-items-center rounded-xl bg-brand-600 text-white"><Boxes size={20} /></span><span className="text-base font-black text-ink">Partmaster</span></button>
           <label className="relative hidden max-w-xl flex-1 md:block"><SearchCheck className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} /><input aria-label="Global search" placeholder="Search all parts, processes, or fields…" className="w-full rounded-xl border border-slate-200 bg-slate-50 py-2.5 pl-9 pr-4 text-sm outline-none transition focus:border-brand-400 focus:bg-white" /></label>
           <div className="ml-auto flex items-center gap-2">
@@ -141,7 +141,7 @@ export default function App() {
 
       {view === "processes" && <nav className="border-b border-slate-200 bg-white px-4 py-2 shadow-sm" aria-label="Processes submenu"><div className="mx-auto flex max-w-7xl items-center gap-2 sm:px-2"><span className="mr-2 text-xs font-black uppercase tracking-widest text-slate-400">Processes</span><button type="button" onClick={() => setProcessMode("monitor")} className={`rounded-lg px-3 py-1.5 text-sm font-bold ${processMode === "monitor" ? "bg-brand-50 text-brand-700" : "text-slate-600 hover:bg-slate-50"}`}>Monitor</button><button type="button" onClick={() => setProcessMode("logs")} className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-bold ${processMode === "logs" ? "bg-slate-950 text-cyan-300" : "text-slate-600 hover:bg-slate-50"}`}><span className="h-2 w-2 rounded-full bg-emerald-400" />Live log</button></div></nav>}
 
-      <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+      <main className="w-full max-w-none overflow-x-hidden px-3 py-5 sm:px-5 sm:py-7 lg:px-6">
         <nav className="mb-6 grid grid-cols-3 rounded-xl bg-slate-200/70 p-1 sm:grid-cols-5 lg:hidden" aria-label="Primary navigation">
           {NAVIGATION.map(({ id, shortLabel, icon }) => <button key={id} type="button" onClick={() => setView(id)} className={`flex flex-col items-center gap-1 rounded-lg px-1 py-2 text-[11px] font-medium sm:flex-row sm:justify-center sm:text-sm ${view === id ? "bg-white text-brand-700 shadow-sm" : "text-slate-600"}`}>{createElement(icon, { size: 16, "aria-hidden": true })}{shortLabel}</button>)}
         </nav>
