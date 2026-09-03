@@ -6142,7 +6142,10 @@ app.post("/api/local/enrichment/candidates/:id/source-search/resolve", asyncRout
   const text = cleanText(html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, " "));
   const title = cleanText(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "");
   const candidates = [...new Set(`${title} ${text} ${url}`.match(/\b(?=[A-Z0-9-]*\d)[A-Z0-9]{2,8}[-–][A-Z0-9]{1,8}[-–][A-Z0-9]{2,8}\b/gi)?.map((item) => item.replace("–", "-")) || [])];
-  response.json({ url, title, candidates, partNumber: candidates.length === 1 ? candidates[0] : "", partNumbers: candidates, partSpecific: candidates.length > 0 });
+  const side = text.match(/\b(left|right|center)\b/i)?.[1] || "";
+  const position = text.match(/\b(front|rear|upper|lower|inner|outer)\b/i)?.[1] || "";
+  const familyName = text.match(/\b(mirror|clutch|brake|suspension|steering|electrical|ignition|air cleaner|molding|fuel tank|filter|washer|bolt|nut)\b/i)?.[1] || "";
+  response.json({ url, title, candidates, partNumber: candidates.length === 1 ? candidates[0] : "", partNumbers: candidates, partSpecific: candidates.length > 0, fields: { ...(side ? { side } : {}), ...(position ? { position } : {}), ...(familyName ? { familyName } : {}), ...(title ? { description: title } : {}) } });
 }));
 
 app.post("/api/local/enrichment/candidates/source-search-batch", asyncRoute(async (request, response) => {

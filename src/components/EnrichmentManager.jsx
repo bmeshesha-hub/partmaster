@@ -444,7 +444,15 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
     setSearchingSources(true); setReviewError("");
     try {
       const result = await localDataApi.searchCandidateSources(candidate.id);
-      const results = result.results || [];
+      let results = result.results || [];
+      // Prefer the supplied source page: it is usually the most authoritative
+      // place to recover an OEM number and missing descriptive fields.
+      if (candidate.source_url) {
+        try {
+          const supplied = await localDataApi.resolveCandidateSource(candidate.id, candidate.source_url);
+          if (supplied.partNumbers?.length || supplied.title) results = [{ ...supplied, url: candidate.source_url, title: supplied.title || "Supplied source page", partNumber: supplied.partNumber, partNumbers: supplied.partNumbers || [], fields: supplied.fields || {} }, ...results.filter((item) => item.url !== candidate.source_url)];
+        } catch { /* Keep web search results when the supplied page blocks access. */ }
+      }
       setSourceResults(results);
       setDetectedOemNumbers([...new Set(results.flatMap((item) => Array.isArray(item.partNumbers) ? item.partNumbers : [item.partNumber]).map((value) => String(value || "").trim()).filter(Boolean))]);
       setFieldSuggestions(results.reduce((fields, item) => { Object.entries(item.fields || {}).forEach(([field, value]) => { if (value) fields[field] = [...new Set([...(fields[field] || []), value])]; }); return fields; }, {}));
