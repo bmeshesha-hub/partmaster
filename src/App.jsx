@@ -69,6 +69,7 @@ export default function App() {
   const [view, setView] = useState("dashboard");
   const [processMode, setProcessMode] = useState("monitor");
   const [settingsOpen, setSettingsOpen] = useState(() => !localStorage.getItem(TOKEN_STORAGE_KEY));
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const loadWorkspace = useCallback(async () => {
     if (!token) return;
@@ -114,17 +115,25 @@ export default function App() {
   const [eyebrow, heading] = VIEW_COPY[view];
 
   return (
-    <div className="min-h-screen">
-      <header className="sticky top-0 z-20 border-b border-slate-200/80 bg-white/90 backdrop-blur">
-        <div className="mx-auto flex max-w-[90rem] items-center justify-between px-4 py-4 sm:px-6 lg:px-8">
-          <button type="button" onClick={() => setView("dashboard")} className="flex items-center gap-3 text-left">
-            <span className="grid h-10 w-10 place-items-center rounded-xl bg-brand-600 text-white shadow-sm"><Boxes size={22} aria-hidden="true" /></span>
-            <span><span className="block text-lg font-bold tracking-tight text-ink">Partmaster</span><span className="block text-xs text-slate-500">Parts intelligence workspace</span></span>
+    <div className="min-h-screen overflow-x-hidden">
+      <aside className={`fixed inset-y-0 left-0 z-30 hidden border-r border-slate-200 bg-white transition-all lg:block ${sidebarCollapsed ? "w-20" : "w-60"}`}>
+        <div className={`flex h-full flex-col ${sidebarCollapsed ? "items-center" : ""}`}>
+          <button type="button" onClick={() => setView("dashboard")} className={`flex items-center gap-3 border-b border-slate-100 px-4 py-5 text-left ${sidebarCollapsed ? "justify-center" : "w-full"}`}>
+            <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-brand-600 text-white shadow-sm"><Boxes size={20} /></span>
+            {!sidebarCollapsed && <span><span className="block text-base font-black tracking-tight text-ink">Partmaster</span><span className="block text-[10px] text-slate-500">Parts intelligence workspace</span></span>}
           </button>
-          <div className="flex items-center gap-2">
-            <nav className="hidden rounded-xl bg-slate-100 p-1 2xl:flex" aria-label="Primary navigation">
-              {NAVIGATION.map(({ id, label, icon }) => <button key={id} type="button" onClick={() => setView(id)} className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium ${view === id ? "bg-white text-brand-700 shadow-sm" : "text-slate-600 hover:text-slate-900"}`}>{createElement(icon, { size: 16, "aria-hidden": true })}{label}{id === "processes" && <span className="rounded-full bg-emerald-100 px-1.5 text-[10px] font-black text-emerald-700">LIVE</span>}</button>)}
-            </nav>
+          <nav className="flex-1 space-y-1 p-3" aria-label="Primary navigation">
+            {NAVIGATION.map(({ id, label, icon }) => <button key={id} type="button" title={sidebarCollapsed ? label : undefined} onClick={() => setView(id)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm font-semibold transition ${view === id ? "bg-brand-50 text-brand-700" : "text-slate-600 hover:bg-slate-50 hover:text-slate-900"} ${sidebarCollapsed ? "justify-center" : ""}`}>{createElement(icon, { size: 17, "aria-hidden": true })}{!sidebarCollapsed && <><span className="flex-1">{label}</span>{id === "processes" && <span className="rounded-full bg-emerald-100 px-1.5 text-[9px] font-black text-emerald-700">LIVE</span>}</>}</button>)}
+          </nav>
+          <button type="button" onClick={() => setSidebarCollapsed((value) => !value)} className="m-3 rounded-lg border border-slate-200 px-3 py-2 text-xs font-bold text-slate-500 hover:bg-slate-50">{sidebarCollapsed ? "»" : "« Minimize"}</button>
+        </div>
+      </aside>
+      <div className={`transition-all ${sidebarCollapsed ? "lg:pl-20" : "lg:pl-60"}`}>
+      <header className="sticky top-0 z-20 border-b border-slate-200/80 bg-white/95 backdrop-blur">
+        <div className="mx-auto flex max-w-[100rem] items-center gap-4 px-4 py-3 sm:px-6 lg:px-8">
+          <button type="button" onClick={() => setView("dashboard")} className="flex items-center gap-2 lg:hidden"><span className="grid h-9 w-9 place-items-center rounded-xl bg-brand-600 text-white"><Boxes size={20} /></span><span className="text-base font-black text-ink">Partmaster</span></button>
+          <label className="relative hidden max-w-xl flex-1 md:block"><SearchCheck className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} /><input aria-label="Global search" placeholder="Search all parts, processes, or fields…" className="w-full rounded-xl border border-slate-200 bg-slate-50 py-2.5 pl-9 pr-4 text-sm outline-none transition focus:border-brand-400 focus:bg-white" /></label>
+          <div className="ml-auto flex items-center gap-2">
             <button type="button" onClick={() => setSettingsOpen(true)} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"><Settings size={17} aria-hidden="true" /><span className="hidden sm:inline">Settings</span></button>
           </div>
         </div>
@@ -133,7 +142,7 @@ export default function App() {
       {view === "processes" && <nav className="border-b border-slate-200 bg-white px-4 py-2 shadow-sm" aria-label="Processes submenu"><div className="mx-auto flex max-w-7xl items-center gap-2 sm:px-2"><span className="mr-2 text-xs font-black uppercase tracking-widest text-slate-400">Processes</span><button type="button" onClick={() => setProcessMode("monitor")} className={`rounded-lg px-3 py-1.5 text-sm font-bold ${processMode === "monitor" ? "bg-brand-50 text-brand-700" : "text-slate-600 hover:bg-slate-50"}`}>Monitor</button><button type="button" onClick={() => setProcessMode("logs")} className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-bold ${processMode === "logs" ? "bg-slate-950 text-cyan-300" : "text-slate-600 hover:bg-slate-50"}`}><span className="h-2 w-2 rounded-full bg-emerald-400" />Live log</button></div></nav>}
 
       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
-        <nav className="mb-6 grid grid-cols-3 rounded-xl bg-slate-200/70 p-1 sm:grid-cols-5 lg:grid-cols-9 2xl:hidden" aria-label="Primary navigation">
+        <nav className="mb-6 grid grid-cols-3 rounded-xl bg-slate-200/70 p-1 sm:grid-cols-5 lg:hidden" aria-label="Primary navigation">
           {NAVIGATION.map(({ id, shortLabel, icon }) => <button key={id} type="button" onClick={() => setView(id)} className={`flex flex-col items-center gap-1 rounded-lg px-1 py-2 text-[11px] font-medium sm:flex-row sm:justify-center sm:text-sm ${view === id ? "bg-white text-brand-700 shadow-sm" : "text-slate-600"}`}>{createElement(icon, { size: 16, "aria-hidden": true })}{shortLabel}</button>)}
         </nav>
 
@@ -170,6 +179,7 @@ export default function App() {
           <PartsLibrary data={data} />
         ) : null}
       </main>
+      </div>
 
       <GitHubAuth open={settingsOpen} initialToken={token} onClose={() => setSettingsOpen(false)} onSave={saveToken} />
     </div>
