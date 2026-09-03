@@ -2302,7 +2302,9 @@ async function fetchEvidence(url) {
 }
 
 async function searchCandidateSources(candidate) {
-  const query = String(candidate.search_query || [candidate.manufacturer_raw, candidate.year, candidate.model, candidate.description_raw, candidate.assembly].filter(Boolean).join(" ")).trim();
+  const extractOemNumbers = (value) => [...new Set(String(value || "").match(/\b[A-Z0-9]{2,8}[-–][A-Z0-9]{1,8}[-–][A-Z0-9]{2,8}\b/gi)?.map((item) => item.replace("–", "-")) || [])];
+  const sourcePartNumber = candidate.enriched_part_number || candidate.part_number_raw || "";
+  const query = String(candidate.search_query || [sourcePartNumber, candidate.manufacturer_raw, candidate.year, candidate.model, candidate.description_raw, candidate.assembly].filter(Boolean).join(" ")).trim();
   const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
   let response = await fetch(searchUrl, { headers: { Accept: "text/html", "User-Agent": "Mozilla/5.0" } });
   let html;
@@ -2322,9 +2324,10 @@ async function searchCandidateSources(candidate) {
       try { url = new URL(url, searchUrl).searchParams.get("uddg") || url; } catch { /* keep original */ }
       const title = cleanText(match[2]);
       const context = html.slice(Math.max(0, match.index - 300), match.index + 900);
-      const partNumber = context.match(/\b\d{4,6}[-–]\d{3,5}\b/)?.[0]?.replace("–", "-") || "";
+      const partNumbers = extractOemNumbers(`${title} ${snippet} ${url}`);
+      const partNumber = partNumbers[0] || "";
       const snippet = cleanText(context);
-      if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, confidence: partNumber ? 0.55 : 0.25 });
+      if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, partNumbers, confidence: partNumber ? 0.55 : 0.25 });
       if (results.length >= 8) break;
     }
   } else {
@@ -2338,8 +2341,9 @@ async function searchCandidateSources(candidate) {
       } catch { /* Keep the result URL if Bing changes its redirect format. */ }
       const title = cleanText(match[2]);
       const snippet = cleanText(block.match(/<p[^>]*>([\s\S]*?)<\/p>/i)?.[1] || "");
-      const partNumber = `${title} ${snippet}`.match(/\b\d{4,6}[-–]\d{3,5}\b/)?.[0]?.replace("–", "-") || "";
-      if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, confidence: partNumber ? 0.55 : 0.25 });
+      const partNumbers = extractOemNumbers(`${title} ${snippet} ${url}`);
+      const partNumber = partNumbers[0] || "";
+      if (title && /^https?:/i.test(url)) results.push({ title, snippet, url, partNumber, partNumbers, confidence: partNumber ? 0.55 : 0.25 });
       if (results.length >= 8) break;
     }
   }
@@ -4704,7 +4708,8 @@ function parsePartSearchQuery(query) {
     const exclusionPattern = new RegExp(`(?:without|exclude|no|non)[ -]{0,2}${key.replaceAll("_", "[ -]?")}`, "i");
     (exclusionPattern.test(lower) ? excludedFeatures : requiredFeatures).push(key);
   }
-  const importantTerms = lower.replace(/[^a-z0-9-]+/g, " ").split(/\s+/).filter((term) => term.length >= 3 && !["find", "part", "parts", "with", "without", "for", "the", "and", "but", "exclude", year, manufacturer.toLowerCase(), side].includes(term)).slice(0, 8);
+  const featureTerms = Object.keys(featureMap).flatMap((key) => [key, ...key.split("_")]);
+  const importantTerms = lower.replace(/[^a-z0-9-]+/g, " ").split(/\s+/).filter((term) => term.length >= 3 && !["find", "part", "parts", "with", "without", "for", "the", "and", "but", "exclude", "no", "non", "of", "a", "an", year, manufacturer.toLowerCase(), side, ...featureTerms].includes(term)).slice(0, 8);
   return { raw, year, side, manufacturer, requiredFeatures, excludedFeatures, importantTerms };
 }
 
@@ -4760,9 +4765,13 @@ async function intelligentPartSearch(query) {
     }
     if (rejected) continue;
     const termMatches = interpreted.importantTerms.filter((term) => searchable.includes(term));
-    if (interpreted.importantTerms.length && !termMatches.length && !normalizePartNumber(interpreted.raw).includes(row.part_number.replace(/[^A-Z0-9]/gi, ""))) continue;
+    // Descriptive words such as "mirror" are useful ranking signals, but are
+    // not hard filters: category names and structured attributes may identify
+    // a part even when its description does not repeat the user's wording.
+    const exactPartMatch = normalizePartNumber(interpreted.raw).includes(row.part_number.replace(/[^A-Z0-9]/gi, ""));
     score += termMatches.length * 5;
     if (termMatches.length) reasons.push(`Matched ${termMatches.join(", ")}`);
+    else if (interpreted.importantTerms.length && !exactPartMatch) reasons.push("Matched structured part data; wording may differ");
     results.push({ ...row, matchScore: Math.round(score), reasons: reasons.length ? reasons : ["Matched canonical part identity"] });
   }
   return { interpreted, results: results.sort((left, right) => right.matchScore - left.matchScore).slice(0, 100) };
@@ -6114,6 +6123,18 @@ app.get("/api/local/enrichment/candidates/:id/source-search", asyncRoute(async (
   });
   if (!candidate) return response.status(404).json({ error: "Review candidate not found." });
   response.json(await searchCandidateSources(candidate));
+}));
+
+app.post("/api/local/enrichment/candidates/:id/source-search/resolve", asyncRoute(async (request, response) => {
+  const url = String(request.body?.url || "").trim();
+  if (!/^https?:\/\//i.test(url)) return response.status(400).json({ error: "A valid source URL is required." });
+  const pageResponse = await fetch(url, { headers: { Accept: "text/html", "User-Agent": "Mozilla/5.0 (compatible; Partmaster/1.0)" } });
+  if (!pageResponse.ok) return response.status(502).json({ error: `The source page returned HTTP ${pageResponse.status}.` });
+  const html = (await pageResponse.text()).slice(0, 1000000);
+  const text = cleanText(html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, " "));
+  const title = cleanText(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "");
+  const candidates = [...new Set(`${title} ${text} ${url}`.match(/\b[A-Z0-9]{2,8}[-–][A-Z0-9]{1,8}[-–][A-Z0-9]{2,8}\b/gi)?.map((item) => item.replace("–", "-")) || [])];
+  response.json({ url, title, candidates, partNumber: candidates.length === 1 ? candidates[0] : "", partNumbers: candidates, partSpecific: candidates.length > 0 });
 }));
 
 app.post("/api/local/enrichment/candidates/source-search-batch", asyncRoute(async (request, response) => {

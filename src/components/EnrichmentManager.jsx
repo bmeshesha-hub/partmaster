@@ -445,16 +445,30 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
     finally { setSearchingSources(false); }
   }
 
-  function applySearchResult(result) {
-    const selectedPartNumber = String(result.partNumber || result.part_number || "").trim();
+  async function applySearchResult(result) {
+    setSearchingSources(true); setReviewError("");
+    const candidates = [...new Set([...(result.partNumbers || []), result.partNumber, result.part_number, result.oemNumber].map((value) => String(value || "").trim()).filter(Boolean))];
+    let resolved = result;
+    try {
+      if (result.url && !candidates.length) resolved = await localDataApi.resolveCandidateSource(candidate.id, result.url);
+    } catch (requestError) {
+      setReviewError(requestError.message || "The source page could not be verified.");
+      setSearchingSources(false);
+      return;
+    }
+    const resolvedCandidates = [...new Set([...(resolved.partNumbers || []), resolved.partNumber, resolved.part_number, resolved.oemNumber].map((value) => String(value || "").trim()).filter(Boolean))];
+    const selectedPartNumber = resolvedCandidates.length === 1 ? resolvedCandidates[0] : "";
     setSelectedSourceResult(result);
     setValues((current) => ({
       ...current,
       ...(result.url ? { evidenceUrl: result.url } : {}),
       ...(selectedPartNumber ? { partNumber: selectedPartNumber } : {}),
-      ...(result.title ? { notes: `${current.notes ? `${current.notes}\n` : ""}Selected search result: ${result.title}` } : {}),
+      ...(result.title ? { notes: `${current.notes ? `${current.notes}\n` : ""}Selected source: ${result.title}${resolvedCandidates.length > 1 ? ` · OEM candidates: ${resolvedCandidates.join(", ")}` : selectedPartNumber ? ` · OEM: ${selectedPartNumber}` : " · no OEM number detected"}` } : {}),
     }));
-    setReviewError("");
+    // A result without an OEM is an informational outcome, not a save error.
+    // The required-field styling already tells the reviewer what remains.
+    setReviewError(resolvedCandidates.length > 1 ? "Multiple OEM numbers were found. Confirm the exact number manually before approval." : !selectedPartNumber ? "The page was checked, but no OEM number was found. Enter the exact OEM number manually." : "");
+    setSearchingSources(false);
   }
 
   async function fetchCompatibility() {
@@ -492,6 +506,8 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
   const extractedAttributes = candidateAttributes(candidate);
   const missingFields = candidateMissingFields(candidate);
   const actionPlan = candidateActionPlan(candidate);
+  const fieldNeedsAttention = (field) => missingFields.includes(field);
+  const fieldClass = (field) => fieldNeedsAttention(field) ? "border-red-400 bg-red-50/40 ring-2 ring-red-200 placeholder:text-red-300" : "border-slate-300 bg-white";
 
   return <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/55 p-4">
     <div className="max-h-[92vh] w-full max-w-6xl overflow-y-auto rounded-2xl bg-white shadow-2xl">
@@ -499,9 +515,9 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
         <div><h3 className="font-semibold">Review enrichment evidence</h3><p className="mt-1 text-xs text-slate-500">Source row {candidate.source_row_id} · Confidence {Math.round(Number(candidate.confidence || 0) * 100)}%</p><div className="mt-3 flex flex-wrap gap-2">{(candidate.vehicle_year || candidate.year) && <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-bold text-blue-700"><span className="mr-1 font-medium text-blue-500">Year</span>{candidate.vehicle_year || candidate.year}</span>}{(candidate.vehicle_make || candidate.manufacturer_raw) && <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700"><span className="mr-1 font-medium text-emerald-500">Make</span>{candidate.vehicle_make || candidate.manufacturer_raw}</span>}{(candidate.family_name || candidate.assembly) && <span className="rounded-full bg-violet-50 px-3 py-1 text-xs font-bold text-violet-700"><span className="mr-1 font-medium text-violet-500">Category</span>{candidate.family_name || candidate.assembly}</span>}</div></div>
         <button type="button" onClick={onClose} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"><X size={18} /></button>
       </header>
-      <section className={`mx-5 mt-5 rounded-2xl border-2 p-4 ${missingFields.length ? "border-amber-300 bg-amber-50" : "border-emerald-200 bg-emerald-50"}`}>
+      <section className={`mx-5 mt-5 rounded-2xl border-2 p-4 ${missingFields.length ? "border-red-300 bg-red-50" : "border-emerald-200 bg-emerald-50"}`}>
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div><p className={`text-xs font-black uppercase tracking-wide ${missingFields.length ? "text-amber-800" : "text-emerald-800"}`}>{missingFields.length ? "Missing information" : "Record completeness"}</p><div className="mt-2 flex flex-wrap gap-2">{missingFields.length ? missingFields.map((field) => <span key={field} className="rounded-full bg-white px-2.5 py-1 text-xs font-bold text-amber-900 ring-1 ring-amber-300">Missing {field}</span>) : <span className="rounded-full bg-white px-2.5 py-1 text-xs font-bold text-emerald-800 ring-1 ring-emerald-300">No obvious gaps</span>}</div><p className="mt-3 text-sm font-bold text-slate-900">Why this needs attention: <span className="font-normal">{attentionExplanation(candidate)}</span></p><p className="mt-2 text-sm font-bold text-slate-900">Action plan: <span className="font-normal">{actionPlan}</span></p></div>
+          <div><p className={`text-xs font-black uppercase tracking-wide ${missingFields.length ? "text-red-800" : "text-emerald-800"}`}>{missingFields.length ? "Missing information — highlighted below" : "Record completeness"}</p><div className="mt-2 flex flex-wrap gap-2">{missingFields.length ? missingFields.map((field) => <span key={field} className="rounded-full bg-red-100 px-2.5 py-1 text-xs font-bold text-red-900 ring-1 ring-red-300">Missing {field}</span>) : <span className="rounded-full bg-white px-2.5 py-1 text-xs font-bold text-emerald-800 ring-1 ring-emerald-300">No obvious gaps</span>}</div><p className="mt-3 text-sm font-bold text-slate-900">Why this needs attention: <span className="font-normal">{attentionExplanation(candidate)}</span></p><p className="mt-2 text-sm font-bold text-slate-900">Action plan: <span className="font-normal">{actionPlan}</span></p></div>
           {missingFields.includes("OEM number") && candidate.source_url && <button type="button" disabled={fetchingSource} onClick={fetchSource} className="inline-flex items-center gap-2 rounded-xl bg-cyan-700 px-3 py-2 text-xs font-bold text-white disabled:cursor-wait disabled:opacity-60">{fetchingSource ? <LoaderCircle className="animate-spin" size={15} /> : <Globe2 size={15} />}{fetchingSource ? "Fetching source page…" : "Fetch from source page"}</button>}
         </div>
         {candidate.source_url && <a href={candidate.source_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-brand-700">Open supplied source page <ExternalLink size={13} /></a>}
@@ -510,10 +526,10 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
       </section>
       {reviewError && <div className="mx-5 mt-5 flex items-start gap-3 rounded-2xl border-2 border-red-300 bg-red-50 p-4 text-red-900" role="alert"><AlertTriangle className="mt-0.5 shrink-0 text-red-600" size={22} /><div><p className="font-bold">Could not save this review</p><p className="mt-1 text-sm leading-5">{reviewError}</p><p className="mt-2 text-xs font-semibold text-red-700">Your edits are still here. Correct the issue and try again.</p></div></div>}
       <div className="grid gap-4 p-5 sm:grid-cols-2">
-        <label className="text-sm font-medium text-slate-700">OEM Part Number<input value={values.partNumber} onChange={(event) => setValues((current) => ({ ...current, partNumber: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-mono font-normal" /></label>
-        <label className="text-sm font-medium text-slate-700">Side<select value={values.side} onChange={(event) => setValues((current) => ({ ...current, side: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 font-normal">{["Unknown", "Not applicable", "Left", "Right", "Center", "Universal"].map((side) => <option key={side}>{side}</option>)}</select><ControlHint>{sideApplies(candidate) ? "Side is relevant for this vehicle/part." : "Motorcycle parts commonly have no left/right side; do not invent one."}</ControlHint></label>
-        <label className="text-sm font-medium text-slate-700 sm:col-span-2">Description<input value={values.description} onChange={(event) => setValues((current) => ({ ...current, description: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
-        <label className="text-sm font-medium text-slate-700">Position<input value={values.position} onChange={(event) => setValues((current) => ({ ...current, position: event.target.value }))} placeholder="Position 1, Front Upper…" className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
+        <label className={`text-sm font-medium ${fieldNeedsAttention("OEM number") ? "text-red-800" : "text-slate-700"}`}>OEM Part Number{fieldNeedsAttention("OEM number") && <span className="ml-2 text-xs font-black uppercase text-red-600">Required before approval</span>}<input value={values.partNumber} onChange={(event) => { setReviewError(""); setValues((current) => ({ ...current, partNumber: event.target.value })); }} className={`mt-1.5 w-full rounded-xl border px-3 py-2.5 font-mono font-normal ${fieldClass("OEM number")}`} /></label>
+        <label className={`text-sm font-medium ${fieldNeedsAttention("Side") ? "text-red-800" : "text-slate-700"}`}>Side{fieldNeedsAttention("Side") && <span className="ml-2 text-xs font-black uppercase text-red-600">Needs confirmation</span>}<select value={values.side} onChange={(event) => setValues((current) => ({ ...current, side: event.target.value }))} className={`mt-1.5 w-full rounded-xl border px-3 py-2.5 font-normal ${fieldClass("Side")}`}>{["Unknown", "Not applicable", "Left", "Right", "Center", "Universal"].map((side) => <option key={side}>{side}</option>)}</select><ControlHint>{sideApplies(candidate) ? "Side is relevant for this vehicle/part." : "Motorcycle parts commonly have no left/right side; do not invent one."}</ControlHint></label>
+        <label className={`text-sm font-medium sm:col-span-2 ${fieldNeedsAttention("Description") ? "text-red-800" : "text-slate-700"}`}>Description{fieldNeedsAttention("Description") && <span className="ml-2 text-xs font-black uppercase text-red-600">Needs input</span>}<input value={values.description} onChange={(event) => setValues((current) => ({ ...current, description: event.target.value }))} className={`mt-1.5 w-full rounded-xl border px-3 py-2.5 font-normal ${fieldClass("Description")}`} /></label>
+        <label className={`text-sm font-medium ${fieldNeedsAttention("Position") ? "text-red-800" : "text-slate-700"}`}>Position{fieldNeedsAttention("Position") && <span className="ml-2 text-xs font-black uppercase text-red-600">Needs confirmation</span>}<input value={values.position} onChange={(event) => setValues((current) => ({ ...current, position: event.target.value }))} placeholder="Position 1, Front Upper…" className={`mt-1.5 w-full rounded-xl border px-3 py-2.5 font-normal ${fieldClass("Position")}`} /></label>
         <label className="text-sm font-medium text-slate-700">Location notes<input value={values.locationNotes} onChange={(event) => setValues((current) => ({ ...current, locationNotes: event.target.value }))} className="mt-1.5 w-full rounded-xl border border-slate-300 px-3 py-2.5 font-normal" /></label>
         {(candidate.epid || candidate.vehicle_mapping_method) && <section className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 sm:col-span-2"><div className="flex flex-wrap items-start justify-between gap-3"><div><h4 className="font-bold text-emerald-950">Vehicle identity mapping</h4><p className="mt-1 text-sm text-emerald-800">{[candidate.vehicle_year || candidate.year, candidate.vehicle_make || candidate.manufacturer_raw, candidate.vehicle_model || candidate.model, candidate.vehicle_trim, candidate.vehicle_motorcycle_type || candidate.vehicle_type].filter(Boolean).join(" · ")}</p><p className="mt-1 text-xs text-emerald-700">ePID {candidate.epid} · {(candidate.vehicle_mapping_method || "source").replaceAll("_", " ")}</p></div>{candidate.vehicle_mapping_confidence != null && <span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-emerald-700">{Math.round(Number(candidate.vehicle_mapping_confidence) * 100)}% mapping confidence</span>}</div></section>}
         <section className="rounded-2xl border border-violet-200 bg-violet-50/60 p-4 sm:col-span-2">
