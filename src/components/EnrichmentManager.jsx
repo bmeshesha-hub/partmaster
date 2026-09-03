@@ -388,6 +388,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
   const [searchingSources, setSearchingSources] = useState(false);
   const [sourceResults, setSourceResults] = useState([]);
   const [detectedOemNumbers, setDetectedOemNumbers] = useState([]);
+  const [fieldSuggestions, setFieldSuggestions] = useState({});
   const [selectedSourceResult, setSelectedSourceResult] = useState(null);
   const [reviewError, setReviewError] = useState("");
   const [comparison, setComparison] = useState({ familyName: "", variants: [], compatibility: [], compatibilitySourceUrl: "" });
@@ -446,6 +447,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
       const results = result.results || [];
       setSourceResults(results);
       setDetectedOemNumbers([...new Set(results.flatMap((item) => Array.isArray(item.partNumbers) ? item.partNumbers : [item.partNumber]).map((value) => String(value || "").trim()).filter(Boolean))]);
+      setFieldSuggestions(results.reduce((fields, item) => { Object.entries(item.fields || {}).forEach(([field, value]) => { if (value) fields[field] = [...new Set([...(fields[field] || []), value])]; }); return fields; }, {}));
     }
     catch (requestError) { setReviewError(requestError.message || "Web search failed."); }
     finally { setSearchingSources(false); }
@@ -471,6 +473,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
     }
     const resolvedCandidates = [...new Set([...(resolved.partNumbers || []), resolved.partNumber, resolved.part_number, resolved.oemNumber].map((value) => String(value || "").trim()).filter(Boolean))];
     setDetectedOemNumbers((current) => [...new Set([...current, ...resolvedCandidates])]);
+    setFieldSuggestions((current) => Object.entries(resolved.fields || {}).reduce((fields, [field, value]) => ({ ...fields, [field]: [...new Set([...(fields[field] || []), value])] }), current));
     const selectedPartNumber = resolvedCandidates.length === 1 ? resolvedCandidates[0] : "";
     setSelectedSourceResult(result);
     setValues((current) => ({
@@ -544,6 +547,7 @@ export function ReviewModal({ candidate, onClose, onDecision, onFetchSource }) {
       </section>
       {reviewError && <div className="mx-5 mt-5 flex items-start gap-3 rounded-2xl border-2 border-red-300 bg-red-50 p-4 text-red-900" role="alert"><AlertTriangle className="mt-0.5 shrink-0 text-red-600" size={22} /><div><p className="font-bold">Could not save this review</p><p className="mt-1 text-sm leading-5">{reviewError}</p><p className="mt-2 text-xs font-semibold text-red-700">Your edits are still here. Correct the issue and try again.</p></div></div>}
       {detectedOemNumbers.length > 0 && <div className="mx-5 mt-3 rounded-xl border border-blue-200 bg-blue-50 p-3"><p className="text-xs font-black uppercase tracking-wide text-blue-900">OEM numbers found — select the exact match</p><div className="mt-2 flex flex-wrap gap-2">{detectedOemNumbers.map((partNumber) => <button key={partNumber} type="button" onClick={() => { setValues((current) => ({ ...current, partNumber })); setReviewError(""); }} className={`rounded-lg border px-3 py-2 font-mono text-xs font-bold ${values.partNumber === partNumber ? "border-emerald-500 bg-emerald-600 text-white" : "border-blue-300 bg-white text-blue-800 hover:bg-emerald-50"}`}>{partNumber}{values.partNumber === partNumber ? " ✓" : ""}</button>)}</div><p className="mt-2 text-xs text-blue-800">Selecting a number fills the OEM Part Number field below.</p></div>}
+      {Object.keys(fieldSuggestions).some((field) => fieldSuggestions[field]?.length) && <div className="mx-5 mt-3 rounded-xl border border-violet-200 bg-violet-50 p-3"><p className="text-xs font-black uppercase tracking-wide text-violet-900">Suggested missing-field values — select to autofill</p><div className="mt-2 grid gap-2 sm:grid-cols-2">{Object.entries(fieldSuggestions).map(([field, options]) => <div key={field}><p className="text-[11px] font-bold uppercase text-violet-700">{field === "familyName" ? "Part family" : field}</p><div className="mt-1 flex flex-wrap gap-1">{options.map((value) => <button key={`${field}-${value}`} type="button" onClick={() => { setValues((current) => ({ ...current, [field]: value })); setReviewError(""); }} className="rounded-md border border-violet-200 bg-white px-2 py-1 text-xs font-semibold text-violet-900 hover:bg-violet-100">{value}</button>)}</div></div>)}</div></div>}
       <div className="grid gap-4 p-5 sm:grid-cols-2">
         <label className={`text-sm font-medium ${fieldNeedsAttention("OEM number") ? "text-red-800" : "text-slate-700"}`}>OEM Part Number{fieldNeedsAttention("OEM number") && <span className="ml-2 text-xs font-black uppercase text-red-600">Required before approval</span>}<input value={values.partNumber} onChange={(event) => { setReviewError(""); setValues((current) => ({ ...current, partNumber: event.target.value })); }} className={`mt-1.5 w-full rounded-xl border px-3 py-2.5 font-mono font-normal ${fieldClass("OEM number")}`} /></label>
         <label className={`text-sm font-medium ${fieldNeedsAttention("Side") ? "text-red-800" : "text-slate-700"}`}>Side{fieldNeedsAttention("Side") && <span className="ml-2 text-xs font-black uppercase text-red-600">Needs confirmation</span>}<select value={values.side} onChange={(event) => setValues((current) => ({ ...current, side: event.target.value }))} className={`mt-1.5 w-full rounded-xl border px-3 py-2.5 font-normal ${fieldClass("Side")}`}>{["Unknown", "Not applicable", "Left", "Right", "Center", "Universal"].map((side) => <option key={side}>{side}</option>)}</select><ControlHint>{sideApplies(candidate) ? "Side is relevant for this vehicle/part." : "Motorcycle parts commonly have no left/right side; do not invent one."}</ControlHint></label>
