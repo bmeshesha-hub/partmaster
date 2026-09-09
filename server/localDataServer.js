@@ -926,14 +926,6 @@ function vehicleModelVariants(value) {
   return [...new Set(variants.filter(Boolean))];
 }
 
-function vehicleModelCodeStem(value) {
-  const raw = String(value || "").trim();
-  const code = raw.match(/\(([^)]+)\)/)?.[1]
-    || raw.match(/\b([A-Z]{2,}\d+[A-Z0-9]*)$/i)?.[1]
-    || "";
-  return normalizeApplicationValue(code).match(/^[A-Z]+\d+/)?.[0] || "";
-}
-
 function vehicleModelLookupVariants(value, assembly = "") {
   const raw = String(value || "").trim();
   const variants = new Set(vehicleModelVariants(raw));

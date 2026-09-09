@@ -39,13 +39,6 @@ function statusClass(status) {
   if (status === "not_found") return "border-orange-200 bg-orange-50 text-orange-700";
   return "border-amber-200 bg-amber-50 text-amber-700";
 }
-function attentionExplanation(candidate) {
-  const reason = String(candidate.decision || candidate.decision_notes || "").trim();
-  if (reason) return reason;
-  if (!candidate.side || String(candidate.side).toLowerCase() === "unknown") return "Side is unknown; this is missing information, not necessarily a conflict.";
-  return candidate.status === "conflict" ? "Sources or existing variant data disagree and need comparison." : "Human evidence review is required.";
-}
-
 function proposedManufacturer(candidate) {
   return String(candidate.vehicle_make || candidate.manufacturer_norm || candidate.manufacturer_raw || "").trim();
 }
