@@ -1,3 +1,4 @@
+import { catalogExportQuery, catalogFilters, catalogPart, catalogQuery } from "./masterCatalog.js";
 import { DuckDBInstance } from "@duckdb/node-api";
 import express from "express";
 import { randomUUID } from "node:crypto";
@@ -5399,101 +5400,26 @@ app.get("/api/local/master-catalog/filters", asyncRoute(async (_request, respons
 }));
 
 app.get("/api/local/master-catalog", asyncRoute(async (request, response) => {
-  const page = Math.max(1, Number(request.query.page) || 1);
-  const pageSize = Math.max(10, Math.min(200, Number(request.query.pageSize) || 50));
-  const conditions = [];
-  const values = {};
-  const query = String(request.query.q || "").trim().toLowerCase();
-  if (query) {
-    conditions.push("lower(concat_ws(' ', manufacturer, part_number, description, family_name, side, position, extracted_attributes_json)) LIKE $query");
-    values.query = `%${query}%`;
-  }
-  if (request.query.manufacturer) { conditions.push("manufacturer_norm = $manufacturer"); values.manufacturer = normalizePartNumber(normalizeManufacturer(request.query.manufacturer)); }
-  if (request.query.family) { conditions.push("coalesce(family_name, 'Unclassified') = $family"); values.family = String(request.query.family); }
-  if (request.query.onlineStatus) { conditions.push("online_status = $onlineStatus"); values.onlineStatus = String(request.query.onlineStatus); }
-  if (request.query.factStatus === "with_facts") conditions.push("extracted_attribute_count > 0");
-  if (request.query.factStatus === "missing_facts") conditions.push("extracted_attribute_count = 0");
-  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const sortColumns = {
-    occurrences: "occurrence_count", manufacturer: "manufacturer_norm", part_number: "part_number_norm",
-    family: "family_name", facts: "extracted_attribute_count", confidence: "confidence", updated: "updated_at",
-  };
-  const sort = sortColumns[request.query.sort] || "occurrence_count";
-  const direction = String(request.query.direction).toLowerCase() === "asc" ? "ASC" : "DESC";
+  const page = Math.max(1, Math.floor(Number(request.query.page) || 1));
+  const pageSize = Math.max(10, Math.min(200, Math.floor(Number(request.query.pageSize) || 50)));
+  const { where, values } = catalogFilters(request.query);
   const result = await withConnection(async (connection) => {
-    const countReader = await connection.runAndReadAll(`SELECT count(*) AS count FROM partmaster_offline_parts ${where}`, values);
+    const countReader = await connection.runAndReadAll(`SELECT count(*) AS count FROM partmaster_offline_parts parts ${where}`, values);
     const total = Number(countReader.getRowObjectsJson()[0].count);
-    const rowsReader = await connection.runAndReadAll(
-      `SELECT parts.part_key, CASE parts.manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
-        WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM' WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha'
-        WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE parts.manufacturer END AS manufacturer,
-       parts.part_number, parts.description, parts.family_name, parts.component_scope, parts.side, parts.position,
-       parts.extracted_attributes_json, parts.extracted_attribute_count, parts.occurrence_count, parts.dataset_count, parts.application_count,
-       parts.source_page_count, parts.best_source_url, parts.confidence, parts.attribute_status, parts.online_status, parts.updated_at,
-       applications.vehicle_summary, applications.epid_summary, applications.assembly_summary, applications.mapping_confidence,
-       coalesce(flags.review_flag_count, 0) AS review_flag_count, coalesce(flags.review_flags, '') AS review_flags
-       FROM partmaster_offline_parts parts
-       LEFT JOIN (
-         SELECT part_key, count(*) AS review_flag_count, string_agg(flag_code, ', ' ORDER BY flag_code) AS review_flags
-         FROM partmaster_master_review_flags WHERE status = 'open' GROUP BY part_key
-       ) flags ON flags.part_key = parts.part_key
-       LEFT JOIN LATERAL (
-         SELECT string_agg(DISTINCT concat_ws(' · ', applications.year, applications.vehicle_make, applications.vehicle_model, applications.vehicle_type, applications.vehicle_motorcycle_type), ' | ') AS vehicle_summary,
-                string_agg(DISTINCT applications.epid, ', ') FILTER (WHERE applications.epid IS NOT NULL AND trim(applications.epid) != '') AS epid_summary,
-                string_agg(DISTINCT applications.assembly, ' | ') FILTER (WHERE applications.assembly IS NOT NULL AND trim(applications.assembly) != '') AS assembly_summary,
-                min(applications.vehicle_mapping_confidence) AS mapping_confidence
-         FROM partmaster_canonical_parts canonical
-         JOIN partmaster_part_applications applications ON applications.part_id = canonical.id
-         WHERE canonical.manufacturer_norm = parts.manufacturer_norm AND canonical.part_number_norm = parts.part_number_norm
-       ) applications ON true ${where}
-       ORDER BY parts.${sort} ${direction} NULLS LAST, parts.manufacturer_norm, parts.part_number_norm
-       LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`, values,
-    );
-    return { rows: rowsReader.getRowObjectsJson(), total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)) };
+    const rowsReader = await connection.runAndReadAll(catalogQuery(request.query, `LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`), values);
+    return { rows: rowsReader.getRowObjectsJson().map((row) => catalogPart(row, request.query.view === "audit")), total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)) };
   });
   response.json(result);
 }));
 
 app.post("/api/local/master-catalog/export", asyncRoute(async (request, response) => {
   const filters = request.body || {};
-  const conditions = ["coalesce(record_type, 'product') = 'product'"]; const values = {};
-  const query = String(filters.q || "").trim().toLowerCase();
-  if (query) { conditions.push("lower(concat_ws(' ', manufacturer, part_number, description, family_name, side, position, extracted_attributes_json)) LIKE $query"); values.query = `%${query}%`; }
-  if (filters.manufacturer) { conditions.push("manufacturer_norm = $manufacturer"); values.manufacturer = normalizePartNumber(normalizeManufacturer(filters.manufacturer)); }
-  if (filters.family) { conditions.push("coalesce(family_name, 'Unclassified') = $family"); values.family = String(filters.family); }
-  if (filters.onlineStatus) { conditions.push("online_status = $onlineStatus"); values.onlineStatus = String(filters.onlineStatus); }
-  if (filters.factStatus === "with_facts") conditions.push("extracted_attribute_count > 0");
-  if (filters.factStatus === "missing_facts") conditions.push("extracted_attribute_count = 0");
-  if (filters.descriptionStatus === "missing") conditions.push("nullif(trim(description), '') IS NULL");
-  if (filters.descriptionStatus === "present") conditions.push("nullif(trim(description), '') IS NOT NULL");
-  if (Number.isFinite(Number(filters.minConfidence))) { conditions.push("confidence >= $minConfidence"); values.minConfidence = Number(filters.minConfidence); }
-  if (Number.isFinite(Number(filters.maxConfidence))) { conditions.push("confidence <= $maxConfidence"); values.maxConfidence = Number(filters.maxConfidence); }
-  if (Number.isFinite(Number(filters.minOccurrences))) { conditions.push("occurrence_count >= $minOccurrences"); values.minOccurrences = Number(filters.minOccurrences); }
-  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const hasFilters = Object.entries(filters).some(([key, value]) => !["sort", "direction", "page", "pageSize"].includes(key) && value !== "" && value != null);
-  const stamp = Date.now(); const filename = `master-catalog-${hasFilters ? "filtered" : "all"}-${stamp}.csv`; const path = join(EXPORT_ROOT, filename);
-  await withConnection((connection) => connection.run(
-    `COPY (SELECT CASE parts.manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
-       WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM' WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha'
-       WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE parts.manufacturer END AS "Manufacturer",
-       parts.part_number AS "OEM Part Number", parts.description AS "Description", parts.family_name AS "Part Family",
-       CASE WHEN coalesce(parts.family_name, 'General Part') = 'General Part' THEN 'needs_classification' ELSE 'classified' END AS "Classification Status",
-       parts.component_scope AS "Component Scope", parts.side AS "Side", parts.position AS "Position",
-       parts.occurrence_count AS "Occurrences", parts.dataset_count AS "Datasets", parts.application_count AS "Applications",
-       parts.source_page_count AS "Source Pages", parts.extracted_attribute_count AS "Extracted Facts", parts.confidence AS "Confidence",
-       parts.attribute_status AS "Attribute Status", parts.online_status AS "Online Evidence Status", parts.best_source_url AS "Best Source URL",
-       coalesce(flags.review_flag_count, 0) AS "Review Flag Count", coalesce(flags.review_flags, '') AS "Review Flags",
-       CASE WHEN coalesce(flags.review_flag_count, 0) > 0 THEN 'needs_review' ELSE 'accepted' END AS "Identity Review Status",
-       parts.manufacturer_norm AS "Normalized Manufacturer", parts.part_number_norm AS "Normalized OEM Number", parts.part_key AS "Global Part Key"
-       FROM partmaster_offline_parts parts
-       LEFT JOIN (
-         SELECT part_key, count(*) AS review_flag_count, string_agg(flag_code, ', ' ORDER BY flag_code) AS review_flags
-         FROM partmaster_master_review_flags WHERE status = 'open' GROUP BY part_key
-       ) flags ON flags.part_key = parts.part_key ${where}
-       ORDER BY parts.manufacturer_norm, parts.part_number_norm) TO ${quoteString(path)} (FORMAT CSV, HEADER true)`, values,
-  ));
+  const { where, values } = catalogFilters(filters);
+  const hasFilters = Object.entries(filters).some(([key, value]) => !["view", "sort", "direction", "page", "pageSize"].includes(key) && value !== "" && value != null);
+  const filename = `master-catalog-${filters.view === "audit" ? "audit-" : ""}${hasFilters ? "filtered" : "all"}-${Date.now()}.csv`;
   const count = await withConnection(async (connection) => {
-    const reader = await connection.runAndReadAll(`SELECT count(*) AS count FROM partmaster_offline_parts ${where}`, values);
+    await connection.run(`COPY (${catalogExportQuery(filters, filters.view === "audit")}) TO ${quoteString(join(EXPORT_ROOT, filename))} (FORMAT CSV, HEADER true)`, values);
+    const reader = await connection.runAndReadAll(`SELECT count(*) AS count FROM partmaster_offline_parts parts ${where}`, values);
     return Number(reader.getRowObjectsJson()[0].count);
   });
   response.json({ exports: [{ filename, downloadUrl: `/api/local/exports/${encodeURIComponent(filename)}`, filters }], count });
@@ -6856,29 +6782,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const autopilotJobsPath = join(EXPORT_ROOT, autopilotJobsFilename);
     const autopilotItemsPath = join(EXPORT_ROOT, autopilotItemsFilename);
     await connection.run(
-      `COPY (SELECT CASE parts.manufacturer_norm WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson'
-       WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM' WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha'
-       WHEN 'SUZUKI' THEN 'Suzuki' WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE parts.manufacturer END AS "Manufacturer",
-       parts.part_number AS "OEM Part Number", parts.description AS "Description", parts.family_name AS "Part Family",
-       CASE WHEN coalesce(parts.family_name, 'General Part') = 'General Part' THEN 'needs_classification' ELSE 'classified' END AS "Classification Status",
-       parts.component_scope AS "Component Scope", parts.side AS "Side", parts.position AS "Position",
-       parts.extracted_attributes_json AS "Extracted Attributes JSON", parts.extracted_attribute_count AS "Extracted Facts",
-       parts.occurrence_count AS "Raw Occurrences", parts.dataset_count AS "Source Datasets",
-       parts.application_count AS "Applications", parts.source_page_count AS "Source Pages",
-       parts.best_source_url AS "Best Source URL", parts.confidence AS "Confidence", parts.attribute_status AS "Attribute Status",
-       parts.online_status AS "Online Evidence Status", parts.updated_at AS "Updated At",
-       coalesce(flags.review_flag_count, 0) AS "Review Flag Count", coalesce(flags.review_flags, '') AS "Review Flags",
-       CASE WHEN coalesce(flags.review_flag_count, 0) > 0 THEN 'needs_review' ELSE 'accepted' END AS "Identity Review Status",
-       parts.manufacturer_norm AS "Normalized Manufacturer", parts.part_number_norm AS "Normalized OEM Number",
-       parts.part_key AS "Global Part Key"
-       FROM partmaster_offline_parts parts
-       LEFT JOIN (
-         SELECT part_key, count(*) AS review_flag_count, string_agg(flag_code, ', ' ORDER BY flag_code) AS review_flags
-         FROM partmaster_master_review_flags WHERE status = 'open' GROUP BY part_key
-       ) flags ON flags.part_key = parts.part_key
-       WHERE coalesce(parts.record_type, 'product') = 'product'
-       ORDER BY parts.manufacturer_norm, parts.part_number_norm)
-       TO ${quoteString(catalogPath)} (FORMAT CSV, HEADER true)`,
+      `COPY (${catalogExportQuery()}) TO ${quoteString(catalogPath)} (FORMAT CSV, HEADER true)`,
     );
     await connection.run(
       `COPY (SELECT parts.manufacturer AS "Manufacturer", families.family_name AS "Part Family",

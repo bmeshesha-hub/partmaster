@@ -47,6 +47,50 @@ canceled, and discontinued descriptions do not remove a valid part identity.
 Future full source rebuilds apply the same identity validation before creating
 master identities.
 
+## Shared parts catalog
+
+Master Data serves Partout Pro and other applications with reusable part
+definitions. The **Parts catalog** view prioritizes identity, category, recorded
+vehicle fitment, side/position, and specifications. Expand a part to inspect all
+attributes, alternate numbers, directional replacement/interchange relationships,
+and installation details. Search includes recorded vehicle models, confirmed
+alternate numbers, and variant attributes.
+
+The **Export for apps** download and **Export matching parts** use the same
+catalog projection and eligibility rules. Rejected identities and non-product
+records are excluded. Missing specifications do not exclude an otherwise usable
+part. Price, condition, and stock for a particular item belong in seller listings.
+
+- `GET /api/local/master-catalog` returns a page of product records with
+  `attributes`, `fitments`, `additional_fitments`, `alternate_numbers`,
+  `relationships`, and `unresolved_details` arrays. Each attribute has a `name`
+  and `values` array; multiple distinct values require confirmation. Missing
+  scalar fields are `null`, and missing collections are empty arrays.
+- `POST /api/local/master-catalog/export` accepts the same search/filter fields
+  and exports **all** matching parts, regardless of the current page. CSV columns
+  ending in `JSON` contain those structured collections. Parse these columns as
+  JSON instead of splitting them on commas or combining independent year/model
+  lists. Fitment rows retain their trim, ePID, assembly, quantity, location notes,
+  and required/excluded options together. Additional catalog fitments retain
+  their recorded year, model, model code, and assembly without inventing options.
+- The default sort is OEM number ascending. Filters include `q`, `manufacturer`,
+  `family`, `fitmentStatus` (`present`/`missing`), `factStatus`
+  (`with_facts`/`missing_facts`), and `descriptionStatus` (`present`/`missing`).
+  `page` and `pageSize` control API pagination.
+- Add `view=audit` to the GET query, or `"view": "audit"` to the export body,
+  to include internal provenance and quality fields. The UI exposes these in
+  **Data quality**. Existing callers that used top-level collection counts or
+  processing scores should read the GET response's `audit` object instead.
+  The legacy FPA download retains its existing schema for current integrations.
+
+Recorded fitment and a mapped vehicle reference are not guarantees of universal
+compatibility. Consumers must retain restrictions, unresolved details, and
+relationship conditions. A missing option or specification is unknown; it must
+not be treated as a confirmed absence. No new part facts are invented by the UI.
+
+Run `node --test server/masterCatalog.test.mjs` for catalog query and CSV
+round-trip checks, plus `npm run lint` and `npm run build` for application checks.
+
 Everything inside `local_data/` except the small directory instructions and
 placeholder files is ignored by Git. The GitHub Pages build includes the UI,
 but the local-data screen can only connect when the Mac service is running.
