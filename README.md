@@ -95,6 +95,46 @@ Everything inside `local_data/` except the small directory instructions and
 placeholder files is ignored by Git. The GitHub Pages build includes the UI,
 but the local-data screen can only connect when the Mac service is running.
 
+### Publishing the finished master catalog
+
+After enrichment has finished, stop the local worker cleanly so DuckDB
+checkpoints its WAL, then run:
+
+```bash
+npm run publish:master
+git add public/data/master-catalog.json
+git commit -m "Publish enriched master catalog"
+git push
+```
+
+The command writes a read-only catalog snapshot for GitHub Pages. Raw CSVs,
+DuckDB, source-page cache, jobs, and evidence-review internals remain in
+`local_data/` and are never uploaded. Pages supports catalog search, filters,
+paging, fitments, specifications, aliases, and relationships; enrichment,
+revalidation, and CSV exports remain local-only.
+
+### Google Drive snapshots
+
+Google Drive can be used as the shared archive for approved exports without
+becoming a dependency of the app. Copy `.env.example` to `.env` and set
+`PARTMASTER_DRIVE_MASTERDATA_DIR` to the local Google Drive `Masterdata/exports`
+folder. `npm run publish:master` will then write both:
+
+- `master-catalog-<timestamp>.json`, an immutable dated snapshot; and
+- `master-catalog-latest.json`, the current approved snapshot.
+
+The app and GitHub Pages continue to read `public/data/master-catalog.json`, so
+Drive sync outages or an incomplete upload cannot break catalog browsing. If
+desired, set `VITE_GOOGLE_DRIVE_MASTERDATA_URL` to the Drive share link for the
+latest approved export; the Master Data export screen will show a link to it.
+Share only the exported snapshot, never the working database or raw-data
+folder. Keep `local_data/partmaster.duckdb` on local disk. For GitHub Pages,
+the publisher also creates `public/data/master-catalog-index.json` and smaller
+files under `public/data/master-catalog-chunks/`; commit those files with the
+app so the portal can serve the large catalog without exceeding GitHub's
+single-file limit. The app transparently loads the chunks and retains the
+search, filters, expandable details, fitments, and specifications.
+
 ## Local enrichment worker
 
 The **Enrichment** workspace creates persistent, resumable jobs in DuckDB. A

@@ -7,6 +7,9 @@ const numericFilter = (value) => value !== "" && value != null && Number.isFinit
 
 export function catalogFilters(filters = {}) {
   const conditions = ["coalesce(parts.record_type, 'product') = 'product'",
+    "length(parts.part_number_norm) BETWEEN 3 AND 50",
+    "regexp_matches(parts.part_number_norm, '[0-9]')",
+    "NOT regexp_matches(parts.part_number_norm, '^(0+|NA|NONE|NULL|UNKNOWN|UNAVAILABLE|NOTAVAILABLE|TBD|MISSING|X+)$')",
     `NOT EXISTS (SELECT 1 FROM partmaster_canonical_parts rejected WHERE ${identityMatch("rejected")} AND rejected.verification_status = 'rejected')`];
   const values = {};
   const q = String(filters.q || "").trim().toLowerCase();

@@ -17,3 +17,7 @@ local_data/inbox/*
 !local_data/exports/
 local_data/exports/*
 !local_data/exports/.gitkeep
+
+# The compatibility master snapshot can exceed GitHub's single-file limit.
+# Commit the generated index and chunk directory instead.
+public/data/master-catalog.json

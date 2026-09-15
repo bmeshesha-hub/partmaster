@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "dev:local": "concurrently -n DATA,WEB -c magenta,cyan \"npm:local:data\" \"node scripts/wait-for-local-data.mjs && npm run dev\"",
+    "dev:local": "concurrently --kill-others-on-fail=false -n DATA,WEB -c magenta,cyan \"npm:local:data\" \"npm run dev\"",
     "local:data": "node scripts/start-local-data.mjs",
     "vehicle:mapping:extract": "python3 scripts/extract_vehicle_mapping.py",
     "build": "vite build",
+    "publish:master": "node scripts/publish-master-data.mjs",
+    "split:master-snapshot": "node scripts/split-master-snapshot.mjs",
     "preview": "vite preview",
     "lint": "eslint ."
   },

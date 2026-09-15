@@ -5,9 +5,30 @@ import { localDataApi } from "../utils/localDataApi.js";
 
 const INITIAL_QUERY = { q: "", manufacturer: "", family: "", onlineStatus: "", factStatus: "", fitmentStatus: "", descriptionStatus: "", minConfidence: "", maxConfidence: "", minOccurrences: "", sort: "part_number", direction: "asc", page: 1, pageSize: 50 };
 const LOCAL_URL = "http://127.0.0.1:5173/partmaster/";
+const GOOGLE_DRIVE_MASTERDATA_URL = import.meta.env.VITE_GOOGLE_DRIVE_MASTERDATA_URL || "";
+const SNAPSHOT_BASE = `${import.meta.env.BASE_URL}data/`;
+
+async function loadPublishedCatalog() {
+  const indexResponse = await fetch(`${SNAPSHOT_BASE}master-catalog-index.json`);
+  if (indexResponse.ok) {
+    const index = await indexResponse.json();
+    const chunkResponses = await Promise.all((index.chunks || []).map((chunk) => fetch(`${SNAPSHOT_BASE.replace(/data\/$/, "")}${chunk}`)));
+    if (chunkResponses.every((response) => response.ok)) {
+      const chunks = await Promise.all(chunkResponses.map((response) => response.json()));
+      return { ...index, rows: chunks.flatMap((chunk) => chunk.rows || []) };
+    }
+  }
+  const legacyResponse = await fetch(`${SNAPSHOT_BASE}master-catalog.json`);
+  return legacyResponse.ok ? legacyResponse.json() : null;
+}
 
 function number(value) { return Number(value || 0).toLocaleString(); }
 function percent(value, total) { return Number(total) ? `${Math.round((Number(value || 0) / Number(total)) * 100)}%` : "0%"; }
+function validPartNumber(value) {
+  const normalized = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return normalized.length >= 3 && normalized.length <= 50 && /[0-9]/.test(normalized)
+    && !/^(0+|NA|NONE|NULL|UNKNOWN|UNAVAILABLE|NOTAVAILABLE|TBD|MISSING|X+)$/.test(normalized);
+}
 function MetricCard({ label, value, detail, tone = "text-slate-950", onClick }) {
   const content = <><p className="text-[11px] font-black uppercase tracking-wide text-slate-500">{label}</p><p className={`mt-2 text-2xl font-black ${tone}`}>{number(value)}</p><p className="mt-1 text-xs leading-5 text-slate-500">{detail}</p>{onClick && <p className="mt-3 text-[11px] font-black text-brand-700">Click for quick view →</p>}</>;
   return onClick ? <button type="button" onClick={onClick} className="rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-brand-300 hover:shadow-md">{content}</button> : <article className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">{content}</article>;
@@ -22,6 +43,7 @@ export default function MasterDataPage() {
   const [metrics, setMetrics] = useState(null);
   const [metricSource, setMetricSource] = useState("snapshot");
   const [connected, setConnected] = useState(null);
+  const [localServiceAvailable, setLocalServiceAvailable] = useState(null);
   const [filters, setFilters] = useState({ manufacturers: [], families: [] });
   const [query, setQuery] = useState(INITIAL_QUERY);
   const [catalog, setCatalog] = useState({ rows: [], total: 0, page: 1, pages: 1, pageSize: 50 });
@@ -37,16 +59,29 @@ export default function MasterDataPage() {
   const [fitmentRecoveryStarting, setFitmentRecoveryStarting] = useState(false);
   const requestSerial = useRef(0);
   const [tableDensity, setTableDensity] = useState("standard");
+  const [publishedCatalog, setPublishedCatalog] = useState(null);
+  const publicMode = !["127.0.0.1", "localhost", "::1"].includes(window.location.hostname);
 
   useEffect(() => {
-    fetch(`${import.meta.env.BASE_URL}data/master-metrics.json`).then((response) => response.json()).then(setMetrics).catch(() => null);
+    Promise.all([
+      fetch(`${import.meta.env.BASE_URL}data/master-metrics.json`).then((response) => response.ok ? response.json() : null),
+      loadPublishedCatalog(),
+    ]).then(([snapshot, catalogSnapshot]) => {
+      if (snapshot) setMetrics(snapshot);
+      if (catalogSnapshot?.rows) {
+        setPublishedCatalog(catalogSnapshot);
+        setFilters(catalogSnapshot.filters || { manufacturers: [], families: [] });
+        setMetrics((current) => ({ ...(current || {}), summary: { ...(current?.summary || {}), ...(catalogSnapshot.summary || {}) } }));
+      }
+    }).catch(() => null);
     const localHostname = ["127.0.0.1", "localhost", "::1"].includes(window.location.hostname);
     if (!localHostname) {
-      setConnected(false);
+      setConnected(true);
       return;
     }
     Promise.all([localDataApi.masterDashboard(), localDataApi.masterCatalogFilters(), localDataApi.pipelineSources()])
       .then(([dashboard, availableFilters, sourceAudit]) => {
+        setLocalServiceAvailable(true);
         const coverage = sourceAudit.summary || {};
         const liveDashboard = {
           ...dashboard,
@@ -69,17 +104,38 @@ export default function MasterDataPage() {
         };
         setMetrics(liveDashboard); setMetricSource("live"); setFilters(availableFilters); setConnected(true);
       })
-      .catch(() => setConnected(false));
+      .catch(() => {
+        setLocalServiceAvailable(false);
+        // The published snapshot remains browseable when the optional local
+        // DuckDB service is unavailable. Editing/enrichment still requires it.
+        setMetricSource("snapshot");
+        setConnected(true);
+      });
   }, []);
 
   const loadCatalog = useCallback(async (parameters) => {
     if (!connected) return;
+    if ((publicMode || localServiceAvailable === false) && !publishedCatalog) return;
     const serial = ++requestSerial.current;
     setTableLoading(true); setTableError("");
-    try { const result = await localDataApi.masterCatalog(parameters); if (serial === requestSerial.current) setCatalog(result); }
+    try {
+      let result;
+      if (publishedCatalog && (publicMode || localServiceAvailable === false)) {
+        const search = String(parameters.q || "").trim().toLowerCase();
+        const matches = publishedCatalog.rows.filter((part) => {
+          if (!validPartNumber(part.part_number)) return false;
+          const text = JSON.stringify(part).toLowerCase();
+          const hasFitment = Boolean(part.fitments?.length || part.additional_fitments?.length);
+          return (!search || text.includes(search)) && (!parameters.manufacturer || part.manufacturer === parameters.manufacturer) && (!parameters.family || (part.family_name || "Unclassified") === parameters.family) && (!parameters.fitmentStatus || (parameters.fitmentStatus === "present" ? hasFitment : !hasFitment)) && (!parameters.factStatus || (parameters.factStatus === "with_facts" ? part.attributes?.length : !part.attributes?.length)) && (!parameters.descriptionStatus || (parameters.descriptionStatus === "present" ? part.description : !part.description));
+        });
+        const pageSize = Number(parameters.pageSize || 50); const page = Number(parameters.page || 1);
+        result = { rows: matches.slice((page - 1) * pageSize, page * pageSize), total: matches.length, page, pages: Math.max(1, Math.ceil(matches.length / pageSize)), pageSize };
+      } else result = await localDataApi.masterCatalog(parameters);
+      if (serial === requestSerial.current) setCatalog(result);
+    }
     catch (error) { if (serial === requestSerial.current) { setCatalog({ rows: [], total: 0, page: 1, pages: 1 }); setTableError(error.message); } }
     finally { if (serial === requestSerial.current) setTableLoading(false); }
-  }, [connected]);
+  }, [connected, localServiceAvailable, publishedCatalog, publicMode]);
 
   useEffect(() => {
     if (!connected) return undefined;
@@ -134,10 +190,13 @@ export default function MasterDataPage() {
       const result = await localDataApi.revalidateMasterCatalog();
       setMetrics((current) => current ? { ...current, summary: { ...current.summary, unique_parts: result.remaining_parts } } : current);
       await loadCatalog({ ...query, view: "audit" });
+      const mappingStatus = result.vehicle_mapping_validation?.status === "passed"
+        ? " Vehicle mapping validation passed for both workbook tabs."
+        : " Vehicle mapping validation is not passing; fitment mappings should be reviewed."
       if (result.quarantined) {
         const reasons = (result.reasons || []).map((item) => `${item.reason_code}: ${number(item.count)}`).join(", ");
-        setExportMessage(`Quarantined ${number(result.quarantined)} impure part numbers${reasons ? ` (${reasons})` : ""}; ${number(result.review_flags || 0)} softer review flags remain. Source rows were preserved.`);
-      } else setExportMessage(`No hard impurities found; ${number(result.review_flags || 0)} softer review flags remain. Availability and discontinued status do not affect catalog inclusion.`);
+        setExportMessage(`Quarantined ${number(result.quarantined)} impure part numbers${reasons ? ` (${reasons})` : ""}; ${number(result.review_flags || 0)} softer review flags remain. Source rows were preserved.${mappingStatus}`);
+      } else setExportMessage(`No hard impurities found; ${number(result.review_flags || 0)} softer review flags remain. Availability and discontinued status do not affect catalog inclusion.${mappingStatus}`);
     }
     catch (error) { setExportMessage(error.message); } finally { setRevalidating(false); }
   }
@@ -159,7 +218,7 @@ export default function MasterDataPage() {
     {masterTab === "export" ? <section className="rounded-3xl border border-emerald-200 bg-white p-6 shadow-panel sm:p-8">
       <p className="text-xs font-black uppercase tracking-wide text-emerald-700">Partout Pro & other apps</p><h3 className="mt-2 text-2xl font-black">A reusable catalog with complete part details</h3><p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">Download one row per part with every available attribute, complete vehicle fitments, alternate numbers, and replacement relationships. Fitment restrictions stay attached to the correct vehicle. Unknown fields remain empty and conflicting values stay visible for confirmation.</p>
       <div className="mt-6 grid gap-4 md:grid-cols-3">{[["Part identity", "Manufacturer, OEM number, description, family, component scope, and side or position."], ["Fitment & installation", "Year, make, model, trim, ePID, assembly, quantity, and required or excluded options for each fitment."], ["Specifications & alternatives", "All recorded product and variant attributes, confirmed alternate numbers, and conditional replacement relationships."]].map(([title, description]) => <article key={title} className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><h4 className="font-black">{title}</h4><p className="mt-2 text-sm leading-6 text-slate-600">{description}</p></article>)}</div>
-      <div className="mt-6 flex flex-wrap gap-3"><button type="button" onClick={exportAllMasterData} disabled={!connected || fullExporting} className="inline-flex items-center gap-2 rounded-xl bg-brand-700 px-5 py-3 text-sm font-black text-white disabled:opacity-50"><Download size={17} />{fullExporting ? "Preparing catalog…" : "Download complete parts catalog"}</button><button type="button" onClick={() => chooseTab("catalog")} className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-bold">Filter & preview parts</button></div>
+      <div className="mt-6 flex flex-wrap gap-3"><button type="button" onClick={exportAllMasterData} disabled={!connected || fullExporting} className="inline-flex items-center gap-2 rounded-xl bg-brand-700 px-5 py-3 text-sm font-black text-white disabled:opacity-50"><Download size={17} />{fullExporting ? "Preparing catalog…" : "Download complete parts catalog"}</button><button type="button" onClick={() => chooseTab("catalog")} className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-bold">Filter & preview parts</button>{GOOGLE_DRIVE_MASTERDATA_URL && <a href={GOOGLE_DRIVE_MASTERDATA_URL} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-5 py-3 text-sm font-black text-emerald-800"><ExternalLink size={17} />Open approved Drive snapshot</a>}</div>
       <p className="mt-4 text-xs leading-5 text-slate-500">CSV includes JSON columns for attributes and fitments to preserve their structure. Collection counts and processing scores are available in Data quality. Seller-specific price, condition, and stock belong to individual listings.</p>
       {exportMessage && <p role="status" className="mt-4 rounded-xl bg-slate-100 p-3 text-sm">{exportMessage}</p>}
       {!connected && <p className="mt-4 text-sm font-semibold text-amber-800">Connect the local data service to download the catalog.</p>}
