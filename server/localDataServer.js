@@ -1,4 +1,5 @@
 import { catalogExportQuery, catalogFilters, catalogPart, catalogQuery } from "./masterCatalog.js";
+import { MASTER_EXPORT_TEMPLATE_VERSION, MASTER_EXPORT_TEMPLATES, masterExportTemplate } from "../shared/masterExportTemplates.js";
 import { DuckDBInstance } from "@duckdb/node-api";
 import express from "express";
 import { randomUUID } from "node:crypto";
@@ -3308,6 +3309,7 @@ async function masterExtractQuery(connection) {
 
 async function masterTemplateQuery(connection, template) {
   const type = String(template || "raw_enriched");
+  if (!masterExportTemplate(type)) throw new Error(`Unknown export template: ${type}`);
   const productWhere = "WHERE coalesce(record_type, 'product') = 'product'";
   if (type === "part_number") return `SELECT manufacturer AS "Make", part_number AS "Part Number",
     description AS "Description", part_type AS "Part Type", family_name AS "Part Family",
@@ -7210,13 +7212,20 @@ app.get("/api/local/master/quality", asyncRoute(async (_request, response) => {
   response.json({ quality });
 }));
 
+app.get("/api/local/master/templates", (_request, response) => {
+  response.json({ version: MASTER_EXPORT_TEMPLATE_VERSION, templates: MASTER_EXPORT_TEMPLATES });
+});
+
 app.post("/api/local/master/templates/:template/preview", asyncRoute(async (request, response) => {
   const template = String(request.params.template || "raw_enriched");
   const result = await withConnection(async (connection) => {
     const query = await masterTemplateQuery(connection, template);
+    const countReader = await connection.runAndReadAll(`SELECT count(*) AS total FROM (${query}) template`);
+    const total = Number(countReader.getRowObjectsJson()[0]?.total || 0);
     const reader = await connection.runAndReadAll(`SELECT * FROM (${query}) template LIMIT 10`);
     const rows = reader.getRowObjectsJson();
-    return { columns: rows.length ? Object.keys(rows[0]) : [], rows };
+    const definition = masterExportTemplate(template);
+    return { version: MASTER_EXPORT_TEMPLATE_VERSION, columns: rows.length ? Object.keys(rows[0]) : (definition?.columns || []), rows, total };
   });
   response.json({ template, ...result });
 }));

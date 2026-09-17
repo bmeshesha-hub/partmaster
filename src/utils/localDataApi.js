@@ -50,6 +50,7 @@ export const localDataApi = {
     return request(`/master-catalog?${query}`);
   },
   exportMasterCatalog: (parameters = {}) => request("/master-catalog/export", { method: "POST", body: JSON.stringify(parameters) }),
+  masterTemplateCapabilities: () => request("/master/templates"),
   masterTemplatePreview: (template) => request(`/master/templates/${encodeURIComponent(template)}/preview`, { method: "POST", body: "{}" }),
   exportMasterTemplate: (template) => request(`/master/templates/${encodeURIComponent(template)}/export`, { method: "POST", body: "{}" }),
   exportFpa: () => request("/master/fpa-export", { method: "POST", body: "{}" }),

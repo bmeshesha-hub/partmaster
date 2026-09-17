@@ -2,29 +2,12 @@ import { BarChart3, ChevronLeft, ChevronRight, Database, Download, ExternalLink,
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CatalogPartRow from "./CatalogPartRow.jsx";
 import { localDataApi } from "../utils/localDataApi.js";
+import { MASTER_EXPORT_TEMPLATES } from "../../shared/masterExportTemplates.js";
 
 const INITIAL_QUERY = { q: "", manufacturer: "", family: "", onlineStatus: "", factStatus: "", fitmentStatus: "", descriptionStatus: "", minConfidence: "", maxConfidence: "", minOccurrences: "", sort: "part_number", direction: "asc", page: 1, pageSize: 50 };
 const LOCAL_URL = "http://127.0.0.1:5173/partmaster/";
 const GOOGLE_DRIVE_MASTERDATA_URL = import.meta.env.VITE_GOOGLE_DRIVE_MASTERDATA_URL || "";
 const SNAPSHOT_BASE = `${import.meta.env.BASE_URL}data/`;
-const EXPORT_TEMPLATES = [
-  { id: "part_number", label: "Part number focused", detail: "One row per canonical part; identity, description, category, and coverage.", columns: ["Make", "Part Number", "Description", "Part Type", "Part Family", "Component Scope", "Side", "Position"] },
-  { id: "category", label: "Category focused", detail: "Assembly and category view with each known application row.", columns: ["Make", "Part Type", "Part Family", "Assembly Category", "Part Number", "Description", "Year", "Model"] },
-  { id: "attribute", label: "Attribute focused", detail: "One row per product attribute and value for analysis or mapping.", columns: ["Make", "Part Number", "Part Family", "Attribute", "Value", "Value Type", "Method", "Confidence"] },
-  { id: "fitment", label: "Fitment focused", detail: "One row per part-to-vehicle application with restrictions and mapping.", columns: ["Make", "Part Number", "Year", "Vehicle Make", "Vehicle Model", "Vehicle Trim", "ePID", "Assembly Category"] },
-  { id: "vehicle_fitment", label: "Vehicle fitment matrix", detail: "Fitment rows with mapping confidence, restrictions, quantity, and notes.", columns: ["Make", "Part Number", "Year", "Vehicle Make", "Vehicle Model", "Vehicle Trim", "ePID", "Mapping Confidence"] },
-  { id: "assembly_diagram", label: "Assembly / diagram", detail: "Manufacturer fiche view organized by assembly, diagram, position, and reference.", columns: ["Year", "Make", "Model", "Assembly Category", "Assembly GUID", "Diagram GUID", "Pos", "Ref"] },
-  { id: "category_attribute", label: "Category attributes", detail: "Category-aware attribute records with evidence and confidence.", columns: ["Make", "Part Number", "Part Type", "Part Family", "Category", "Attribute", "Value", "Method"] },
-  { id: "listing_ready", label: "Listing ready", detail: "Clean product title, specifications, reference price, and fitment summary.", columns: ["Make", "Part Number", "Listing Title", "Cleaned Description", "Part Type", "Part Family", "Specifications JSON", "Fitment Summary"] },
-  { id: "supersession", label: "Supersession / interchange", detail: "Verified alternate numbers and conditional part relationships.", columns: ["Make", "Part Number", "Relationship Type", "Related Part Number", "Conditions", "Confidence", "Evidence URL"] },
-  { id: "source_traceability", label: "Source traceability", detail: "Field-level evidence for auditing and verification.", columns: ["Make", "Part Number", "Field", "Observed Value", "Source URL", "Method", "Confidence", "Accepted"] },
-  { id: "quality_review", label: "Data-quality review", detail: "Parts with missing descriptions, classification, attributes, confidence, or review flags.", columns: ["Make", "Part Number", "Description", "Part Type", "Part Family", "Attribute Status", "Online Status", "Review Reasons"] },
-  { id: "vehicle_summary", label: "Vehicle summary", detail: "One row per vehicle application with part, fitment, assembly, and mapping counts.", columns: ["Year", "Vehicle Make", "Vehicle Model", "Vehicle Trim", "Vehicle Type", "Part Count", "Fitment Row Count", "Assembly Count"] },
-  { id: "manufacturer_specific", label: "Manufacturer-specific", detail: "Manufacturer-ready identity and specifications layout for brand-specific workflows.", columns: ["Make", "Part Number", "Description", "Part Type", "Part Family", "Component Scope", "Side", "Specifications JSON"] },
-  { id: "raw_enriched", label: "Raw + enriched", detail: "Every raw source row plus the standardized master fields and provenance.", columns: ["Year", "Make", "Model", "Fitment Notes", "Part Number", "Cleaned Description", "Specs", "Availability"] },
-  { id: "raw", label: "Raw source", detail: "Every raw source row preserved as JSON with source and row identity.", columns: ["Dataset ID", "Source File", "Source Row ID", "Source URL", "Raw Record JSON"] },
-];
-
 async function loadPublishedCatalog() {
   const indexResponse = await fetch(`${SNAPSHOT_BASE}master-catalog-index.json`);
   if (indexResponse.ok) {
@@ -86,6 +69,7 @@ export default function MasterDataPage() {
   const [templatePreviewLoading, setTemplatePreviewLoading] = useState(false);
   const [templatePreviewError, setTemplatePreviewError] = useState("");
   const [templateExporting, setTemplateExporting] = useState(false);
+  const [templateCapabilities, setTemplateCapabilities] = useState(null);
   const requestSerial = useRef(0);
   const [tableDensity, setTableDensity] = useState("standard");
   const [publishedCatalog, setPublishedCatalog] = useState(null);
@@ -143,7 +127,22 @@ export default function MasterDataPage() {
   }, []);
 
   useEffect(() => {
+    if (publicMode || connected !== true) return undefined;
+    let active = true;
+    localDataApi.masterTemplateCapabilities()
+      .then((result) => { if (active) setTemplateCapabilities(result); })
+      .catch(() => { if (active) setTemplateCapabilities({ templates: [], error: "The local data service is older than this site. Restart it to enable export templates." }); });
+    return () => { active = false; };
+  }, [connected, publicMode]);
+
+  useEffect(() => {
     if (masterTab !== "export" || publicMode || connected !== true || localServiceAvailable === false) return undefined;
+    if (!templateCapabilities) return undefined;
+    if (!templateCapabilities.templates?.some((template) => template.id === exportTemplate)) {
+      setTemplatePreview({ columns: [], rows: [] });
+      setTemplatePreviewError(templateCapabilities.error || "This template is not supported by the local data service.");
+      return undefined;
+    }
     let active = true;
     setTemplatePreviewLoading(true); setTemplatePreviewError("");
     localDataApi.masterTemplatePreview(exportTemplate)
@@ -151,7 +150,7 @@ export default function MasterDataPage() {
       .catch((error) => { if (active) { setTemplatePreview({ columns: [], rows: [] }); setTemplatePreviewError(error.message); } })
       .finally(() => { if (active) setTemplatePreviewLoading(false); });
     return () => { active = false; };
-  }, [connected, exportTemplate, localServiceAvailable, masterTab, publicMode]);
+  }, [connected, exportTemplate, localServiceAvailable, masterTab, publicMode, templateCapabilities]);
 
   const loadCatalog = useCallback(async (parameters) => {
     if (!connected) return;
@@ -225,7 +224,7 @@ export default function MasterDataPage() {
       link.href = item.downloadUrl || `/api/local/exports/${encodeURIComponent(item.filename)}`;
       link.download = item.filename;
       document.body.appendChild(link); link.click(); link.remove();
-      setExportMessage(`Downloaded the ${EXPORT_TEMPLATES.find((template) => template.id === exportTemplate)?.label || "selected"} template.`);
+      setExportMessage(`Downloaded the ${MASTER_EXPORT_TEMPLATES.find((template) => template.id === exportTemplate)?.label || "selected"} template.`);
     }
     catch (error) { setExportMessage(error.message); }
     finally { setTemplateExporting(false); }
@@ -279,7 +278,7 @@ export default function MasterDataPage() {
       <p className="text-xs font-black uppercase tracking-wide text-emerald-700">Partout Pro & other apps</p><h3 className="mt-2 text-2xl font-black">A reusable catalog with complete part details</h3><p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">Download the canonical catalog plus a raw-to-master extract built from every imported source row. Fitment restrictions stay attached to the correct vehicle, and raw provenance remains available for review.</p>
       <div className="mt-6 grid gap-4 md:grid-cols-3">{[["Part identity", "Manufacturer, OEM number, description, family, component scope, and side or position."], ["Fitment & installation", "Year, make, model, trim, ePID, assembly, quantity, and required or excluded options for each fitment."], ["Specifications & alternatives", "All recorded product and variant attributes, confirmed alternate numbers, and conditional replacement relationships."]].map(([title, description]) => <article key={title} className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><h4 className="font-black">{title}</h4><p className="mt-2 text-sm leading-6 text-slate-600">{description}</p></article>)}</div>
       <div className="mt-6 rounded-2xl border border-cyan-200 bg-cyan-50/70 p-4"><p className="text-xs font-black uppercase tracking-wide text-cyan-800">Raw → master extract</p><p className="mt-1 text-sm leading-6 text-cyan-950">Every raw source row is enriched with Year, Make, Model, Fitment Notes, Est. Year Fitment, Part Number, Supersedes Part, Cleaned Description, Industry Taxonomy, Specs, Availability, numeric Price, Currency, Pos, Ref, Assembly GUID, Diagram GUID, Brand Code, and source traceability.</p></div>
-      <div className="mt-6 rounded-2xl border border-violet-200 bg-violet-50/50 p-4 sm:p-5"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-black uppercase tracking-wide text-violet-700">Choose an export template</p><h4 className="mt-1 text-lg font-black text-violet-950">Different column arrangements for different workflows</h4><p className="mt-1 text-sm leading-5 text-violet-900">Select a format, review the first 10 rows, then export the full matching dataset.</p></div><span className="rounded-full bg-white px-3 py-1 text-[11px] font-black text-violet-700">{templatePreview.rows.length || 0} preview rows</span></div><div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{EXPORT_TEMPLATES.map((template) => <button key={template.id} type="button" onClick={() => setExportTemplate(template.id)} className={`rounded-xl border p-3 text-left transition ${exportTemplate === template.id ? "border-violet-500 bg-white shadow-sm ring-2 ring-violet-200" : "border-violet-100 bg-white/60 hover:border-violet-300"}`}><span className="block text-sm font-black text-slate-900">{template.label}</span><span className="mt-1 block text-xs leading-5 text-slate-600">{template.detail}</span><span className="mt-2 block truncate font-mono text-[10px] text-violet-700">{template.columns.join(" · ")}</span></button>)}</div><div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="text-xs font-bold text-slate-600">Preview: {EXPORT_TEMPLATES.find((template) => template.id === exportTemplate)?.label}</p><button type="button" onClick={exportSelectedTemplate} disabled={templateExporting || !connected || publicMode} className="inline-flex items-center gap-2 rounded-xl bg-violet-700 px-4 py-2.5 text-sm font-black text-white disabled:opacity-50"><Download size={16} />{templateExporting ? "Preparing template…" : "Export selected template"}</button></div><TemplatePreview preview={templatePreview} loading={templatePreviewLoading} error={publicMode ? "Template previews and exports are available from the local catalog service." : templatePreviewError} /></div>
+      <div className="mt-6 rounded-2xl border border-violet-200 bg-violet-50/50 p-4 sm:p-5"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-black uppercase tracking-wide text-violet-700">Choose an export template</p><h4 className="mt-1 text-lg font-black text-violet-950">Different column arrangements for different workflows</h4><p className="mt-1 text-sm leading-5 text-violet-900">Select a format, review the first 10 rows, then export the full matching dataset.</p></div><span className="rounded-full bg-white px-3 py-1 text-[11px] font-black text-violet-700">{templatePreview.rows.length || 0} preview rows</span></div><div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{MASTER_EXPORT_TEMPLATES.map((template) => { const supported = publicMode || !templateCapabilities || templateCapabilities.templates?.some((item) => item.id === template.id); return <button key={template.id} type="button" onClick={() => setExportTemplate(template.id)} disabled={!publicMode && Boolean(templateCapabilities) && !supported} className={`rounded-xl border p-3 text-left transition ${exportTemplate === template.id ? "border-violet-500 bg-white shadow-sm ring-2 ring-violet-200" : "border-violet-100 bg-white/60 hover:border-violet-300"} disabled:cursor-not-allowed disabled:opacity-50`}><span className="block text-sm font-black text-slate-900">{template.label}</span><span className="mt-1 block text-xs leading-5 text-slate-600">{template.detail}</span><span className="mt-2 block truncate font-mono text-[10px] text-violet-700">{template.columns.join(" · ")}</span></button>; })}</div><div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="text-xs font-bold text-slate-600">Preview: {MASTER_EXPORT_TEMPLATES.find((template) => template.id === exportTemplate)?.label}</p><button type="button" onClick={exportSelectedTemplate} disabled={templateExporting || !connected || publicMode || !templateCapabilities?.templates?.some((template) => template.id === exportTemplate)} className="inline-flex items-center gap-2 rounded-xl bg-violet-700 px-4 py-2.5 text-sm font-black text-white disabled:opacity-50"><Download size={16} />{templateExporting ? "Preparing template…" : "Export selected template"}</button></div><TemplatePreview preview={templatePreview} loading={templatePreviewLoading} error={publicMode ? "Template previews and exports are available from the local catalog service." : templatePreviewError} /></div>
       <div className="mt-6 flex flex-wrap gap-3"><button type="button" onClick={exportAllMasterData} disabled={!connected || fullExporting} className="inline-flex items-center gap-2 rounded-xl bg-brand-700 px-5 py-3 text-sm font-black text-white disabled:opacity-50"><Download size={17} />{fullExporting ? "Preparing exports…" : "Download catalog + raw-to-master extract"}</button><button type="button" onClick={() => chooseTab("catalog")} className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-bold">Filter & preview parts</button>{GOOGLE_DRIVE_MASTERDATA_URL && <a href={GOOGLE_DRIVE_MASTERDATA_URL} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-5 py-3 text-sm font-black text-emerald-800"><ExternalLink size={17} />Open approved Drive snapshot</a>}</div>
       <p className="mt-4 text-xs leading-5 text-slate-500">The button downloads both the canonical catalog and <span className="font-mono">master-extract-all-*.csv</span>. The raw-to-master file excludes marketplace sales/live metrics and keeps source provenance for every row.</p>
       {exportMessage && <p role="status" className="mt-4 rounded-xl bg-slate-100 p-3 text-sm">{exportMessage}</p>}
