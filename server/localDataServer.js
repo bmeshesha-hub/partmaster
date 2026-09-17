@@ -3372,7 +3372,7 @@ async function masterTemplateQuery(connection, template) {
   if (type === "fitment") {
     if (await hasSparseApplications()) return rawFitmentQuery();
     return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
-    parts.description AS "Description", applications.year AS "Year", applications.vehicle_make AS "Vehicle Make",
+    parts.description AS "Description", applications.year AS "Year", coalesce(nullif(trim(applications.vehicle_make), ''), parts.manufacturer) AS "Vehicle Make",
     coalesce(applications.vehicle_model, applications.model) AS "Vehicle Model", applications.vehicle_trim AS "Vehicle Trim",
     applications.vehicle_type AS "Vehicle Type", applications.vehicle_motorcycle_type AS "Motorcycle Type",
     applications.epid AS "ePID", applications.assembly AS "Assembly Category", applications.item_number AS "Ref",
@@ -3390,7 +3390,7 @@ async function masterTemplateQuery(connection, template) {
   if (type === "vehicle_fitment") {
     if (await hasSparseApplications()) return rawFitmentQuery();
     return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
-    parts.description AS "Description", applications.year AS "Year", applications.vehicle_make AS "Vehicle Make",
+    parts.description AS "Description", applications.year AS "Year", coalesce(nullif(trim(applications.vehicle_make), ''), parts.manufacturer) AS "Vehicle Make",
     coalesce(applications.vehicle_model, applications.model) AS "Vehicle Model", applications.vehicle_trim AS "Vehicle Trim",
     applications.vehicle_type AS "Vehicle Type", applications.vehicle_motorcycle_type AS "Motorcycle Type",
     applications.epid AS "ePID", applications.assembly AS "Assembly Category", applications.item_number AS "Ref",
@@ -3419,11 +3419,13 @@ async function masterTemplateQuery(connection, template) {
     WHERE canonical.verification_status != 'rejected'
     ORDER BY parts.manufacturer_norm, parts.part_number_norm, applications.year, applications.assembly, applications.item_number`;
   if (type === "category_attribute") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
-    parts.description AS "Description", parts.part_type AS "Part Type", families.family_name AS "Part Family",
+    parts.description AS "Description", coalesce(offline.part_type, families.category) AS "Part Type", families.family_name AS "Part Family",
     families.category AS "Category", attributes.attribute_name AS "Attribute", attributes.attribute_value AS "Value",
     attributes.source_method AS "Method", attributes.confidence AS "Confidence", attributes.evidence_url AS "Evidence URL"
     FROM partmaster_variant_attributes attributes
     JOIN partmaster_canonical_parts parts ON parts.id = attributes.part_id
+    LEFT JOIN partmaster_offline_parts offline ON offline.manufacturer_norm = parts.manufacturer_norm
+      AND offline.part_number_norm = parts.part_number_norm
     LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
     WHERE parts.verification_status != 'rejected'
     ORDER BY parts.manufacturer_norm, parts.part_number_norm, attributes.attribute_name, attributes.attribute_value`;
@@ -3481,7 +3483,11 @@ async function masterTemplateQuery(connection, template) {
       OR parts.family_name = 'General Part' OR coalesce(parts.extracted_attribute_count, 0) = 0
       OR parts.confidence < .8 OR parts.confidence IS NULL OR flags.review_flags IS NOT NULL)
     ORDER BY parts.confidence NULLS FIRST, parts.manufacturer_norm, parts.part_number_norm`;
-  if (type === "vehicle_summary") return `SELECT applications.year AS "Year", applications.vehicle_make AS "Vehicle Make",
+  if (type === "vehicle_summary") return `SELECT applications.year AS "Year", coalesce(nullif(trim(applications.vehicle_make), ''), nullif(trim(offline.manufacturer), ''),
+    CASE WHEN lower(coalesce(datasets.source_file, '')) LIKE '%harley%' OR lower(coalesce(datasets.source_file, '')) LIKE '%harvey%' THEN 'Harley-Davidson'
+      WHEN lower(coalesce(datasets.source_file, '')) LIKE '%honda%' THEN 'Honda' WHEN lower(coalesce(datasets.source_file, '')) LIKE '%bmw%' THEN 'BMW'
+      WHEN lower(coalesce(datasets.source_file, '')) LIKE '%kawasaki%' THEN 'Kawasaki' WHEN lower(coalesce(datasets.source_file, '')) LIKE '%suzuki%' THEN 'Suzuki'
+      WHEN lower(coalesce(datasets.source_file, '')) LIKE '%yamaha%' THEN 'Yamaha' WHEN lower(coalesce(datasets.source_file, '')) LIKE '%ktm%' THEN 'KTM' END) AS "Vehicle Make",
     coalesce(applications.vehicle_model, applications.model) AS "Vehicle Model", applications.vehicle_trim AS "Vehicle Trim",
     applications.vehicle_type AS "Vehicle Type", applications.vehicle_motorcycle_type AS "Motorcycle Type",
     count(DISTINCT applications.part_id) AS "Part Count", count(*) AS "Fitment Row Count",
@@ -3489,8 +3495,15 @@ async function masterTemplateQuery(connection, template) {
     count(*) FILTER (WHERE applications.vehicle_mapping_method IS NOT NULL) AS "Mapped Fitments"
     FROM partmaster_part_applications applications
     JOIN partmaster_canonical_parts parts ON parts.id = applications.part_id
+    LEFT JOIN partmaster_offline_parts offline ON offline.manufacturer_norm = parts.manufacturer_norm
+      AND offline.part_number_norm = parts.part_number_norm
+    LEFT JOIN partmaster_datasets datasets ON datasets.id = applications.dataset_id
     WHERE parts.verification_status != 'rejected'
-    GROUP BY applications.year, applications.vehicle_make, coalesce(applications.vehicle_model, applications.model),
+    GROUP BY applications.year, coalesce(nullif(trim(applications.vehicle_make), ''), nullif(trim(offline.manufacturer), ''),
+      CASE WHEN lower(coalesce(datasets.source_file, '')) LIKE '%harley%' OR lower(coalesce(datasets.source_file, '')) LIKE '%harvey%' THEN 'Harley-Davidson'
+        WHEN lower(coalesce(datasets.source_file, '')) LIKE '%honda%' THEN 'Honda' WHEN lower(coalesce(datasets.source_file, '')) LIKE '%bmw%' THEN 'BMW'
+        WHEN lower(coalesce(datasets.source_file, '')) LIKE '%kawasaki%' THEN 'Kawasaki' WHEN lower(coalesce(datasets.source_file, '')) LIKE '%suzuki%' THEN 'Suzuki'
+        WHEN lower(coalesce(datasets.source_file, '')) LIKE '%yamaha%' THEN 'Yamaha' WHEN lower(coalesce(datasets.source_file, '')) LIKE '%ktm%' THEN 'KTM' END), coalesce(applications.vehicle_model, applications.model),
       applications.vehicle_trim, applications.vehicle_type, applications.vehicle_motorcycle_type
     ORDER BY "Year", "Vehicle Make", "Vehicle Model", "Vehicle Trim"`;
   if (type === "manufacturer_specific") return `SELECT manufacturer AS "Make", part_number AS "Part Number",
