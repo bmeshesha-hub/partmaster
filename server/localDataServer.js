@@ -3240,6 +3240,7 @@ function offlineDatasetExpressions(columns) {
     currency: firstColumnExpression(columns, ["currency", "currency_code"]),
     quantity: firstColumnExpression(columns, ["quantity", "qty", "quatity"]),
     sourceUrl: firstColumnExpression(columns, ["url", "source_url"]),
+    epid: firstColumnExpression(columns, ["epid", "e_pid"]),
     date: firstColumnExpression(columns, ["dt", "date", "updated_at"]),
     jobId: firstColumnExpression(columns, ["jobid", "job_id"]),
     fitmentNotes: firstColumnExpression(columns, ["fitment_notes", "fitment_note"]),
@@ -3298,6 +3299,8 @@ async function masterExtractQuery(connection) {
       list_extract(${sourceGuids}, 1) AS "Assembly GUID", list_extract(${sourceGuids}, 2) AS "Diagram GUID",
       regexp_extract(lower(coalesce(${sourceUrl}, '')), 'aribrand(?:%253d|%3d|=)([a-z0-9_-]+)', 1) AS "Brand Code",
       ${fields.assembly} AS "Assembly Category", ${sourceUrl} AS "Source URL",
+      ${description} AS "Raw Description", ${fields.partType} AS "Raw Part Type", ${rawPrice} AS "Raw Price",
+      ${fields.quantity} AS "Raw Quantity", ${fields.epid} AS "Raw ePID",
       ${fields.date} AS "Source Date", ${fields.jobId} AS "Source Job ID",
       ${quoteString(dataset.id)} AS "Dataset ID", ${quoteString(dataset.source_file)} AS "Source File", _row_id AS "Source Row ID",
       to_json(source) AS "Raw Record JSON"
@@ -7243,7 +7246,10 @@ app.post("/api/local/master/templates/:template/preview", asyncRoute(async (requ
     const query = await masterTemplateQuery(connection, template);
     const countReader = await connection.runAndReadAll(`SELECT count(*) AS total FROM (${query}) template`);
     const total = Number(countReader.getRowObjectsJson()[0]?.total || 0);
-    const reader = await connection.runAndReadAll(`SELECT * FROM (${query}) template LIMIT 10`);
+    const previewOrdering = template === "raw_enriched"
+      ? `ORDER BY "Year" NULLS LAST, "Model" NULLS LAST, "Source File", "Source Row ID"`
+      : "";
+    const reader = await connection.runAndReadAll(`SELECT * FROM (${query}) template ${previewOrdering} LIMIT 10`);
     const rows = reader.getRowObjectsJson();
     const definition = masterExportTemplate(template);
     return { version: MASTER_EXPORT_TEMPLATE_VERSION, columns: rows.length ? Object.keys(rows[0]) : (definition?.columns || []), rows, total };
