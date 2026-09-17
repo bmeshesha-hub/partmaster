@@ -2,7 +2,8 @@ import { catalogExportQuery, catalogFilters, catalogPart, catalogQuery } from ".
 import { DuckDBInstance } from "@duckdb/node-api";
 import express from "express";
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readdir, stat } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { basename, extname, join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { lookup } from "node:dns/promises";
@@ -13,16 +14,23 @@ const INBOX_ROOT = join(DATA_ROOT, "inbox");
 const RAWDATA_ROOT = join(INBOX_ROOT, "rawdata");
 const EXPORT_ROOT = join(DATA_ROOT, "exports");
 const REFERENCE_ROOT = join(DATA_ROOT, "reference");
+const VEHICLE_MAPPING_WORKBOOK_PATH = join(INBOX_ROOT, "Vehicle Mapping ePID.xlsx");
 const VEHICLE_MASTER_PATH = join(REFERENCE_ROOT, "vehicle_master.csv");
 const VEHICLE_ALIASES_PATH = join(REFERENCE_ROOT, "vehicle_source_aliases.csv");
+const VEHICLE_VALIDATION_PATH = join(REFERENCE_ROOT, "vehicle_mapping_validation.json");
 const MPSOV_INBOX_PATH = join(INBOX_ROOT, "MPSOV.csv");
-const DATABASE_PATH = resolve(process.env.PARTMASTER_DATABASE_PATH || join(DATA_ROOT, "partmaster.duckdb"));
+const MAIN_DATABASE_PATH = join(DATA_ROOT, "partmaster.duckdb");
+const REBUILT_DATABASE_PATH = join(DATA_ROOT, "partmaster.rebuilt.duckdb");
+// Prefer the verified rebuilt copy when present. The original database is
+// retained for recovery and can be selected explicitly through .env.
+const DATABASE_PATH = resolve(process.env.PARTMASTER_DATABASE_PATH || (existsSync(REBUILT_DATABASE_PATH) ? REBUILT_DATABASE_PATH : MAIN_DATABASE_PATH));
 const PORT = Number(process.env.PARTMASTER_DATA_PORT || 8787);
 // Keep the control plane available even when the database contains a very large
 // resumable job. Heavy recovery/backfill work must be explicitly enabled instead
 // of running before app.listen() and making the API appear dead.
 const AUTO_RESUME_JOBS = String(process.env.PARTMASTER_AUTO_RESUME_JOBS || "false").toLowerCase() === "true";
 const STARTUP_BACKFILL = String(process.env.PARTMASTER_STARTUP_BACKFILL || "false").toLowerCase() === "true";
+const SKIP_VEHICLE_MAPPING_STARTUP = String(process.env.PARTMASTER_SKIP_VEHICLE_MAPPING_STARTUP || "false").toLowerCase() === "true";
 const importJobs = new Map();
 const activeEnrichmentJobs = new Set();
 const activeRowEnhancementJobs = new Set();
@@ -139,6 +147,9 @@ await withConnection((connection) => connection.run(`
     part_number_raw VARCHAR,
     part_number_norm VARCHAR,
     description_raw VARCHAR,
+    part_type VARCHAR,
+    raw_price VARCHAR,
+    raw_record_json VARCHAR,
     quantity VARCHAR,
     source_url VARCHAR,
     enriched_part_number VARCHAR,
@@ -199,12 +210,15 @@ await withConnection((connection) => connection.run(`
     source_row_id BIGINT NOT NULL,
     year VARCHAR,
     model VARCHAR,
+    part_type VARCHAR,
     assembly VARCHAR,
     item_number VARCHAR,
     side VARCHAR,
     position VARCHAR,
     location_notes VARCHAR,
     quantity VARCHAR,
+    raw_price VARCHAR,
+    raw_record_json VARCHAR,
     source_url VARCHAR,
     evidence_url VARCHAR,
     required_options VARCHAR,
@@ -351,6 +365,9 @@ await withConnection((connection) => connection.run(`
     part_number VARCHAR,
     part_number_norm VARCHAR NOT NULL,
     description VARCHAR,
+    part_type VARCHAR,
+    raw_price VARCHAR,
+    raw_record_json VARCHAR,
     year VARCHAR,
     model VARCHAR,
     assembly VARCHAR,
@@ -378,6 +395,8 @@ await withConnection((connection) => connection.run(`
     part_number_norm VARCHAR NOT NULL,
     description VARCHAR,
     family_name VARCHAR,
+    part_type VARCHAR,
+    raw_price VARCHAR,
     component_scope VARCHAR,
     side VARCHAR,
     position VARCHAR,
@@ -704,7 +723,15 @@ await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_mapping_method VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS vehicle_mapping_confidence DOUBLE;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS extracted_attributes_json VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS part_type VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS raw_price VARCHAR;
+  ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS raw_record_json VARCHAR;
   ALTER TABLE partmaster_offline_parts ADD COLUMN IF NOT EXISTS record_type VARCHAR DEFAULT 'product';
+  ALTER TABLE partmaster_offline_part_sources ADD COLUMN IF NOT EXISTS part_type VARCHAR;
+  ALTER TABLE partmaster_offline_part_sources ADD COLUMN IF NOT EXISTS raw_price VARCHAR;
+  ALTER TABLE partmaster_offline_part_sources ADD COLUMN IF NOT EXISTS raw_record_json VARCHAR;
+  ALTER TABLE partmaster_offline_parts ADD COLUMN IF NOT EXISTS part_type VARCHAR;
+  ALTER TABLE partmaster_offline_parts ADD COLUMN IF NOT EXISTS raw_price VARCHAR;
   ALTER TABLE partmaster_enrichment_candidates ADD COLUMN IF NOT EXISTS extracted_attribute_count INTEGER DEFAULT 0;
   ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS family_id VARCHAR;
   ALTER TABLE partmaster_canonical_parts ADD COLUMN IF NOT EXISTS component_scope VARCHAR;
@@ -721,17 +748,21 @@ await withConnection((connection) => connection.run(`
   ALTER TABLE partmaster_vehicle_master ADD COLUMN IF NOT EXISTS motorcycle_type VARCHAR;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_mapping_method VARCHAR;
   ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS vehicle_mapping_confidence DOUBLE;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS part_type VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS raw_price VARCHAR;
+  ALTER TABLE partmaster_part_applications ADD COLUMN IF NOT EXISTS raw_record_json VARCHAR;
   CREATE UNIQUE INDEX IF NOT EXISTS part_applications_key_idx
     ON partmaster_part_applications (application_key);
   CREATE INDEX IF NOT EXISTS canonical_parts_family_idx
     ON partmaster_canonical_parts (family_id)
 `));
 
-await withConnection((connection) => connection.run(`
+try {
+  await withConnection((connection) => connection.run(`
   UPDATE partmaster_offline_parts
   SET record_type = 'reference_document', family_name = NULL,
       attribute_status = 'needs_review', extracted_attribute_count = 0,
-      extracted_attributes_json = '{}', online_status = NULL,
+      extracted_attributes_json = '{}', online_status = 'queued',
       confidence = least(coalesce(confidence, 0.2), 0.2), updated_at = current_timestamp
   WHERE (
     lower(coalesce(description, '')) LIKE '%installation instruction%'
@@ -751,15 +782,25 @@ await withConnection((connection) => connection.run(`
     OR lower(coalesce(description, '')) LIKE '%insertion sheet%'
   )
     AND coalesce(record_type, 'product') <> 'reference_document'
-`));
+  `));
+} catch (error) {
+  // These are repair/normalization conveniences, not required to serve the
+  // local API. An older database may contain a NOT NULL/default mismatch;
+  // keep the service alive and let the explicit repair flow handle it.
+  console.warn(`Startup reference normalization skipped: ${friendlyDataError(error)}`);
+}
 
-await withConnection((connection) => connection.run(`
+try {
+  await withConnection((connection) => connection.run(`
   UPDATE partmaster_offline_parts
   SET attribute_status = 'needs_review'
   WHERE coalesce(record_type, 'product') = 'product'
     AND coalesce(extracted_attribute_count, 0) = 0
     AND attribute_status = 'complete'
-`));
+  `));
+} catch (error) {
+  console.warn(`Startup attribute normalization skipped: ${friendlyDataError(error)}`);
+}
 
 // Do not run bulk cleanup mutations during startup.  A previous enrichment
 // crash could leave DuckDB's indexes invalidated; replaying a large DELETE
@@ -896,6 +937,10 @@ function normalizeManufacturer(value) {
 
 function normalizePartNumber(value) {
   return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function normalizedManufacturerSql(column) {
+  return `upper(regexp_replace(coalesce(${column}, ''), '[^A-Za-z0-9]', '', 'g'))`;
 }
 
 function partNumberValidationSql(column = "part_number_norm") {
@@ -1192,10 +1237,15 @@ function applyExtractedAttributes(update, candidate, evidenceDescription = "") {
 }
 
 async function loadVehicleMappingReferences() {
+  let validation;
   try {
-    await Promise.all([stat(VEHICLE_MASTER_PATH), stat(VEHICLE_ALIASES_PATH)]);
+    await Promise.all([stat(VEHICLE_MASTER_PATH), stat(VEHICLE_ALIASES_PATH), stat(VEHICLE_VALIDATION_PATH)]);
+    validation = JSON.parse(await readFile(VEHICLE_VALIDATION_PATH, "utf8"));
   } catch {
-    return { loaded: false, reason: "Extract Vehicle Mapping ePID.xlsx to create the optional reference CSVs." };
+    return { loaded: false, reason: "Run vehicle mapping validation to create the reference files and validation report." };
+  }
+  if (validation?.status !== "passed") {
+    return { loaded: false, reason: "Vehicle Mapping ePID.xlsx did not pass validation.", validation };
   }
   return withConnection(async (connection) => {
     let mpsovAvailable = false;
@@ -1250,47 +1300,96 @@ async function loadVehicleMappingReferences() {
           { path: MPSOV_INBOX_PATH },
         );
         mpsovStats = statsReader.getRowObjectsJson()[0];
+        // Rebuilt databases may have plain reference tables without a unique
+        // constraint. Use update-then-insert instead of ON CONFLICT so vehicle
+        // mapping loading works for both normal and rebuilt databases.
         await connection.run(
-          `INSERT INTO partmaster_vehicle_master
-           (epid, year, make_name, model_name, trim_name, vehicle_type, motorcycle_type, year_norm, make_norm, model_norm)
-           SELECT trim(epid), trim(_year), trim(make), trim(model), nullif(trim(submodel), '--'),
-            nullif(trim(vehicle_type), ''), nullif(trim(motorcycle_type), ''),
-            upper(regexp_replace(trim(_year), '[^A-Za-z0-9]', '', 'g')),
-            upper(regexp_replace(trim(make), '[^A-Za-z0-9]', '', 'g')),
-            upper(regexp_replace(trim(model), '[^A-Za-z0-9]', '', 'g'))
-           FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
-            quote = '"', escape = '"', strict_mode = true)
-           WHERE trim(epid) != '' QUALIFY row_number() OVER (PARTITION BY trim(epid) ORDER BY trim(epid)) = 1
-           ON CONFLICT (epid) DO UPDATE SET year = excluded.year, make_name = excluded.make_name,
-            model_name = excluded.model_name, trim_name = excluded.trim_name, vehicle_type = excluded.vehicle_type,
-            motorcycle_type = excluded.motorcycle_type,
-            year_norm = excluded.year_norm, make_norm = excluded.make_norm, model_norm = excluded.model_norm,
-            loaded_at = now()`,
+          `WITH source AS (
+             SELECT trim(epid) AS epid, trim(_year) AS year, trim(make) AS make_name,
+              trim(model) AS model_name, nullif(trim(submodel), '--') AS trim_name,
+              nullif(trim(vehicle_type), '') AS vehicle_type, nullif(trim(motorcycle_type), '') AS motorcycle_type,
+              upper(regexp_replace(trim(_year), '[^A-Za-z0-9]', '', 'g')) AS year_norm,
+              upper(regexp_replace(trim(make), '[^A-Za-z0-9]', '', 'g')) AS make_norm,
+              upper(regexp_replace(trim(model), '[^A-Za-z0-9]', '', 'g')) AS model_norm
+             FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
+              quote = '"', escape = '"', strict_mode = true)
+             WHERE trim(epid) != '' QUALIFY row_number() OVER (PARTITION BY trim(epid) ORDER BY trim(epid)) = 1
+           )
+           UPDATE partmaster_vehicle_master AS target SET year = source.year, make_name = source.make_name,
+            model_name = source.model_name, trim_name = source.trim_name, vehicle_type = source.vehicle_type,
+            motorcycle_type = source.motorcycle_type, year_norm = source.year_norm, make_norm = source.make_norm,
+            model_norm = source.model_norm, loaded_at = now()
+           FROM source WHERE target.epid = source.epid`,
           { path: MPSOV_INBOX_PATH },
         );
         await connection.run(
-          `INSERT INTO partmaster_vehicle_source_aliases
-           (epid, source, year, make_name, model_name, trim_name, year_norm, make_norm, model_norm)
-           SELECT trim(epid), 'MPSOV CSV', trim(_year), trim(make), trim(model), nullif(trim(submodel), '--'),
-            upper(regexp_replace(trim(_year), '[^A-Za-z0-9]', '', 'g')),
-            upper(regexp_replace(trim(make), '[^A-Za-z0-9]', '', 'g')),
-            upper(regexp_replace(trim(model), '[^A-Za-z0-9]', '', 'g'))
-           FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
-            quote = '"', escape = '"', strict_mode = true) WHERE trim(epid) != ''
-           ON CONFLICT DO NOTHING`,
+          `WITH source AS (
+             SELECT trim(epid) AS epid, trim(_year) AS year, trim(make) AS make_name,
+              trim(model) AS model_name, nullif(trim(submodel), '--') AS trim_name,
+              nullif(trim(vehicle_type), '') AS vehicle_type, nullif(trim(motorcycle_type), '') AS motorcycle_type,
+              upper(regexp_replace(trim(_year), '[^A-Za-z0-9]', '', 'g')) AS year_norm,
+              upper(regexp_replace(trim(make), '[^A-Za-z0-9]', '', 'g')) AS make_norm,
+              upper(regexp_replace(trim(model), '[^A-Za-z0-9]', '', 'g')) AS model_norm
+             FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
+              quote = '"', escape = '"', strict_mode = true)
+             WHERE trim(epid) != '' QUALIFY row_number() OVER (PARTITION BY trim(epid) ORDER BY trim(epid)) = 1
+           )
+           INSERT INTO partmaster_vehicle_master
+            (epid, year, make_name, model_name, trim_name, vehicle_type, motorcycle_type, year_norm, make_norm, model_norm)
+           SELECT source.epid, source.year, source.make_name, source.model_name, source.trim_name,
+            source.vehicle_type, source.motorcycle_type, source.year_norm, source.make_norm, source.model_norm
+           FROM source WHERE NOT EXISTS (
+             SELECT 1 FROM partmaster_vehicle_master target WHERE target.epid = source.epid
+           )`,
           { path: MPSOV_INBOX_PATH },
         );
         await connection.run(
-          `INSERT INTO partmaster_vehicle_source_aliases
-           (epid, source, year, make_name, model_name, trim_name, year_norm, make_norm, model_norm)
-           SELECT trim(epid), 'MPSOV Model+Submodel', trim(_year), trim(make), trim(model_submodel), nullif(trim(submodel), '--'),
-            upper(regexp_replace(trim(_year), '[^A-Za-z0-9]', '', 'g')),
-            upper(regexp_replace(trim(make), '[^A-Za-z0-9]', '', 'g')),
-            upper(regexp_replace(trim(model_submodel), '[^A-Za-z0-9]', '', 'g'))
-           FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
-            quote = '"', escape = '"', strict_mode = true)
-           WHERE trim(epid) != '' AND trim(model_submodel) != '' AND trim(model_submodel) != trim(model)
-           ON CONFLICT DO NOTHING`,
+          `WITH source AS (
+             SELECT DISTINCT trim(epid) AS epid, 'MPSOV CSV' AS source, trim(_year) AS year,
+              trim(make) AS make_name, trim(model) AS model_name, nullif(trim(submodel), '--') AS trim_name,
+              upper(regexp_replace(trim(_year), '[^A-Za-z0-9]', '', 'g')) AS year_norm,
+              upper(regexp_replace(trim(make), '[^A-Za-z0-9]', '', 'g')) AS make_norm,
+              upper(regexp_replace(trim(model), '[^A-Za-z0-9]', '', 'g')) AS model_norm
+             FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
+              quote = '"', escape = '"', strict_mode = true) WHERE trim(epid) != ''
+           )
+           INSERT INTO partmaster_vehicle_source_aliases
+            (epid, source, year, make_name, model_name, trim_name, year_norm, make_norm, model_norm)
+           SELECT source.epid, source.source, source.year, source.make_name, source.model_name, source.trim_name,
+            source.year_norm, source.make_norm, source.model_norm
+           FROM source WHERE NOT EXISTS (
+             SELECT 1 FROM partmaster_vehicle_source_aliases target
+             WHERE target.epid = source.epid AND target.source = source.source
+              AND coalesce(target.year, '') = coalesce(source.year, '')
+              AND coalesce(target.make_name, '') = coalesce(source.make_name, '')
+              AND coalesce(target.model_name, '') = coalesce(source.model_name, '')
+              AND coalesce(target.trim_name, '') = coalesce(source.trim_name, '')
+           )`,
+          { path: MPSOV_INBOX_PATH },
+        );
+        await connection.run(
+          `WITH source AS (
+             SELECT DISTINCT trim(epid) AS epid, 'MPSOV Model+Submodel' AS source, trim(_year) AS year,
+              trim(make) AS make_name, trim(model_submodel) AS model_name, nullif(trim(submodel), '--') AS trim_name,
+              upper(regexp_replace(trim(_year), '[^A-Za-z0-9]', '', 'g')) AS year_norm,
+              upper(regexp_replace(trim(make), '[^A-Za-z0-9]', '', 'g')) AS make_norm,
+              upper(regexp_replace(trim(model_submodel), '[^A-Za-z0-9]', '', 'g')) AS model_norm
+             FROM read_csv($path, header = true, all_varchar = true, normalize_names = true,
+              quote = '"', escape = '"', strict_mode = true)
+             WHERE trim(epid) != '' AND trim(model_submodel) != '' AND trim(model_submodel) != trim(model)
+           )
+           INSERT INTO partmaster_vehicle_source_aliases
+            (epid, source, year, make_name, model_name, trim_name, year_norm, make_norm, model_norm)
+           SELECT source.epid, source.source, source.year, source.make_name, source.model_name, source.trim_name,
+            source.year_norm, source.make_norm, source.model_norm
+           FROM source WHERE NOT EXISTS (
+             SELECT 1 FROM partmaster_vehicle_source_aliases target
+             WHERE target.epid = source.epid AND target.source = source.source
+              AND coalesce(target.year, '') = coalesce(source.year, '')
+              AND coalesce(target.make_name, '') = coalesce(source.make_name, '')
+              AND coalesce(target.model_name, '') = coalesce(source.model_name, '')
+              AND coalesce(target.trim_name, '') = coalesce(source.trim_name, '')
+           )`,
           { path: MPSOV_INBOX_PATH },
         );
       }
@@ -1304,8 +1403,56 @@ async function loadVehicleMappingReferences() {
        (SELECT count(*) FROM partmaster_vehicle_source_aliases) AS aliases`,
     );
     const counts = reader.getRowObjectsJson()[0];
-    return { loaded: true, vehicles: counts.vehicles, aliases: counts.aliases, mpsov: mpsovAvailable ? mpsovStats : null };
+    return {
+      loaded: true,
+      vehicles: counts.vehicles,
+      aliases: counts.aliases,
+      mpsov: mpsovAvailable ? mpsovStats : null,
+      validation,
+      mappingInputs: { wideCrosswalk: true, sourceAliases: true },
+    };
   });
+}
+
+async function readVehicleMappingValidation() {
+  try {
+    return JSON.parse(await readFile(VEHICLE_VALIDATION_PATH, "utf8"));
+  } catch {
+    return { status: "missing", errors: ["Vehicle mapping validation has not been run."] };
+  }
+}
+
+function extractVehicleMappingReferences() {
+  return new Promise((resolve, reject) => {
+    const child = spawn("python3", [
+      join(APP_ROOT, "scripts", "extract_vehicle_mapping.py"),
+      VEHICLE_MAPPING_WORKBOOK_PATH,
+      REFERENCE_ROOT,
+    ], { cwd: APP_ROOT, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) return resolve({ stdout: stdout.trim() });
+      const error = new Error(stderr.trim() || stdout.trim() || `Vehicle mapping extraction exited with code ${code}.`);
+      error.status = 422;
+      reject(error);
+    });
+  });
+}
+
+async function ensureVehicleMappingReferences() {
+  const [workbookStats, validationStats] = await Promise.all([
+    stat(VEHICLE_MAPPING_WORKBOOK_PATH),
+    stat(VEHICLE_VALIDATION_PATH).catch(() => null),
+  ]);
+  const validation = await readVehicleMappingValidation();
+  if (validationStats && validation.status === "passed" && validationStats.mtimeMs >= workbookStats.mtimeMs) {
+    return { refreshed: false, validation };
+  }
+  return { refreshed: true, ...(await extractVehicleMappingReferences()), validation: await readVehicleMappingValidation() };
 }
 
 async function vehicleMappingStats() {
@@ -1483,7 +1630,9 @@ async function fitmentDatasetContext(connection, datasetId) {
       manufacturer: firstColumnExpression(columns, ["brand", "make", "manufacturer"]),
       year: firstColumnExpression(columns, ["year"]),
       model: firstColumnExpression(columns, ["model", "model_name"]),
+      partType: firstColumnExpression(columns, ["part_type", "type", "category", "part_category", "assembly_category", "diagram_title"]),
       assembly: firstColumnExpression(columns, ["category", "part_category", "assembly_category", "diagram_title"]),
+      rawPrice: firstColumnExpression(columns, ["msrp", "price", "retail_price", "list_price", "unit_price"]),
       quantity: firstColumnExpression(columns, ["quantity", "qty", "quatity"]),
       sourceUrl: firstColumnExpression(columns, ["url", "source_url"]),
       epid: firstColumnExpression(columns, ["epid", "e_pid"]),
@@ -1508,9 +1657,11 @@ async function loadFitmentSourceRows(connection, items) {
     const reader = await connection.runAndReadAll(
       `SELECT _row_id AS source_row_id, ${context.fields.manufacturer} AS manufacturer_raw,
        ${context.fields.year} AS year, ${context.fields.model} AS model,
-       ${context.fields.assembly} AS assembly, ${context.fields.quantity} AS quantity,
-       ${context.fields.sourceUrl} AS source_url, ${context.fields.epid} AS epid
-       FROM ${quoteIdentifier(context.tableName)} WHERE _row_id IN (${ids})`,
+       ${context.fields.partType} AS part_type, ${context.fields.assembly} AS assembly,
+       ${context.fields.rawPrice} AS raw_price, ${context.fields.quantity} AS quantity,
+       ${context.fields.sourceUrl} AS source_url, ${context.fields.epid} AS epid,
+       to_json(source) AS raw_record_json
+       FROM ${quoteIdentifier(context.tableName)} AS source WHERE _row_id IN (${ids})`,
     );
     for (const row of reader.getRowObjectsJson()) rows.set(`${datasetId}:${row.source_row_id}`, row);
   }
@@ -1651,12 +1802,16 @@ async function processFitmentEnrichmentBatch(jobId) {
         await connection.run(
           `UPDATE partmaster_part_applications SET
            year = coalesce(nullif($year, ''), year), model = coalesce(nullif($model, ''), model),
-           assembly = coalesce(nullif($assembly, ''), assembly), quantity = coalesce(nullif($quantity, ''), quantity),
+           part_type = coalesce(nullif($partType, ''), part_type), assembly = coalesce(nullif($assembly, ''), assembly),
+           raw_price = coalesce(nullif($rawPrice, ''), raw_price), raw_record_json = coalesce(nullif($rawRecordJson, ''), raw_record_json),
+           quantity = coalesce(nullif($quantity, ''), quantity),
            source_url = coalesce(nullif($sourceUrl, ''), source_url), epid = coalesce(nullif($sourceEpid, ''), epid),
            updated_at = current_timestamp WHERE id = $applicationId`,
           {
             applicationId: item.application_id, year: String(year || ""), model: String(model || ""),
+            partType: String(source.part_type || item.part_type || ""),
             assembly: String(source.assembly || item.assembly || ""), quantity: String(source.quantity || item.quantity || ""),
+            rawPrice: String(source.raw_price || item.raw_price || ""), rawRecordJson: String(source.raw_record_json || item.raw_record_json || ""),
             sourceUrl: String(source.source_url || item.source_url || ""), sourceEpid: String(epid || ""),
           },
         );
@@ -2695,7 +2850,7 @@ async function ensurePartFamily(connection, candidate) {
   const familyKey = normalizeApplicationValue(familyName);
   const reader = await connection.runAndReadAll(
     `SELECT id FROM partmaster_part_families
-     WHERE manufacturer_norm = $manufacturer AND family_key = $familyKey`,
+     WHERE ${normalizedManufacturerSql("manufacturer_norm")} = $manufacturer AND family_key = $familyKey`,
     { manufacturer: candidate.manufacturer_norm, familyKey },
   );
   let familyId = reader.getRowObjectsJson()[0]?.id;
@@ -2816,7 +2971,7 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
   const { familyId } = await ensurePartFamily(connection, candidate);
   const existingReader = await connection.runAndReadAll(
     `SELECT id, confidence FROM partmaster_canonical_parts
-     WHERE manufacturer_norm = $manufacturer AND part_number_norm = $partNumber`,
+     WHERE ${normalizedManufacturerSql("manufacturer_norm")} = $manufacturer AND part_number_norm = $partNumber`,
     { manufacturer: candidate.manufacturer_norm, partNumber: partNumberNorm },
   );
   let partId = existingReader.getRowObjectsJson()[0]?.id;
@@ -2905,12 +3060,15 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
     vehicleMotorcycleType: candidate.vehicle_motorcycle_type || null,
     vehicleMappingMethod: candidate.vehicle_mapping_method || null,
     vehicleMappingConfidence: candidate.vehicle_mapping_confidence || null,
+    partType: candidate.part_type || candidate.assembly || null,
     assembly: candidate.assembly || null,
     itemNumber: candidate.item_number || null,
     side: candidate.side || "Unknown",
     position: candidate.position || null,
     locationNotes: candidate.location_notes || null,
     quantity: candidate.quantity || null,
+    rawPrice: candidate.raw_price || null,
+    rawRecordJson: candidate.raw_record_json || null,
     sourceUrl: candidate.source_url || null,
     evidenceUrl: candidate.evidence_url || null,
     requiredOptions: candidate.required_options || null,
@@ -2925,9 +3083,9 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
        vehicle_model = $vehicleModel, vehicle_trim = $vehicleTrim, vehicle_type = $vehicleType,
        vehicle_motorcycle_type = $vehicleMotorcycleType,
        vehicle_mapping_method = $vehicleMappingMethod, vehicle_mapping_confidence = $vehicleMappingConfidence,
-       assembly = $assembly, item_number = $itemNumber,
+       part_type = $partType, assembly = $assembly, item_number = $itemNumber,
        side = $side, position = $position, location_notes = $locationNotes, quantity = $quantity,
-       source_url = $sourceUrl, evidence_url = $evidenceUrl, required_options = $requiredOptions,
+       raw_price = $rawPrice, raw_record_json = $rawRecordJson, source_url = $sourceUrl, evidence_url = $evidenceUrl, required_options = $requiredOptions,
        excluded_options = $excludedOptions, fitment_explanation = $fitmentExplanation, confidence = $confidence,
        updated_at = current_timestamp WHERE id = $id`,
       {
@@ -2942,12 +3100,15 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
         vehicleMotorcycleType: applicationValues.vehicleMotorcycleType,
         vehicleMappingMethod: applicationValues.vehicleMappingMethod,
         vehicleMappingConfidence: applicationValues.vehicleMappingConfidence,
+        partType: applicationValues.partType,
         assembly: applicationValues.assembly,
         itemNumber: applicationValues.itemNumber,
         side: applicationValues.side,
         position: applicationValues.position,
         locationNotes: applicationValues.locationNotes,
         quantity: applicationValues.quantity,
+        rawPrice: applicationValues.rawPrice,
+        rawRecordJson: applicationValues.rawRecordJson,
         sourceUrl: applicationValues.sourceUrl,
         evidenceUrl: applicationValues.evidenceUrl,
         requiredOptions: applicationValues.requiredOptions,
@@ -2960,15 +3121,24 @@ async function promoteCandidate(connection, candidate, verificationStatus) {
     await connection.run(
       `INSERT INTO partmaster_part_applications
        (id, application_key, part_id, dataset_id, source_row_id, epid, year, model, vehicle_make, vehicle_model,
-        vehicle_trim, vehicle_type, vehicle_motorcycle_type, vehicle_mapping_method, vehicle_mapping_confidence, assembly, item_number, side, position,
-        location_notes, quantity, source_url, evidence_url, required_options, excluded_options, fitment_explanation, confidence)
+        vehicle_trim, vehicle_type, vehicle_motorcycle_type, vehicle_mapping_method, vehicle_mapping_confidence, part_type, assembly, item_number, side, position,
+        location_notes, quantity, raw_price, raw_record_json, source_url, evidence_url, required_options, excluded_options, fitment_explanation, confidence)
        VALUES ($id, $applicationKey, $partId, $datasetId, $sourceRowId, $epid, $year, $model, $vehicleMake, $vehicleModel,
-        $vehicleTrim, $vehicleType, $vehicleMotorcycleType, $vehicleMappingMethod, $vehicleMappingConfidence, $assembly, $itemNumber, $side,
-        $position, $locationNotes, $quantity, $sourceUrl, $evidenceUrl, $requiredOptions, $excludedOptions,
+        $vehicleTrim, $vehicleType, $vehicleMotorcycleType, $vehicleMappingMethod, $vehicleMappingConfidence, $partType, $assembly, $itemNumber, $side,
+        $position, $locationNotes, $quantity, $rawPrice, $rawRecordJson, $sourceUrl, $evidenceUrl, $requiredOptions, $excludedOptions,
         $fitmentExplanation, $confidence)`,
       applicationValues,
     );
   }
+  await connection.run(
+    `UPDATE partmaster_offline_parts AS offline SET application_count = (
+       SELECT count(*) FROM partmaster_part_applications applications
+       WHERE applications.part_id = $partId
+     )
+     WHERE ${normalizedManufacturerSql("offline.manufacturer_norm")} = $manufacturer
+       AND offline.part_number_norm = $partNumber`,
+    { partId, manufacturer: candidate.manufacturer_norm, partNumber: partNumberNorm },
+  );
   return partId;
 }
 
@@ -3060,11 +3230,256 @@ function offlineDatasetExpressions(columns) {
     model: firstColumnExpression(columns, ["model", "model_name"]),
     assembly: firstColumnExpression(columns, ["category", "part_category", "assembly_category", "diagram_title"]),
     itemNumber: firstColumnExpression(columns, ["pos", "item_number", "reference_number"]),
+    position: firstColumnExpression(columns, ["pos", "position"]),
+    referenceNumber: firstColumnExpression(columns, ["reference_number", "ref", "item_number"]),
     partNumber: firstColumnExpression(columns, ["part_number", "code", "oem_part_number"]),
     description: firstColumnExpression(columns, ["part_name", "description"]),
+    partType: firstColumnExpression(columns, ["part_type", "type", "category", "part_category", "assembly_category", "diagram_title"]),
+    rawPrice: firstColumnExpression(columns, ["msrp", "price", "retail_price", "list_price", "unit_price"]),
+    currency: firstColumnExpression(columns, ["currency", "currency_code"]),
     quantity: firstColumnExpression(columns, ["quantity", "qty", "quatity"]),
     sourceUrl: firstColumnExpression(columns, ["url", "source_url"]),
+    date: firstColumnExpression(columns, ["dt", "date", "updated_at"]),
+    jobId: firstColumnExpression(columns, ["jobid", "job_id"]),
+    fitmentNotes: firstColumnExpression(columns, ["fitment_notes", "fitment_note"]),
+    estimatedYearFitment: firstColumnExpression(columns, ["est_year_fitment", "estimated_year_fitment", "fitment_year"]),
+    supersedesPart: firstColumnExpression(columns, ["supersedes_part", "superseded_part", "replaces_part"]),
   };
+}
+
+function masterExtractTaxonomy(description, partType, assembly) {
+  const text = `lower(concat_ws(' ', coalesce(${description}, ''), coalesce(${partType}, ''), coalesce(${assembly}, '')))`.trim();
+  return `CASE
+    WHEN regexp_matches(${text}, '(^|[^a-z])(screw|bolt|nut|washer)([^a-z]|$)') THEN 'Hardware > Fasteners > Screws'
+    WHEN regexp_matches(${text}, '(^|[^a-z])clip([^a-z]|$)') THEN 'Hardware > Fasteners > Clips'
+    WHEN regexp_matches(${text}, 'grommet') THEN 'Hardware > Grommets'
+    WHEN regexp_matches(${text}, 'spacer|standoff') THEN 'Hardware > Spacers & Standoffs'
+    WHEN regexp_matches(${text}, 'bracket|mount') THEN 'Hardware > Brackets & Mounts'
+    WHEN regexp_matches(${text}, 'fuel gauge') THEN 'Gauges > Fuel Level Gauges'
+    WHEN regexp_matches(${text}, 'gauge|instrument') THEN 'Gauges > Gauge Housings'
+    ELSE nullif(trim(coalesce(${partType}, ${assembly})), '')
+  END`;
+}
+
+async function masterExtractQuery(connection) {
+  const datasetReader = await connection.runAndReadAll(
+    `SELECT * EXCLUDE (rank) FROM (
+       SELECT datasets.*, row_number() OVER (PARTITION BY source_file ORDER BY imported_at DESC) AS rank
+       FROM partmaster_datasets datasets
+     ) latest
+     WHERE rank = 1
+       AND NOT regexp_matches(lower(coalesce(source_file, '')), 'sample|mpsov|vehicle_mapping')
+     ORDER BY source_file`,
+  );
+  const datasets = datasetReader.getRowObjectsJson();
+  const selects = [];
+  for (const dataset of datasets) {
+    const columns = await getColumns(connection, dataset.table_name);
+    const fields = offlineDatasetExpressions(columns);
+    const description = fields.description;
+    const sourceUrl = fields.sourceUrl;
+    const fitmentNotes = `coalesce(nullif(trim(${fields.fitmentNotes}), ''), nullif(trim(regexp_replace(regexp_extract(coalesce(${description}, ''), '\\|\\s*(.*)$', 1), '(?i)not available', '', 'g')), ''))`;
+    const cleanedDescription = `nullif(trim(regexp_replace(regexp_extract(coalesce(${description}, ''), '^([^|]*)', 1), '(?i)not available', '', 'g')), '')`;
+    const rawPrice = fields.rawPrice;
+    const priceFloat = `try_cast(nullif(regexp_replace(coalesce(${rawPrice}, ''), '[^0-9.-]', '', 'g'), '') AS DOUBLE)`;
+    const currency = `coalesce(nullif(trim(${fields.currency}), ''), CASE WHEN ${priceFloat} IS NOT NULL OR strpos(coalesce(${rawPrice}, ''), '$') > 0 THEN 'USD' END)`;
+    const sourceGuids = `regexp_extract_all(coalesce(${sourceUrl}, ''), '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')`;
+    const specs = `nullif(regexp_extract(coalesce(${description}, ''), '[0-9]+/[0-9]+-[0-9]+\\s*[xX]\\s*[0-9]+(?:\\.[0-9]+)?', 0), '')`;
+    const availability = `CASE WHEN regexp_matches(lower(coalesce(${description}, '')), 'not available') THEN 'Not Available' WHEN ${priceFloat} IS NOT NULL THEN 'Available' END`;
+    const taxonomy = masterExtractTaxonomy(description, fields.partType, fields.assembly);
+    selects.push(`SELECT
+      ${fields.year} AS "Year", ${fields.manufacturer} AS "Make", ${fields.model} AS "Model",
+      ${fitmentNotes} AS "Fitment Notes", ${fields.estimatedYearFitment} AS "Est. Year Fitment",
+      ${fields.partNumber} AS "Part Number", ${fields.supersedesPart} AS "Supersedes Part",
+      ${cleanedDescription} AS "Cleaned Description", ${taxonomy} AS "Industry Taxonomy (ACES/PIES)",
+      ${specs} AS "Specs", ${availability} AS "Availability", ${priceFloat} AS "Price (Float)",
+      ${currency} AS "Currency", ${fields.position} AS "Pos", ${fields.referenceNumber} AS "Ref",
+      list_extract(${sourceGuids}, 1) AS "Assembly GUID", list_extract(${sourceGuids}, 2) AS "Diagram GUID",
+      regexp_extract(lower(coalesce(${sourceUrl}, '')), 'aribrand(?:%253d|%3d|=)([a-z0-9_-]+)', 1) AS "Brand Code",
+      ${fields.assembly} AS "Assembly Category", ${sourceUrl} AS "Source URL",
+      ${fields.date} AS "Source Date", ${fields.jobId} AS "Source Job ID",
+      ${quoteString(dataset.id)} AS "Dataset ID", ${quoteString(dataset.source_file)} AS "Source File", _row_id AS "Source Row ID",
+      to_json(source) AS "Raw Record JSON"
+      FROM ${quoteIdentifier(dataset.table_name)} source`);
+  }
+  if (!selects.length) return "SELECT NULL WHERE FALSE";
+  return selects.join(" UNION ALL ");
+}
+
+async function masterTemplateQuery(connection, template) {
+  const type = String(template || "raw_enriched");
+  const productWhere = "WHERE coalesce(record_type, 'product') = 'product'";
+  if (type === "part_number") return `SELECT manufacturer AS "Make", part_number AS "Part Number",
+    description AS "Description", part_type AS "Part Type", family_name AS "Part Family",
+    component_scope AS "Component Scope", side AS "Side", position AS "Position",
+    raw_price AS "Raw Price/MSRP", occurrence_count AS "Occurrences", dataset_count AS "Source Datasets",
+    best_source_url AS "Source URL", confidence AS "Confidence"
+    FROM partmaster_offline_parts ${productWhere} ORDER BY manufacturer_norm, part_number_norm`;
+  if (type === "category") return `SELECT parts.manufacturer AS "Make", parts.part_type AS "Part Type",
+    parts.family_name AS "Part Family", applications.assembly AS "Assembly Category",
+    parts.part_number AS "Part Number", parts.description AS "Description", applications.year AS "Year",
+    applications.model AS "Model", applications.item_number AS "Ref", applications.quantity AS "Quantity",
+    applications.source_url AS "Source URL"
+    FROM partmaster_part_applications applications
+    JOIN partmaster_canonical_parts canonical ON canonical.id = applications.part_id
+    JOIN partmaster_offline_parts parts ON parts.manufacturer_norm = canonical.manufacturer_norm
+      AND parts.part_number_norm = canonical.part_number_norm
+    WHERE canonical.verification_status != 'rejected'
+    ORDER BY parts.manufacturer_norm, parts.part_number_norm, applications.year, applications.model`;
+  if (type === "attribute") return `SELECT manufacturer AS "Make", part_number AS "Part Number",
+    description AS "Description", family_name AS "Part Family", attribute_name AS "Attribute",
+    attribute_value AS "Value", attribute_type AS "Value Type", source_method AS "Method",
+    evidence_url AS "Evidence URL", confidence AS "Confidence"
+    FROM (
+      SELECT parts.manufacturer, parts.part_number, parts.description, parts.family_name,
+        json_each.key AS attribute_name,
+        CASE WHEN json_type(json_each.value) = 'VARCHAR' THEN json_extract_string(json_each.value, '$') ELSE json_each.value::VARCHAR END AS attribute_value,
+        CASE WHEN json_type(json_each.value) = 'VARCHAR' THEN 'text' ELSE lower(json_type(json_each.value)) END AS attribute_type,
+        'raw_description' AS source_method, parts.best_source_url AS evidence_url, parts.confidence
+      FROM partmaster_offline_parts parts, json_each(CASE WHEN json_valid(parts.extracted_attributes_json) THEN parts.extracted_attributes_json ELSE '{}' END)
+      ${productWhere}
+      UNION ALL
+      SELECT parts.manufacturer, parts.part_number, parts.description, families.family_name,
+        attributes.attribute_name, attributes.attribute_value, 'text', attributes.source_method,
+        attributes.evidence_url, attributes.confidence
+      FROM partmaster_variant_attributes attributes
+      JOIN partmaster_canonical_parts parts ON parts.id = attributes.part_id
+      LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+      WHERE parts.verification_status != 'rejected'
+    ) attributes
+    WHERE nullif(trim(attribute_value), '') IS NOT NULL
+    ORDER BY "Make", "Part Number", "Attribute", "Value"`;
+  if (type === "fitment") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
+    parts.description AS "Description", applications.year AS "Year", applications.vehicle_make AS "Vehicle Make",
+    coalesce(applications.vehicle_model, applications.model) AS "Vehicle Model", applications.vehicle_trim AS "Vehicle Trim",
+    applications.vehicle_type AS "Vehicle Type", applications.vehicle_motorcycle_type AS "Motorcycle Type",
+    applications.epid AS "ePID", applications.assembly AS "Assembly Category", applications.item_number AS "Ref",
+    applications.side AS "Side", applications.position AS "Position", applications.quantity AS "Quantity",
+    applications.required_options AS "Required Options", applications.excluded_options AS "Excluded Options",
+    applications.vehicle_mapping_method AS "Mapping Method", applications.source_url AS "Source URL",
+    applications.evidence_url AS "Evidence URL"
+    FROM partmaster_part_applications applications
+    JOIN partmaster_canonical_parts canonical ON canonical.id = applications.part_id
+    JOIN partmaster_offline_parts parts ON parts.manufacturer_norm = canonical.manufacturer_norm
+      AND parts.part_number_norm = canonical.part_number_norm
+    WHERE canonical.verification_status != 'rejected'
+    ORDER BY parts.manufacturer_norm, parts.part_number_norm, applications.year, applications.vehicle_make, applications.vehicle_model`;
+  if (type === "vehicle_fitment") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
+    parts.description AS "Description", applications.year AS "Year", applications.vehicle_make AS "Vehicle Make",
+    coalesce(applications.vehicle_model, applications.model) AS "Vehicle Model", applications.vehicle_trim AS "Vehicle Trim",
+    applications.vehicle_type AS "Vehicle Type", applications.vehicle_motorcycle_type AS "Motorcycle Type",
+    applications.epid AS "ePID", applications.assembly AS "Assembly Category", applications.item_number AS "Ref",
+    applications.side AS "Side", applications.position AS "Position", applications.quantity AS "Quantity",
+    applications.required_options AS "Required Options", applications.excluded_options AS "Excluded Options",
+    applications.fitment_explanation AS "Fitment Notes", applications.vehicle_mapping_method AS "Mapping Method",
+    applications.vehicle_mapping_confidence AS "Mapping Confidence", applications.source_url AS "Source URL"
+    FROM partmaster_part_applications applications
+    JOIN partmaster_canonical_parts canonical ON canonical.id = applications.part_id
+    JOIN partmaster_offline_parts parts ON parts.manufacturer_norm = canonical.manufacturer_norm
+      AND parts.part_number_norm = canonical.part_number_norm
+    WHERE canonical.verification_status != 'rejected'
+    ORDER BY parts.manufacturer_norm, parts.part_number_norm, applications.year, applications.vehicle_make, applications.vehicle_model`;
+  if (type === "assembly_diagram") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
+    parts.description AS "Description", applications.year AS "Year", applications.model AS "Model",
+    applications.assembly AS "Assembly Category", applications.source_url AS "Source URL",
+    list_extract(regexp_extract_all(coalesce(applications.source_url, ''), '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'), 1) AS "Assembly GUID",
+    list_extract(regexp_extract_all(coalesce(applications.source_url, ''), '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'), 2) AS "Diagram GUID",
+    applications.item_number AS "Pos", applications.position AS "Position", applications.quantity AS "Quantity",
+    applications.side AS "Side", applications.raw_price AS "Raw Price/MSRP", applications.evidence_url AS "Evidence URL"
+    FROM partmaster_part_applications applications
+    JOIN partmaster_canonical_parts canonical ON canonical.id = applications.part_id
+    JOIN partmaster_offline_parts parts ON parts.manufacturer_norm = canonical.manufacturer_norm
+      AND parts.part_number_norm = canonical.part_number_norm
+    WHERE canonical.verification_status != 'rejected'
+    ORDER BY parts.manufacturer_norm, parts.part_number_norm, applications.year, applications.assembly, applications.item_number`;
+  if (type === "category_attribute") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
+    parts.description AS "Description", parts.part_type AS "Part Type", families.family_name AS "Part Family",
+    families.category AS "Category", attributes.attribute_name AS "Attribute", attributes.attribute_value AS "Value",
+    attributes.source_method AS "Method", attributes.confidence AS "Confidence", attributes.evidence_url AS "Evidence URL"
+    FROM partmaster_variant_attributes attributes
+    JOIN partmaster_canonical_parts parts ON parts.id = attributes.part_id
+    LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+    WHERE parts.verification_status != 'rejected'
+    ORDER BY parts.manufacturer_norm, parts.part_number_norm, attributes.attribute_name, attributes.attribute_value`;
+  if (type === "listing_ready") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
+    concat_ws(' - ', parts.manufacturer, nullif(trim(parts.part_number), ''), nullif(trim(parts.description), '')) AS "Listing Title",
+    parts.description AS "Cleaned Description", parts.part_type AS "Part Type", families.family_name AS "Part Family",
+    parts.component_scope AS "Component Scope", parts.side AS "Side", parts.position AS "Position",
+    parts.raw_price AS "Reference Price", parts.extracted_attributes_json AS "Specifications JSON",
+    string_agg(DISTINCT nullif(trim(concat_ws(' ', applications.year, applications.vehicle_make,
+      coalesce(applications.vehicle_model, applications.model), applications.vehicle_trim)), ''), '; ' ORDER BY nullif(trim(concat_ws(' ', applications.year, applications.vehicle_make,
+      coalesce(applications.vehicle_model, applications.model), applications.vehicle_trim)), '')) AS "Fitment Summary",
+    parts.best_source_url AS "Source URL", parts.confidence AS "Confidence"
+    FROM partmaster_offline_parts parts
+    LEFT JOIN partmaster_canonical_parts canonical ON canonical.manufacturer_norm = parts.manufacturer_norm
+      AND canonical.part_number_norm = parts.part_number_norm AND canonical.verification_status != 'rejected'
+    LEFT JOIN partmaster_part_families families ON families.id = canonical.family_id
+    LEFT JOIN partmaster_part_applications applications ON applications.part_id = canonical.id
+    ${productWhere}
+    GROUP BY parts.manufacturer_norm, parts.manufacturer, parts.part_number_norm, parts.part_number, parts.description,
+      parts.part_type, families.family_name, parts.component_scope, parts.side, parts.position,
+      parts.raw_price, parts.extracted_attributes_json, parts.best_source_url, parts.confidence
+    ORDER BY parts.manufacturer_norm, parts.part_number_norm`;
+  if (type === "supersession") return `SELECT source.manufacturer AS "Make", source.part_number AS "Part Number",
+    relationships.relationship_type AS "Relationship Type", target.part_number AS "Related Part Number",
+    relationships.conditions AS "Conditions", relationships.confidence AS "Confidence", relationships.evidence_url AS "Evidence URL"
+    FROM partmaster_part_relationships relationships
+    JOIN partmaster_canonical_parts source ON source.id = relationships.source_part_id
+    JOIN partmaster_canonical_parts target ON target.id = relationships.target_part_id
+    WHERE source.verification_status != 'rejected' AND target.verification_status != 'rejected'
+    UNION ALL
+    SELECT parts.manufacturer, parts.part_number, aliases.alias_type, aliases.alias_number,
+      'Verified alternate number', aliases.confidence, aliases.evidence_url
+    FROM partmaster_part_aliases aliases JOIN partmaster_canonical_parts parts ON parts.id = aliases.part_id
+    WHERE aliases.status = 'verified' AND parts.verification_status != 'rejected'
+    ORDER BY "Make", "Part Number", "Relationship Type", "Related Part Number"`;
+  if (type === "source_traceability") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
+    evidence.field_name AS "Field", evidence.field_value AS "Observed Value", evidence.source_url AS "Source URL",
+    evidence.source_title AS "Source Title", evidence.source_method AS "Method", evidence.confidence AS "Confidence",
+    evidence.accepted AS "Accepted", evidence.observed_at AS "Observed At"
+    FROM partmaster_field_evidence evidence JOIN partmaster_canonical_parts parts ON parts.id = evidence.part_id
+    WHERE parts.verification_status != 'rejected'
+    ORDER BY parts.manufacturer_norm, parts.part_number_norm, evidence.field_name, evidence.confidence DESC`;
+  if (type === "quality_review") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
+    parts.description AS "Description", parts.part_type AS "Part Type", parts.family_name AS "Part Family",
+    parts.attribute_status AS "Attribute Status", parts.online_status AS "Online Status", parts.confidence AS "Confidence",
+    CASE WHEN nullif(trim(parts.description), '') IS NULL THEN 'Missing description; ' ELSE '' END ||
+      CASE WHEN nullif(trim(parts.family_name), '') IS NULL OR parts.family_name = 'General Part' THEN 'Needs family classification; ' ELSE '' END ||
+      CASE WHEN coalesce(parts.extracted_attribute_count, 0) = 0 THEN 'Missing attributes; ' ELSE '' END ||
+      CASE WHEN parts.confidence < .8 OR parts.confidence IS NULL THEN 'Low confidence; ' ELSE '' END ||
+      coalesce(flags.review_flags, '') AS "Review Reasons", parts.best_source_url AS "Source URL"
+    FROM partmaster_offline_parts parts
+    LEFT JOIN LATERAL (SELECT string_agg(flag_code, ', ' ORDER BY flag_code) AS review_flags
+      FROM partmaster_master_review_flags WHERE part_key = parts.part_key AND status = 'open') flags ON true
+    ${productWhere} AND (nullif(trim(parts.description), '') IS NULL OR nullif(trim(parts.family_name), '') IS NULL
+      OR parts.family_name = 'General Part' OR coalesce(parts.extracted_attribute_count, 0) = 0
+      OR parts.confidence < .8 OR parts.confidence IS NULL OR flags.review_flags IS NOT NULL)
+    ORDER BY parts.confidence NULLS FIRST, parts.manufacturer_norm, parts.part_number_norm`;
+  if (type === "vehicle_summary") return `SELECT applications.year AS "Year", applications.vehicle_make AS "Vehicle Make",
+    coalesce(applications.vehicle_model, applications.model) AS "Vehicle Model", applications.vehicle_trim AS "Vehicle Trim",
+    applications.vehicle_type AS "Vehicle Type", applications.vehicle_motorcycle_type AS "Motorcycle Type",
+    count(DISTINCT applications.part_id) AS "Part Count", count(*) AS "Fitment Row Count",
+    count(DISTINCT applications.assembly) FILTER (WHERE nullif(trim(applications.assembly), '') IS NOT NULL) AS "Assembly Count",
+    count(*) FILTER (WHERE applications.vehicle_mapping_method IS NOT NULL) AS "Mapped Fitments"
+    FROM partmaster_part_applications applications
+    JOIN partmaster_canonical_parts parts ON parts.id = applications.part_id
+    WHERE parts.verification_status != 'rejected'
+    GROUP BY applications.year, applications.vehicle_make, coalesce(applications.vehicle_model, applications.model),
+      applications.vehicle_trim, applications.vehicle_type, applications.vehicle_motorcycle_type
+    ORDER BY "Year", "Vehicle Make", "Vehicle Model", "Vehicle Trim"`;
+  if (type === "manufacturer_specific") return `SELECT manufacturer AS "Make", part_number AS "Part Number",
+    description AS "Description", part_type AS "Part Type", family_name AS "Part Family", component_scope AS "Component Scope",
+    side AS "Side", position AS "Position", extracted_attributes_json AS "Specifications JSON",
+    raw_price AS "Raw Price/MSRP", occurrence_count AS "Occurrences", best_source_url AS "Source URL",
+    confidence AS "Confidence"
+    FROM partmaster_offline_parts ${productWhere} ORDER BY manufacturer_norm, part_number_norm`;
+  if (type === "raw") {
+    const raw = await masterExtractQuery(connection);
+    return `SELECT "Dataset ID", "Source File", "Source Row ID", "Source URL", "Raw Record JSON"
+      FROM (${raw}) raw_rows ORDER BY "Source File", "Source Row ID"`;
+  }
+  if (type === "raw_enriched") return masterExtractQuery(connection);
+  throw new Error(`Unknown export template: ${type}`);
 }
 
 async function ensurePipelineDatasets(importMissing) {
@@ -3105,9 +3520,10 @@ async function scanDatasetOffline(jobId, dataset) {
     const partNorm = "upper(regexp_replace(coalesce(part_number, ''), '[^A-Za-z0-9]', '', 'g'))";
     const sourceRows = `SELECT _row_id AS source_row_id, ${fields.manufacturer} AS manufacturer_raw,
       ${fields.partNumber} AS part_number, ${fields.description} AS description, ${fields.year} AS year,
-      ${fields.model} AS model, ${fields.assembly} AS assembly, ${fields.itemNumber} AS item_number,
-      ${fields.quantity} AS quantity, ${fields.sourceUrl} AS source_url
-      FROM ${quoteIdentifier(dataset.table_name)}`;
+      ${fields.model} AS model, ${fields.assembly} AS assembly, ${fields.partType} AS part_type, ${fields.itemNumber} AS item_number,
+      ${fields.rawPrice} AS raw_price, ${fields.quantity} AS quantity, ${fields.sourceUrl} AS source_url,
+      to_json(source) AS raw_record_json
+      FROM ${quoteIdentifier(dataset.table_name)} AS source`;
     const validCondition = `manufacturer_norm IN ('BMW','HONDA','KTM','KAWASAKI','SUZUKI','YAMAHA','HARLEYDAVIDSON')
       AND ${partNumberValidationSql("part_number_norm")}`;
     const countsReader = await connection.runAndReadAll(
@@ -3126,7 +3542,7 @@ async function scanDatasetOffline(jobId, dataset) {
       await connection.run(
         `INSERT INTO partmaster_offline_part_sources
          (part_key, dataset_id, source_row_id, manufacturer, manufacturer_norm, part_number, part_number_norm,
-          description, year, model, assembly, item_number, quantity, source_url, occurrence_count)
+          description, part_type, raw_price, raw_record_json, year, model, assembly, item_number, quantity, source_url, occurrence_count)
          WITH source_rows AS (${sourceRows} WHERE _row_id > $chunkStart AND _row_id <= $chunkEnd), normalized AS (
           SELECT *, ${manufacturerNorm} AS manufacturer_norm, ${partNorm} AS part_number_norm FROM source_rows
          ), valid AS (SELECT * FROM normalized WHERE ${validCondition})
@@ -3136,7 +3552,9 @@ async function scanDatasetOffline(jobId, dataset) {
             WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha' WHEN 'SUZUKI' THEN 'Suzuki'
             WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE arg_max(manufacturer_raw, length(coalesce(manufacturer_raw, ''))) END,
           manufacturer_norm, arg_max(part_number, length(coalesce(part_number, ''))), part_number_norm,
-          arg_max(description, length(coalesce(description, ''))), arg_max(year, length(coalesce(year, ''))),
+          arg_max(description, length(coalesce(description, ''))), arg_max(part_type, length(coalesce(part_type, ''))),
+          arg_max(raw_price, length(coalesce(raw_price, ''))), arg_min(raw_record_json, source_row_id),
+          arg_max(year, length(coalesce(year, ''))),
           arg_max(model, length(coalesce(model, ''))), arg_max(assembly, length(coalesce(assembly, ''))),
           arg_max(item_number, length(coalesce(item_number, ''))), arg_max(quantity, length(coalesce(quantity, ''))),
           arg_max(source_url, length(coalesce(source_url, ''))), count(*)
@@ -3190,14 +3608,16 @@ async function rebuildOfflineCatalog(jobId) {
     await connection.run(
       `INSERT INTO partmaster_offline_parts
        (part_key, manufacturer, manufacturer_norm, part_number, part_number_norm, description,
-        occurrence_count, dataset_count, application_count, source_page_count, best_source_url)
+        part_type, raw_price, occurrence_count, dataset_count, application_count, source_page_count, best_source_url)
        SELECT part_key, CASE manufacturer_norm
           WHEN 'HARLEYDAVIDSON' THEN 'Harley-Davidson' WHEN 'BMW' THEN 'BMW' WHEN 'KTM' THEN 'KTM'
           WHEN 'HONDA' THEN 'Honda' WHEN 'YAMAHA' THEN 'Yamaha' WHEN 'SUZUKI' THEN 'Suzuki'
           WHEN 'KAWASAKI' THEN 'Kawasaki' ELSE arg_max(manufacturer, length(coalesce(manufacturer, ''))) END, manufacturer_norm,
         arg_max(part_number, length(coalesce(part_number, ''))), part_number_norm,
-        arg_max(description, length(coalesce(description, ''))), sum(occurrence_count), count(*),
-        sum(occurrence_count), count(DISTINCT nullif(trim(source_url), '')),
+        arg_max(description, length(coalesce(description, ''))),
+        arg_max(part_type, length(coalesce(part_type, ''))), arg_max(raw_price, length(coalesce(raw_price, ''))),
+        sum(occurrence_count), count(*), 0,
+        count(DISTINCT nullif(trim(source_url), '')),
         arg_max(source_url, length(coalesce(source_url, '')))
        FROM partmaster_offline_part_sources GROUP BY part_key, manufacturer_norm, part_number_norm`,
     );
@@ -3245,7 +3665,7 @@ async function extractOfflineAttributes(jobId) {
       await connection.run("BEGIN TRANSACTION");
       try {
         for (const part of state) {
-          const candidate = { description_raw: part.local_description || part.description, assembly: "", part_number_raw: part.part_number, manufacturer_raw: part.manufacturer };
+          const candidate = { description_raw: part.local_description || part.description, assembly: part.part_type || "", part_number_raw: part.part_number, manufacturer_raw: part.manufacturer };
           const intelligence = inferVariantIntelligence(candidate);
           const attributes = inferCategoryAttributes({ ...candidate, family_name: intelligence.familyName }, candidate.description_raw);
           let existingAttributes = {};
@@ -3518,6 +3938,8 @@ async function createEnrichmentJob(options) {
     const itemNumber = firstColumnExpression(columns, ["pos", "item_number", "reference_number"]);
     const partNumber = firstColumnExpression(columns, ["part_number", "code", "oem_part_number"]);
     const description = firstColumnExpression(columns, ["part_name", "description"]);
+    const partType = firstColumnExpression(columns, ["part_type", "type", "category", "part_category", "assembly_category", "diagram_title"]);
+    const rawPrice = firstColumnExpression(columns, ["msrp", "price", "retail_price", "list_price", "unit_price"]);
     const quantity = firstColumnExpression(columns, ["quantity", "qty", "quatity"]);
     const sourceUrl = firstColumnExpression(columns, ["url", "source_url"]);
     const epid = firstColumnExpression(columns, ["epid", "e_pid"]);
@@ -3534,9 +3956,12 @@ async function createEnrichmentJob(options) {
           ${itemNumber} AS item_number,
           ${partNumber} AS part_number_raw,
           ${description} AS description_raw,
+          ${partType} AS part_type,
+          ${rawPrice} AS raw_price,
           ${quantity} AS quantity,
           ${sourceUrl} AS source_url,
-          ${epid} AS epid
+          ${epid} AS epid,
+          to_json(source) AS raw_record_json
         FROM ${quoteIdentifier(dataset.table_name)} source
         WHERE _row_id > $startRowId
           AND (${partNumber} IS NOT NULL OR ${description} IS NOT NULL)
@@ -3594,13 +4019,15 @@ async function createEnrichmentJob(options) {
         },
       );
       for (const candidate of candidates) {
-        const manufacturerNorm = normalizeManufacturer(candidate.manufacturer_raw);
+    const manufacturerNorm = normalizePartNumber(normalizeManufacturer(candidate.manufacturer_raw));
         await connection.run(
           `INSERT INTO partmaster_enrichment_candidates
            (id, job_id, dataset_id, source_row_id, manufacturer_raw, manufacturer_norm, year, model,
-            assembly, item_number, part_number_raw, part_number_norm, description_raw, quantity, source_url, epid)
+            assembly, item_number, part_number_raw, part_number_norm, description_raw, part_type, raw_price,
+            raw_record_json, quantity, source_url, epid)
            VALUES ($id, $jobId, $datasetId, $sourceRowId, $manufacturerRaw, $manufacturerNorm, $year, $model,
-            $assembly, $itemNumber, $partNumberRaw, $partNumberNorm, $descriptionRaw, $quantity, $sourceUrl, $epid)`,
+            $assembly, $itemNumber, $partNumberRaw, $partNumberNorm, $descriptionRaw, $partType, $rawPrice,
+            $rawRecordJson, $quantity, $sourceUrl, $epid)`,
           {
             id: randomUUID(),
             jobId,
@@ -3615,6 +4042,9 @@ async function createEnrichmentJob(options) {
             partNumberRaw: candidate.part_number_raw || null,
             partNumberNorm: normalizePartNumber(candidate.part_number_raw) || null,
             descriptionRaw: candidate.description_raw || null,
+            partType: candidate.part_type || null,
+            rawPrice: candidate.raw_price || null,
+            rawRecordJson: candidate.raw_record_json || null,
             quantity: candidate.quantity || null,
             sourceUrl: candidate.source_url || null,
             epid: candidate.epid || null,
@@ -4843,8 +5273,9 @@ app.use(express.json({ limit: "1mb" }));
 
 app.get("/api/local/vehicle-mappings", asyncRoute(async (_request, response) => {
   const stats = await vehicleMappingStats();
+  const validation = await readVehicleMappingValidation();
   response.json({
-    available: Number(stats.vehicles) > 0,
+    available: Number(stats.vehicles) > 0 && validation.status === "passed",
     vehicles: stats.vehicles,
     mappedVehicles: stats.mapped_vehicles,
     aliases: stats.aliases,
@@ -4853,7 +5284,29 @@ app.get("/api/local/vehicle-mappings", asyncRoute(async (_request, response) => 
     mpsov_enriched_candidates: stats.mpsov_enriched_candidates,
     loadedAt: stats.loaded_at,
     referenceRoot: REFERENCE_ROOT,
+    workbookPath: VEHICLE_MAPPING_WORKBOOK_PATH,
+    validation,
+    mappingInputs: { wideCrosswalk: true, sourceAliases: true },
   });
+}));
+
+app.post("/api/local/vehicle-mappings/validate", asyncRoute(async (_request, response) => {
+  await stat(VEHICLE_MAPPING_WORKBOOK_PATH);
+  await extractVehicleMappingReferences();
+  const validation = await readVehicleMappingValidation();
+  if (validation.status !== "passed") {
+    return response.status(422).json({
+      available: false,
+      validation,
+      error: "Vehicle Mapping ePID.xlsx failed validation. The existing loaded mapping was left unchanged.",
+    });
+  }
+  vehicleLookupCache.clear();
+  const loaded = await loadVehicleMappingReferences();
+  const backfill = loaded.loaded
+    ? await backfillApplicationVehicleMappings()
+    : { backfilled: 0, reason: loaded.reason };
+  response.json({ ...loaded, available: Number(loaded.vehicles) > 0, backfill, validation, mappingInputs: { wideCrosswalk: true, sourceAliases: true } });
 }));
 
 app.post("/api/local/open-folder", (_request, response) => {
@@ -5175,7 +5628,7 @@ app.get("/api/local/pipeline/catalog", asyncRoute(async (request, response) => {
     const values = {};
     let condition = "";
     if (query) {
-      condition = "WHERE lower(concat_ws(' ', manufacturer, part_number, description, family_name, extracted_attributes_json)) LIKE $query";
+      condition = "WHERE lower(concat_ws(' ', manufacturer, part_number, description, family_name, part_type, raw_price, extracted_attributes_json)) LIKE $query";
       values.query = `%${query}%`;
     }
     const rowsReader = await connection.runAndReadAll(
@@ -5480,7 +5933,7 @@ app.get("/api/local/master/quick-view/:kind", asyncRoute(async (request, respons
     if (kind === "parts") sql = `SELECT part_key, manufacturer, part_number, description, family_name AS family_name, component_scope, extracted_attributes_json AS attributes, occurrence_count, online_status, confidence FROM partmaster_offline_parts WHERE NOT regexp_matches(part_number, '^(19|20)[0-9]{2}[- ](19|20)[0-9]{2}$') AND ($query = '' OR lower(concat_ws(' ', manufacturer, part_number, description, family_name, extracted_attributes_json)) LIKE $like) ORDER BY occurrence_count DESC LIMIT 50`;
     else if (kind === "fitments") sql = `SELECT concat_ws(':', parts.manufacturer_norm, parts.part_number_norm) AS part_key, parts.manufacturer, parts.part_number, applications.year AS year_from, applications.year AS year_to, applications.vehicle_make AS make, coalesce(applications.vehicle_model, applications.model) AS model, applications.vehicle_trim AS trim, applications.vehicle_type, applications.vehicle_motorcycle_type AS motorcycle_type, applications.epid, applications.assembly, applications.position, applications.side, applications.vehicle_mapping_method AS mapping_method, applications.vehicle_mapping_confidence AS mapping_confidence, applications.source_url, applications.dataset_id, applications.source_row_id, CASE WHEN applications.vehicle_mapping_method IS NULL OR trim(coalesce(applications.vehicle_make, '')) = '' THEN 'unmapped' ELSE 'mapped' END AS mapping_status FROM partmaster_part_applications applications JOIN partmaster_canonical_parts parts ON parts.id = applications.part_id WHERE NOT regexp_matches(parts.part_number, '^(19|20)[0-9]{2}[- ](19|20)[0-9]{2}$') AND ($query = '' OR lower(concat_ws(' ', parts.manufacturer, parts.part_number, applications.year, applications.vehicle_make, applications.vehicle_model, applications.model, applications.vehicle_type, applications.vehicle_motorcycle_type, applications.assembly)) LIKE $like) ORDER BY parts.manufacturer_norm, parts.part_number_norm LIMIT 50`;
     else if (kind === "attributes") sql = `SELECT concat_ws(':', parts.manufacturer_norm, parts.part_number_norm) AS part_key, parts.manufacturer, parts.part_number, attributes.attribute_name, attributes.attribute_value, CASE WHEN regexp_matches(attributes.attribute_value, '^[0-9]+(\\.[0-9]+)?$') THEN 'number' ELSE 'text' END AS attribute_type, CASE WHEN attributes.attribute_name LIKE '%quantity%' THEN 'each' ELSE NULL END AS attribute_unit, attributes.source_method, attributes.evidence_url AS source_url, attributes.confidence FROM partmaster_variant_attributes attributes JOIN partmaster_canonical_parts parts ON parts.id = attributes.part_id WHERE NOT regexp_matches(parts.part_number, '^(19|20)[0-9]{2}[- ](19|20)[0-9]{2}$') AND ($query = '' OR lower(concat_ws(' ', parts.manufacturer, parts.part_number, attributes.attribute_name, attributes.attribute_value)) LIKE $like) ORDER BY parts.manufacturer_norm, parts.part_number_norm, attributes.attribute_name LIMIT 50`;
-    else if (kind === "sources") sql = `SELECT sources.manufacturer, sources.part_number, sources.source_url, sources.dataset_id, sources.source_row_id, sources.occurrence_count FROM partmaster_offline_part_sources sources WHERE $query = '' OR lower(concat_ws(' ', sources.manufacturer, sources.part_number, sources.source_url)) LIKE $like ORDER BY sources.occurrence_count DESC LIMIT 50`;
+    else if (kind === "sources") sql = `SELECT sources.manufacturer, sources.part_number, sources.part_type, sources.raw_price, sources.description, sources.source_url, sources.raw_record_json, sources.dataset_id, sources.source_row_id, sources.occurrence_count FROM partmaster_offline_part_sources sources WHERE $query = '' OR lower(concat_ws(' ', sources.manufacturer, sources.part_number, sources.part_type, sources.raw_price, sources.description, sources.source_url, sources.raw_record_json)) LIKE $like ORDER BY sources.occurrence_count DESC LIMIT 50`;
     else throw new Error("Unknown master quick-view table.");
     const reader = await connection.runAndReadAll(sql, { query, like });
     return reader.getRowObjectsJson();
@@ -5489,6 +5942,7 @@ app.get("/api/local/master/quick-view/:kind", asyncRoute(async (request, respons
 }));
 
 app.post("/api/local/master-catalog/revalidate", asyncRoute(async (_request, response) => {
+  const vehicleMappingValidation = await readVehicleMappingValidation();
   const result = await withConnection(async (connection) => {
     const invalidWhere = `NOT (${partNumberValidationSql("part_number_norm")})`;
     const reasonReader = await connection.runAndReadAll(
@@ -5586,7 +6040,7 @@ app.post("/api/local/master-catalog/revalidate", asyncRoute(async (_request, res
       sample: sampleReader.getRowObjectsJson(),
     };
   });
-  response.json(result);
+  response.json({ ...result, vehicle_mapping_validation: vehicleMappingValidation });
 }));
 
 app.post("/api/local/pipeline/exports", asyncRoute(async (_request, response) => {
@@ -5604,7 +6058,8 @@ app.post("/api/local/pipeline/exports", asyncRoute(async (_request, response) =>
     const pagesPath = join(EXPORT_ROOT, pagesFilename);
     await connection.run(
       `COPY (SELECT manufacturer AS "Manufacturer", part_number AS "OEM Part Number",
-       description AS "Description", family_name AS "Part Family", component_scope AS "Component Scope",
+       description AS "Description", part_type AS "Part Type", raw_price AS "Raw Price/MSRP",
+       family_name AS "Part Family", component_scope AS "Component Scope",
        side AS "Side", position AS "Position", ${attributeColumns},
        occurrence_count AS "Raw Occurrences", dataset_count AS "Source Datasets",
        application_count AS "Applications", source_page_count AS "Source Pages",
@@ -5616,9 +6071,10 @@ app.post("/api/local/pipeline/exports", asyncRoute(async (_request, response) =>
        TO ${quoteString(catalogPath)} (FORMAT CSV, HEADER true)`,
     );
     await connection.run(
-      `COPY (SELECT sources.manufacturer AS "Manufacturer", sources.part_number AS "OEM Part Number",
+       `COPY (SELECT sources.manufacturer AS "Manufacturer", sources.part_number AS "OEM Part Number",
        datasets.name AS "Dataset", datasets.source_file AS "Source File", sources.source_row_id AS "Representative Row",
-       sources.description AS "Source Description", sources.year AS "Year", sources.model AS "Model",
+       sources.description AS "Source Description", sources.part_type AS "Part Type", sources.raw_price AS "Raw Price/MSRP",
+       sources.raw_record_json AS "Raw Record JSON", sources.year AS "Year", sources.model AS "Model",
        sources.assembly AS "Assembly", sources.item_number AS "Item Number", sources.quantity AS "Quantity",
        sources.occurrence_count AS "Occurrences", sources.source_url AS "Source URL", sources.part_key AS "Global Part Key"
        FROM partmaster_offline_part_sources sources
@@ -6754,10 +7210,33 @@ app.get("/api/local/master/quality", asyncRoute(async (_request, response) => {
   response.json({ quality });
 }));
 
+app.post("/api/local/master/templates/:template/preview", asyncRoute(async (request, response) => {
+  const template = String(request.params.template || "raw_enriched");
+  const result = await withConnection(async (connection) => {
+    const query = await masterTemplateQuery(connection, template);
+    const reader = await connection.runAndReadAll(`SELECT * FROM (${query}) template LIMIT 10`);
+    const rows = reader.getRowObjectsJson();
+    return { columns: rows.length ? Object.keys(rows[0]) : [], rows };
+  });
+  response.json({ template, ...result });
+}));
+
+app.post("/api/local/master/templates/:template/export", asyncRoute(async (request, response) => {
+  const template = String(request.params.template || "raw_enriched");
+  const filename = `master-template-${template}-${Date.now()}.csv`;
+  const path = join(EXPORT_ROOT, filename);
+  await withConnection(async (connection) => {
+    const query = await masterTemplateQuery(connection, template);
+    await connection.run(`COPY (${query}) TO ${quoteString(path)} (FORMAT CSV, HEADER true)`);
+  });
+  response.json({ template, exports: [{ filename, downloadUrl: `/api/local/exports/${encodeURIComponent(filename)}` }] });
+}));
+
 app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
   const exports = await withConnection(async (connection) => {
     const stamp = Date.now();
     const catalogFilename = `master-catalog-all-${stamp}.csv`;
+    const masterExtractFilename = `master-extract-all-${stamp}.csv`;
     const partsFilename = `parts-master-${stamp}.csv`;
     const applicationsFilename = `part-applications-${stamp}.csv`;
     const relationshipsFilename = `part-relationships-${stamp}.csv`;
@@ -6770,6 +7249,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     const autopilotJobsFilename = `autopilot-runs-${stamp}.csv`;
     const autopilotItemsFilename = `autopilot-outcomes-${stamp}.csv`;
     const catalogPath = join(EXPORT_ROOT, catalogFilename);
+    const masterExtractPath = join(EXPORT_ROOT, masterExtractFilename);
     const partsPath = join(EXPORT_ROOT, partsFilename);
     const applicationsPath = join(EXPORT_ROOT, applicationsFilename);
     const relationshipsPath = join(EXPORT_ROOT, relationshipsFilename);
@@ -6785,8 +7265,11 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
       `COPY (${catalogExportQuery()}) TO ${quoteString(catalogPath)} (FORMAT CSV, HEADER true)`,
     );
     await connection.run(
-      `COPY (SELECT parts.manufacturer AS "Manufacturer", families.family_name AS "Part Family",
-       parts.part_number AS "OEM Part Number", parts.description AS "Description",
+      `COPY (${await masterExtractQuery(connection)}) TO ${quoteString(masterExtractPath)} (FORMAT CSV, HEADER true)`,
+    );
+    await connection.run(
+      `COPY (SELECT parts.manufacturer AS "Manufacturer", coalesce(families.category, offline.part_type) AS "Part Type", families.family_name AS "Part Family",
+       parts.part_number AS "OEM Part Number", parts.description AS "Description", offline.raw_price AS "Raw Price/MSRP",
        parts.component_scope AS "Component Scope", parts.variant_summary AS "Variant Summary",
        max(CASE WHEN attributes.attribute_name = 'side' THEN attributes.attribute_value END) AS "Side",
        max(CASE WHEN attributes.attribute_name = 'heated' THEN attributes.attribute_value END) AS "Heated",
@@ -6801,9 +7284,10 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
        parts.evidence_url AS "Evidence URL", parts.verified_at AS "Verified At"
        FROM partmaster_canonical_parts parts
        LEFT JOIN partmaster_part_families families ON families.id = parts.family_id
+       LEFT JOIN partmaster_offline_parts offline ON ${normalizedManufacturerSql("offline.manufacturer_norm")} = ${normalizedManufacturerSql("parts.manufacturer_norm")} AND offline.part_number_norm = parts.part_number_norm
        LEFT JOIN partmaster_variant_attributes attributes ON attributes.part_id = parts.id
        GROUP BY parts.id, parts.manufacturer, families.family_name, parts.part_number, parts.description,
-        parts.component_scope, parts.variant_summary, parts.verification_status, parts.confidence,
+        families.category, offline.raw_price, parts.component_scope, parts.variant_summary, parts.verification_status, parts.confidence,
         parts.evidence_url, parts.verified_at, parts.manufacturer_norm, parts.part_number_norm
        ORDER BY parts.manufacturer_norm, parts.part_number_norm)
        TO ${quoteString(partsPath)} (FORMAT CSV, HEADER true)`,
@@ -6821,8 +7305,9 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
        applications.vehicle_motorcycle_type AS "Motorcycle Type",
        applications.vehicle_mapping_method AS "Vehicle Mapping Method",
        applications.vehicle_mapping_confidence AS "Vehicle Mapping Confidence",
-       applications.assembly AS "Assembly",
-       applications.quantity AS "Quantity", applications.source_url AS "Source URL",
+       applications.part_type AS "Part Type", applications.assembly AS "Assembly",
+       applications.quantity AS "Quantity", applications.raw_price AS "Raw Price/MSRP",
+       applications.raw_record_json AS "Raw Record JSON", applications.source_url AS "Source URL",
        applications.required_options AS "Required Options", applications.excluded_options AS "Excluded Options",
        applications.fitment_explanation AS "Why It Fits", applications.evidence_url AS "Evidence URL",
        applications.confidence AS "Confidence",
@@ -6945,6 +7430,7 @@ app.post("/api/local/master/exports", asyncRoute(async (_request, response) => {
     );
     return [
       { filename: catalogFilename, path: catalogPath, bytes: (await stat(catalogPath)).size },
+      { filename: masterExtractFilename, path: masterExtractPath, bytes: (await stat(masterExtractPath)).size },
       { filename: partsFilename, path: partsPath, bytes: (await stat(partsPath)).size },
       { filename: applicationsFilename, path: applicationsPath, bytes: (await stat(applicationsPath)).size },
       { filename: relationshipsFilename, path: relationshipsPath, bytes: (await stat(relationshipsPath)).size },
@@ -6966,7 +7452,15 @@ app.use((error, _request, response, _next) => {
   response.status(error.status || 500).json({ error: friendlyDataError(error) });
 });
 
-const vehicleMappingLoadResult = await loadVehicleMappingReferences().catch((error) => ({ loaded: false, reason: error.message }));
+const vehicleMappingExtractionResult = SKIP_VEHICLE_MAPPING_STARTUP
+  ? { skipped: true }
+  : await ensureVehicleMappingReferences().catch((error) => ({ error }));
+const vehicleMappingLoadResult = SKIP_VEHICLE_MAPPING_STARTUP
+  ? { loaded: false, reason: "Vehicle mapping reload disabled during safe database startup; existing reference rows were preserved." }
+  : await loadVehicleMappingReferences().catch((error) => ({ loaded: false, reason: error.message }));
+if (vehicleMappingExtractionResult.error && !vehicleMappingLoadResult.loaded) {
+  vehicleMappingLoadResult.reason = vehicleMappingExtractionResult.error.message;
+}
 const vehicleMappingBackfillResult = STARTUP_BACKFILL && vehicleMappingLoadResult.loaded
   ? await backfillApplicationVehicleMappings().catch((error) => ({ backfilled: 0, reason: error.message }))
   : { backfilled: 0 };

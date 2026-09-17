@@ -1,11 +1,12 @@
 import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { catalogPart, catalogQuery } from "../server/masterCatalog.js";
 import { basename, dirname, join } from "node:path";
 
 // Publish only the finished, consumer-safe catalog. Raw files, evidence cache,
 // jobs, and the DuckDB database stay local and are never copied to public/.
-const databasePath = process.env.PARTMASTER_DATABASE_PATH || "local_data/partmaster.duckdb";
+const databasePath = process.env.PARTMASTER_DATABASE_PATH || (existsSync("local_data/partmaster.rebuilt.duckdb") ? "local_data/partmaster.rebuilt.duckdb" : "local_data/partmaster.duckdb");
 const outputPath = process.env.PARTMASTER_MASTER_OUTPUT || "public/data/master-catalog.json";
 const driveOutputDirectory = process.env.PARTMASTER_DRIVE_MASTERDATA_DIR || "";
 const publicDataDirectory = dirname(outputPath);

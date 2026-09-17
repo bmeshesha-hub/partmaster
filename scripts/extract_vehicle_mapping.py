@@ -2,6 +2,7 @@
 """Extract Partmaster vehicle reference CSVs from Vehicle Mapping ePID.xlsx."""
 
 import csv
+import json
 import re
 import sys
 import zipfile
@@ -72,21 +73,59 @@ def main():
     output_directory.mkdir(parents=True, exist_ok=True)
 
     archive, read_rows = workbook_reader(input_path)
+    validation_path = output_directory / "vehicle_mapping_validation.json"
+    validation = {
+        "status": "failed",
+        "source_workbook": str(input_path),
+        "worksheets": ["epid to VCDB ARI NADA", "epid to MPSOV Source"],
+        "master_rows": 0,
+        "unique_epids": 0,
+        "source_rows": 0,
+        "unique_source_aliases": 0,
+        "aliases_by_source": {},
+        "canonical_source_rows": 0,
+        "canonical_source_rows_missing_from_alias_tab": 0,
+        "supplemental_source_aliases": 0,
+        "alias_rows_missing_master": 0,
+        "alias_rows_with_invalid_source": 0,
+        "alias_rows_missing_vehicle_fields": 0,
+        "master_conflicts": 0,
+        "errors": [],
+    }
     try:
         master_by_epid = {}
         wide_rows = read_rows("epid to VCDB ARI NADA")
         next(wide_rows, None)
         next(wide_rows, None)
         for row in wide_rows:
-            padded = row + [""] * (6 - len(row))
+            padded = row + [""] * (16 - len(row))
             epid = padded[0]
             if not epid:
                 continue
             vehicle = tuple(padded[1:6])
             existing = master_by_epid.get(epid)
             if existing is not None and existing != vehicle:
-                raise ValueError(f"ePID {epid} maps to more than one MPSOV vehicle.")
+                validation["master_conflicts"] += 1
+                validation["errors"].append(f"ePID {epid} maps to more than one MPSOV vehicle.")
             master_by_epid[epid] = vehicle
+
+        canonical_aliases = set()
+        # The wide tab is the canonical crosswalk. Its three source blocks
+        # must be represented in the row-wise alias tab when populated.
+        # Re-read the wide tab once to retain each source block for validation
+        # without changing the compact CSV output format.
+        wide_rows = read_rows("epid to VCDB ARI NADA")
+        next(wide_rows, None)
+        next(wide_rows, None)
+        for row in wide_rows:
+            padded = row + [""] * (16 - len(row))
+            epid = padded[0]
+            if not epid:
+                continue
+            for source, indexes in (("VCDB", (6, 7, 8, None)), ("ARI", (9, 10, 11, None)), ("NADA", (12, 13, 14, 15))):
+                values = [padded[index] if index is not None else "" for index in indexes]
+                if all(values[:3]):
+                    canonical_aliases.add((epid, source, *values))
 
         aliases = set()
         source_rows = read_rows("epid to MPSOV Source")
@@ -94,10 +133,48 @@ def main():
         next(source_rows, None)
         for row in source_rows:
             padded = row + [""] * (11 - len(row))
+            if not any(padded):
+                continue
+            validation["source_rows"] += 1
             if padded[0] and padded[6]:
                 aliases.add((padded[0], padded[6], padded[7], padded[8], padded[9], padded[10]))
+            if padded[6] and padded[6] not in {"VCDB", "ARI", "NADA"}:
+                validation["alias_rows_with_invalid_source"] += 1
+            if padded[0] and padded[0] not in master_by_epid:
+                validation["alias_rows_missing_master"] += 1
+            if padded[0] and padded[6] and not all(padded[index] for index in (7, 8, 9)):
+                validation["alias_rows_missing_vehicle_fields"] += 1
     finally:
         archive.close()
+
+    aliases_by_source = {}
+    for alias in aliases:
+        aliases_by_source[alias[1]] = aliases_by_source.get(alias[1], 0) + 1
+    missing_canonical_aliases = canonical_aliases - aliases
+    supplemental_aliases = aliases - canonical_aliases
+    validation.update({
+        "master_rows": len(master_by_epid),
+        "unique_epids": len(master_by_epid),
+        "unique_source_aliases": len(aliases),
+        "aliases_by_source": dict(sorted(aliases_by_source.items())),
+        "canonical_source_rows": len(canonical_aliases),
+        "canonical_source_rows_missing_from_alias_tab": len(missing_canonical_aliases),
+        "supplemental_source_aliases": len(supplemental_aliases),
+    })
+    if validation["master_conflicts"]:
+        validation["errors"].append("The wide crosswalk contains conflicting canonical vehicle values.")
+    if validation["alias_rows_missing_master"]:
+        validation["errors"].append("The source alias tab contains ePIDs that do not exist in the wide crosswalk.")
+    if validation["alias_rows_with_invalid_source"]:
+        validation["errors"].append("The source alias tab contains a source outside VCDB, ARI, or NADA.")
+    if validation["alias_rows_missing_vehicle_fields"]:
+        validation["errors"].append("The source alias tab contains rows missing year, make, or model.")
+    if validation["canonical_source_rows_missing_from_alias_tab"]:
+        validation["errors"].append("The source alias tab is missing a populated source mapping from the wide crosswalk.")
+    validation["status"] = "passed" if not validation["errors"] else "failed"
+    validation_path.write_text(json.dumps(validation, indent=2) + "\n", encoding="utf-8")
+    if validation["status"] != "passed":
+        raise ValueError("Vehicle mapping validation failed: " + " ".join(validation["errors"]))
 
     master_path = output_directory / "vehicle_master.csv"
     aliases_path = output_directory / "vehicle_source_aliases.csv"
@@ -114,6 +191,7 @@ def main():
 
     print(f"Vehicle master: {len(master_by_epid):,} rows -> {master_path}")
     print(f"Source aliases: {len(aliases):,} rows -> {aliases_path}")
+    print(f"Validation: {validation['status']} -> {validation_path}")
 
 
 if __name__ == "__main__":

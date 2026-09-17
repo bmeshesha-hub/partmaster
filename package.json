@@ -10,6 +10,7 @@
     "vehicle:mapping:extract": "python3 scripts/extract_vehicle_mapping.py",
     "build": "vite build",
     "publish:master": "node scripts/publish-master-data.mjs",
+    "publish:portal": "node scripts/publish-portal.mjs",
     "split:master-snapshot": "node scripts/split-master-snapshot.mjs",
     "preview": "vite preview",
     "lint": "eslint ."

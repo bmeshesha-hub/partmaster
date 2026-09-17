@@ -113,6 +113,16 @@ DuckDB, source-page cache, jobs, and evidence-review internals remain in
 paging, fitments, specifications, aliases, and relationships; enrichment,
 revalidation, and CSV exports remain local-only.
 
+After enrichment and review are complete, the one-command portal update is:
+
+```bash
+npm run publish:portal
+```
+
+It publishes the catalog, commits only the GitHub Pages snapshot chunks, and
+pushes them to the `public-backup` remote. It stops without committing or
+pushing if the local database cannot be opened.
+
 ### Google Drive snapshots
 
 Google Drive can be used as the shared archive for approved exports without

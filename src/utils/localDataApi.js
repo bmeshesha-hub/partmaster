@@ -15,6 +15,7 @@ export const localDataApi = {
   files: () => request("/files"),
   datasets: () => request("/datasets"),
   vehicleMappings: () => request("/vehicle-mappings"),
+  validateVehicleMappings: () => request("/vehicle-mappings/validate", { method: "POST", body: "{}" }),
   openFolder: () => request("/open-folder", { method: "POST", body: "{}" }),
   startImport: (filename, name) => request("/imports", { method: "POST", body: JSON.stringify({ filename, name }) }),
   importJob: (jobId) => request(`/imports/${encodeURIComponent(jobId)}`),
@@ -49,6 +50,8 @@ export const localDataApi = {
     return request(`/master-catalog?${query}`);
   },
   exportMasterCatalog: (parameters = {}) => request("/master-catalog/export", { method: "POST", body: JSON.stringify(parameters) }),
+  masterTemplatePreview: (template) => request(`/master/templates/${encodeURIComponent(template)}/preview`, { method: "POST", body: "{}" }),
+  exportMasterTemplate: (template) => request(`/master/templates/${encodeURIComponent(template)}/export`, { method: "POST", body: "{}" }),
   exportFpa: () => request("/master/fpa-export", { method: "POST", body: "{}" }),
   masterQuickView: (kind, query = "") => request(`/master/quick-view/${encodeURIComponent(kind)}${query ? `?q=${encodeURIComponent(query)}` : ""}`),
   revalidateMasterCatalog: () => request("/master-catalog/revalidate", { method: "POST", body: "{}" }),

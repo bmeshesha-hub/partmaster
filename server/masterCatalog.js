@@ -149,7 +149,7 @@ export function catalogPart(row, includeAudit = false) {
 
 export function catalogExportQuery(filters = {}, includeAudit = false) {
   return `SELECT part_key AS "Part Key", manufacturer AS "Manufacturer", part_number AS "OEM Part Number",
-    description AS "Description", family_name AS "Part Family", component_scope AS "Component Scope",
+    description AS "Description", part_type AS "Part Type", family_name AS "Part Family", component_scope AS "Component Scope",
     side AS "Side", position AS "Position", coalesce(attributes_json, '[]') AS "Product Attributes JSON",
     coalesce(fitments_json, '[]') AS "Vehicle Fitments JSON", coalesce(compatibility_json, '[]') AS "Additional Fitments JSON",
     coalesce(aliases_json, '[]') AS "Alternate Part Numbers JSON", coalesce(relationships_json, '[]') AS "Part Relationships JSON",
