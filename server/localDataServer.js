@@ -3311,6 +3311,21 @@ async function masterTemplateQuery(connection, template) {
   const type = String(template || "raw_enriched");
   if (!masterExportTemplate(type)) throw new Error(`Unknown export template: ${type}`);
   const productWhere = "WHERE coalesce(record_type, 'product') = 'product'";
+  const rawFitmentQuery = async () => {
+    return `SELECT manufacturer AS "Make", part_number AS "Part Number", description AS "Description", year AS "Year",
+      manufacturer AS "Vehicle Make", model AS "Vehicle Model", NULL::VARCHAR AS "Vehicle Trim",
+      NULL::VARCHAR AS "Vehicle Type", NULL::VARCHAR AS "Motorcycle Type", NULL::VARCHAR AS "ePID",
+      assembly AS "Assembly Category", item_number AS "Ref", NULL::VARCHAR AS "Position", quantity AS "Quantity",
+      NULL::VARCHAR AS "Side", NULL::VARCHAR AS "Fitment Notes",
+      'indexed_source' AS "Mapping Method", NULL::DOUBLE AS "Mapping Confidence", source_url AS "Source URL"
+      FROM partmaster_offline_part_sources
+      WHERE nullif(trim(part_number), '') IS NOT NULL
+      ORDER BY manufacturer_norm, part_number_norm, year, model, dataset_id, source_row_id`;
+  };
+  const hasSparseApplications = async () => {
+    const reader = await connection.runAndReadAll("SELECT count(*) AS count FROM partmaster_part_applications");
+    return Number(reader.getRowObjectsJson()[0]?.count || 0) < 10;
+  };
   if (type === "part_number") return `SELECT manufacturer AS "Make", part_number AS "Part Number",
     description AS "Description", part_type AS "Part Type", family_name AS "Part Family",
     component_scope AS "Component Scope", side AS "Side", position AS "Position",
@@ -3351,7 +3366,9 @@ async function masterTemplateQuery(connection, template) {
     ) attributes
     WHERE nullif(trim(attribute_value), '') IS NOT NULL
     ORDER BY "Make", "Part Number", "Attribute", "Value"`;
-  if (type === "fitment") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
+  if (type === "fitment") {
+    if (await hasSparseApplications()) return rawFitmentQuery();
+    return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
     parts.description AS "Description", applications.year AS "Year", applications.vehicle_make AS "Vehicle Make",
     coalesce(applications.vehicle_model, applications.model) AS "Vehicle Model", applications.vehicle_trim AS "Vehicle Trim",
     applications.vehicle_type AS "Vehicle Type", applications.vehicle_motorcycle_type AS "Motorcycle Type",
@@ -3366,7 +3383,10 @@ async function masterTemplateQuery(connection, template) {
       AND parts.part_number_norm = canonical.part_number_norm
     WHERE canonical.verification_status != 'rejected'
     ORDER BY parts.manufacturer_norm, parts.part_number_norm, applications.year, applications.vehicle_make, applications.vehicle_model`;
-  if (type === "vehicle_fitment") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
+  }
+  if (type === "vehicle_fitment") {
+    if (await hasSparseApplications()) return rawFitmentQuery();
+    return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
     parts.description AS "Description", applications.year AS "Year", applications.vehicle_make AS "Vehicle Make",
     coalesce(applications.vehicle_model, applications.model) AS "Vehicle Model", applications.vehicle_trim AS "Vehicle Trim",
     applications.vehicle_type AS "Vehicle Type", applications.vehicle_motorcycle_type AS "Motorcycle Type",
@@ -3381,6 +3401,7 @@ async function masterTemplateQuery(connection, template) {
       AND parts.part_number_norm = canonical.part_number_norm
     WHERE canonical.verification_status != 'rejected'
     ORDER BY parts.manufacturer_norm, parts.part_number_norm, applications.year, applications.vehicle_make, applications.vehicle_model`;
+  }
   if (type === "assembly_diagram") return `SELECT parts.manufacturer AS "Make", parts.part_number AS "Part Number",
     parts.description AS "Description", applications.year AS "Year", applications.model AS "Model",
     applications.assembly AS "Assembly Category", applications.source_url AS "Source URL",
