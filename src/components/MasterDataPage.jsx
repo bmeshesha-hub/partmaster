@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CatalogPartRow from "./CatalogPartRow.jsx";
 import { localDataApi } from "../utils/localDataApi.js";
 import { MASTER_EXPORT_TEMPLATES } from "../../shared/masterExportTemplates.js";
+import { staticMasterTemplateCsv, staticMasterTemplatePreview } from "../utils/staticMasterExports.js";
 
 const INITIAL_QUERY = { q: "", manufacturer: "", family: "", onlineStatus: "", factStatus: "", fitmentStatus: "", descriptionStatus: "", minConfidence: "", maxConfidence: "", minOccurrences: "", sort: "part_number", direction: "asc", page: 1, pageSize: 50 };
 const LOCAL_URL = "http://127.0.0.1:5173/partmaster/";
@@ -136,6 +137,28 @@ export default function MasterDataPage() {
   }, [connected, publicMode]);
 
   useEffect(() => {
+    if (!publicMode || masterTab !== "export" || !publishedCatalog?.rows) return undefined;
+    let active = true;
+    setTemplateCapabilities({ templates: MASTER_EXPORT_TEMPLATES, source: "published_snapshot" });
+    setTemplatePreviewLoading(true);
+    setTemplatePreviewError("");
+    const timer = window.setTimeout(() => {
+      try {
+        const preview = staticMasterTemplatePreview(publishedCatalog.rows, exportTemplate);
+        if (active) setTemplatePreview(preview);
+      } catch (error) {
+        if (active) {
+          setTemplatePreview({ columns: [], rows: [] });
+          setTemplatePreviewError(error.message);
+        }
+      } finally {
+        if (active) setTemplatePreviewLoading(false);
+      }
+    }, 0);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [exportTemplate, masterTab, publicMode, publishedCatalog]);
+
+  useEffect(() => {
     if (masterTab !== "export" || publicMode || connected !== true || localServiceAvailable === false) return undefined;
     if (!templateCapabilities) return undefined;
     if (templateCapabilities.error) {
@@ -200,6 +223,17 @@ export default function MasterDataPage() {
   async function exportAllMasterData() {
     setFullExporting(true); setExportMessage("");
     try {
+      if (publicMode) {
+        if (!publishedCatalog?.rows?.length) throw new Error("The published catalog snapshot is still loading.");
+        const blob = new Blob([staticMasterTemplateCsv(publishedCatalog.rows, "part_number")], { type: "text/csv;charset=utf-8" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = "master-catalog-published.csv";
+        document.body.appendChild(link); link.click(); link.remove();
+        URL.revokeObjectURL(link.href);
+        setExportMessage("Downloaded the published catalog snapshot. The complete raw-to-master extract remains available from the local catalog service.");
+        return;
+      }
       const result = await localDataApi.exportMasterCatalog();
       const exports = result.exports || [];
       const catalogExport = exports.find((item) => item.filename.startsWith("master-catalog-all-"));
@@ -222,16 +256,27 @@ export default function MasterDataPage() {
   async function exportSelectedTemplate() {
     setTemplateExporting(true); setExportMessage("");
     try {
-      const result = await localDataApi.exportMasterTemplate(exportTemplate);
-      const item = result.exports?.[0];
-      if (!item) throw new Error("The selected template export was not generated.");
-      const link = document.createElement("a");
-      link.href = item.downloadUrl || `/api/local/exports/${encodeURIComponent(item.filename)}`;
-      link.download = item.filename;
-      document.body.appendChild(link); link.click(); link.remove();
-      setExportMessage(`Downloaded the ${MASTER_EXPORT_TEMPLATES.find((template) => template.id === exportTemplate)?.label || "selected"} template.`);
-    }
-    catch (error) { setExportMessage(error.message); }
+      const label = MASTER_EXPORT_TEMPLATES.find((template) => template.id === exportTemplate)?.label || "selected";
+      if (publicMode) {
+        if (!publishedCatalog?.rows?.length) throw new Error("The published catalog snapshot is still loading.");
+        const blob = new Blob([staticMasterTemplateCsv(publishedCatalog.rows, exportTemplate)], { type: "text/csv;charset=utf-8" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = `master-template-${exportTemplate}-published.csv`;
+        document.body.appendChild(link); link.click(); link.remove();
+        URL.revokeObjectURL(link.href);
+        setExportMessage(`Downloaded the ${label} template from the published catalog snapshot.`);
+      } else {
+        const result = await localDataApi.exportMasterTemplate(exportTemplate);
+        const item = result.exports?.[0];
+        if (!item) throw new Error("The selected template export was not generated.");
+        const link = document.createElement("a");
+        link.href = item.downloadUrl || `/api/local/exports/${encodeURIComponent(item.filename)}`;
+        link.download = item.filename;
+        document.body.appendChild(link); link.click(); link.remove();
+        setExportMessage(`Downloaded the ${label} template.`);
+      }
+    } catch (error) { setExportMessage(error.message); }
     finally { setTemplateExporting(false); }
   }
   async function exportFpa() {
@@ -283,15 +328,15 @@ export default function MasterDataPage() {
     <nav className="flex flex-wrap gap-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-sm" aria-label="Master data views">{[["catalog", "Parts catalog"], ["export", "Export for apps"], ["quality", "Data quality"]].map(([tab, title]) => <button key={tab} type="button" onClick={() => chooseTab(tab)} aria-pressed={masterTab === tab} className={`rounded-xl px-4 py-2 text-sm font-black ${masterTab === tab ? "bg-brand-700 text-white" : "text-slate-600 hover:bg-slate-50"}`}>{title}</button>)}</nav>
 
     {masterTab === "export" ? <section className="rounded-3xl border border-emerald-200 bg-white p-6 shadow-panel sm:p-8">
-      <p className="text-xs font-black uppercase tracking-wide text-emerald-700">Partout Pro & other apps</p><h3 className="mt-2 text-2xl font-black">A reusable catalog with complete part details</h3><p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">Download the canonical catalog plus a raw-to-master extract built from every imported source row. Fitment restrictions stay attached to the correct vehicle, and raw provenance remains available for review.</p>
+      <p className="text-xs font-black uppercase tracking-wide text-emerald-700">Partout Pro & other apps</p><h3 className="mt-2 text-2xl font-black">A reusable catalog with complete part details</h3><p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">{publicMode ? "Browse the published master snapshot, choose a column layout, preview 10 rows, and download the selected CSV directly in your browser." : "Download the canonical catalog plus a raw-to-master extract built from every imported source row. Fitment restrictions stay attached to the correct vehicle, and raw provenance remains available for review."}</p>
       <div className="mt-6 grid gap-4 md:grid-cols-3">{[["Part identity", "Manufacturer, OEM number, description, family, component scope, and side or position."], ["Fitment & installation", "Year, make, model, trim, ePID, assembly, quantity, and required or excluded options for each fitment."], ["Specifications & alternatives", "All recorded product and variant attributes, confirmed alternate numbers, and conditional replacement relationships."]].map(([title, description]) => <article key={title} className="rounded-2xl border border-slate-200 bg-slate-50 p-4"><h4 className="font-black">{title}</h4><p className="mt-2 text-sm leading-6 text-slate-600">{description}</p></article>)}</div>
-      <div className="mt-6 rounded-2xl border border-cyan-200 bg-cyan-50/70 p-4"><p className="text-xs font-black uppercase tracking-wide text-cyan-800">Raw → master extract</p><p className="mt-1 text-sm leading-6 text-cyan-950">Every raw source row is enriched with Year, Make, Model, Fitment Notes, Est. Year Fitment, Part Number, Supersedes Part, Cleaned Description, Industry Taxonomy, Specs, Availability, numeric Price, Currency, Pos, Ref, Assembly GUID, Diagram GUID, Brand Code, and source traceability.</p></div>
-      <div className="mt-6 rounded-2xl border border-violet-200 bg-violet-50/50 p-4 sm:p-5"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-black uppercase tracking-wide text-violet-700">Choose an export template</p><h4 className="mt-1 text-lg font-black text-violet-950">Different column arrangements for different workflows</h4><p className="mt-1 text-sm leading-5 text-violet-900">Select a format, review the first 10 rows, then export the full matching dataset.</p></div><span className="rounded-full bg-white px-3 py-1 text-[11px] font-black text-violet-700">{templatePreview.rows.length || 0} preview rows</span></div><div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{MASTER_EXPORT_TEMPLATES.map((template) => { const supported = !templateCapabilitiesKnown || templateCapabilities.templates?.some((item) => item.id === template.id); return <button key={template.id} type="button" onClick={() => setExportTemplate(template.id)} disabled={templateCapabilitiesKnown && !supported} className={`rounded-xl border p-3 text-left transition ${exportTemplate === template.id ? "border-violet-500 bg-white shadow-sm ring-2 ring-violet-200" : "border-violet-100 bg-white/60 hover:border-violet-300"} disabled:cursor-not-allowed disabled:opacity-50`}><span className="block text-sm font-black text-slate-900">{template.label}</span><span className="mt-1 block text-xs leading-5 text-slate-600">{template.detail}</span><span className="mt-2 block truncate font-mono text-[10px] text-violet-700">{template.columns.join(" · ")}</span></button>; })}</div><div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="text-xs font-bold text-slate-600">Preview: {MASTER_EXPORT_TEMPLATES.find((template) => template.id === exportTemplate)?.label}</p><button type="button" onClick={exportSelectedTemplate} disabled={templateExporting || !connected || publicMode || !templateCanRun} className="inline-flex items-center gap-2 rounded-xl bg-violet-700 px-4 py-2.5 text-sm font-black text-white disabled:opacity-50"><Download size={16} />{templateExporting ? "Preparing template…" : "Export selected template"}</button></div><TemplatePreview preview={templatePreview} loading={templatePreviewLoading} error={publicMode ? "Template previews and exports are available from the local catalog service." : templatePreviewError} /></div>
-      <div className="mt-6 flex flex-wrap gap-3"><button type="button" onClick={exportAllMasterData} disabled={!connected || fullExporting} className="inline-flex items-center gap-2 rounded-xl bg-brand-700 px-5 py-3 text-sm font-black text-white disabled:opacity-50"><Download size={17} />{fullExporting ? "Preparing exports…" : "Download catalog + raw-to-master extract"}</button><button type="button" onClick={() => chooseTab("catalog")} className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-bold">Filter & preview parts</button>{GOOGLE_DRIVE_MASTERDATA_URL && <a href={GOOGLE_DRIVE_MASTERDATA_URL} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-5 py-3 text-sm font-black text-emerald-800"><ExternalLink size={17} />Open approved Drive snapshot</a>}</div>
-      <p className="mt-4 text-xs leading-5 text-slate-500">The button downloads both the canonical catalog and <span className="font-mono">master-extract-all-*.csv</span>. The raw-to-master file excludes marketplace sales/live metrics and keeps source provenance for every row.</p>
+      <div className="mt-6 rounded-2xl border border-cyan-200 bg-cyan-50/70 p-4"><p className="text-xs font-black uppercase tracking-wide text-cyan-800">{publicMode ? "Published snapshot exports" : "Raw → master extract"}</p><p className="mt-1 text-sm leading-6 text-cyan-950">{publicMode ? "Public previews and CSV downloads are generated from the published master snapshot in your browser. The complete raw source rows, internal evidence, and enrichment workers remain local." : "Every raw source row is enriched with Year, Make, Model, Fitment Notes, Est. Year Fitment, Part Number, Supersedes Part, Cleaned Description, Industry Taxonomy, Specs, Availability, numeric Price, Currency, Pos, Ref, Assembly GUID, Diagram GUID, Brand Code, and source traceability."}</p></div>
+      <div className="mt-6 rounded-2xl border border-violet-200 bg-violet-50/50 p-4 sm:p-5"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-black uppercase tracking-wide text-violet-700">Choose an export template</p><h4 className="mt-1 text-lg font-black text-violet-950">Different column arrangements for different workflows</h4><p className="mt-1 text-sm leading-5 text-violet-900">Select a format, review the first 10 rows, then export the full matching dataset.</p></div><span className="rounded-full bg-white px-3 py-1 text-[11px] font-black text-violet-700">{templatePreview.rows.length || 0} preview rows</span></div><div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{MASTER_EXPORT_TEMPLATES.map((template) => { const supported = !templateCapabilitiesKnown || templateCapabilities.templates?.some((item) => item.id === template.id); return <button key={template.id} type="button" onClick={() => setExportTemplate(template.id)} disabled={templateCapabilitiesKnown && !supported} className={`rounded-xl border p-3 text-left transition ${exportTemplate === template.id ? "border-violet-500 bg-white shadow-sm ring-2 ring-violet-200" : "border-violet-100 bg-white/60 hover:border-violet-300"} disabled:cursor-not-allowed disabled:opacity-50`}><span className="block text-sm font-black text-slate-900">{template.label}</span><span className="mt-1 block text-xs leading-5 text-slate-600">{template.detail}</span><span className="mt-2 block truncate font-mono text-[10px] text-violet-700">{template.columns.join(" · ")}</span></button>; })}</div><div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="text-xs font-bold text-slate-600">Preview: {MASTER_EXPORT_TEMPLATES.find((template) => template.id === exportTemplate)?.label}</p><button type="button" onClick={exportSelectedTemplate} disabled={templateExporting || !connected || !templateCanRun} className="inline-flex items-center gap-2 rounded-xl bg-violet-700 px-4 py-2.5 text-sm font-black text-white disabled:opacity-50"><Download size={16} />{templateExporting ? "Preparing template…" : "Export selected template"}</button></div><TemplatePreview preview={templatePreview} loading={templatePreviewLoading} error={templatePreviewError} /></div>
+      <div className="mt-6 flex flex-wrap gap-3"><button type="button" onClick={exportAllMasterData} disabled={!connected || fullExporting} className="inline-flex items-center gap-2 rounded-xl bg-brand-700 px-5 py-3 text-sm font-black text-white disabled:opacity-50"><Download size={17} />{fullExporting ? "Preparing exports…" : publicMode ? "Download published catalog" : "Download catalog + raw-to-master extract"}</button><button type="button" onClick={() => chooseTab("catalog")} className="rounded-xl border border-slate-300 px-5 py-3 text-sm font-bold">Filter & preview parts</button>{GOOGLE_DRIVE_MASTERDATA_URL && <a href={GOOGLE_DRIVE_MASTERDATA_URL} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-5 py-3 text-sm font-black text-emerald-800"><ExternalLink size={17} />Open approved Drive snapshot</a>}</div>
+      <p className="mt-4 text-xs leading-5 text-slate-500">{publicMode ? "Public CSVs are generated from the catalog snapshot currently published with this site. For the complete raw-to-master extract with source provenance, use the local catalog service." : <>The button downloads both the canonical catalog and <span className="font-mono">master-extract-all-*.csv</span>. The raw-to-master file excludes marketplace sales/live metrics and keeps source provenance for every row.</>}</p>
       {exportMessage && <p role="status" className="mt-4 rounded-xl bg-slate-100 p-3 text-sm">{exportMessage}</p>}
       {!connected && <p className="mt-4 text-sm font-semibold text-amber-800">Connect the local data service to download the catalog.</p>}
-      <details className="mt-6 rounded-xl border border-slate-200 p-4"><summary className="cursor-pointer text-sm font-bold text-slate-600">Legacy FPA integration</summary><p className="mt-3 text-sm text-slate-500">Keep the existing FPA format for integrations that require its fitment rows and internal evidence fields. Use the parts catalog above for the shared application format.</p><button type="button" onClick={exportFpa} disabled={fpaExporting || !connected} className="mt-3 inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold disabled:opacity-50"><Download size={15} />{fpaExporting ? "Preparing…" : "Download legacy FPA CSV"}</button>{fpaExportMessage && <p role="status" className="mt-3 text-sm">{fpaExportMessage}</p>}</details>
+      <details className="mt-6 rounded-xl border border-slate-200 p-4"><summary className="cursor-pointer text-sm font-bold text-slate-600">Legacy FPA integration</summary><p className="mt-3 text-sm text-slate-500">Keep the existing FPA format for integrations that require its fitment rows and internal evidence fields. Use the parts catalog above for the shared application format.</p><button type="button" onClick={exportFpa} disabled={fpaExporting || !connected || publicMode} className="mt-3 inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold disabled:opacity-50"><Download size={15} />{fpaExporting ? "Preparing…" : "Download legacy FPA CSV"}</button>{publicMode && <p className="mt-3 text-xs text-slate-500">Legacy FPA export is available from the local catalog service.</p>}{fpaExportMessage && <p role="status" className="mt-3 text-sm">{fpaExportMessage}</p>}</details>
     </section> : <>
       {isAudit ? <>
         <section className="rounded-2xl border border-amber-200 bg-amber-50 p-5"><h3 className="font-black text-amber-950">Internal data quality & traceability</h3><p className="mt-2 text-sm text-amber-900">Review collection coverage, source evidence, and processing status here. Open a part’s details to inspect its provenance. Audit exports include internal fields alongside the product data.</p><button type="button" onClick={startOnlineFitmentRecovery} disabled={fitmentRecoveryStarting || !connected} className="mt-3 inline-flex items-center gap-2 rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-bold text-amber-900 disabled:opacity-50"><Globe2 size={15} />{fitmentRecoveryStarting ? "Queuing recovery…" : "Recover missing fitments online"}</button>{fpaExportMessage && <p role="status" className="mt-3 text-sm">{fpaExportMessage}</p>}</section>
