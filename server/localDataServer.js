@@ -7275,8 +7275,13 @@ app.post("/api/local/master/templates/:template/preview", asyncRoute(async (requ
   const template = String(request.params.template || "raw_enriched");
   const result = await withConnection(async (connection) => {
     const query = await masterTemplateQuery(connection, template);
-    const countReader = await connection.runAndReadAll(`SELECT count(*) AS total FROM (${query}) template`);
-    const total = Number(countReader.getRowObjectsJson()[0]?.total || 0);
+    // Raw/original projections may include very large JSON records. A full
+    // count before LIMIT 10 forces DuckDB to materialize the entire union and
+    // can exhaust the local memory budget just to render a preview.
+    const countRequired = !["original", "raw", "raw_enriched"].includes(template);
+    const total = countRequired
+      ? Number((await connection.runAndReadAll(`SELECT count(*) AS total FROM (${query}) template`)).getRowObjectsJson()[0]?.total || 0)
+      : null;
     const previewOrdering = template === "raw_enriched"
       ? `ORDER BY "Year" NULLS LAST, "Model" NULLS LAST, "Source File", "Source Row ID"`
       : "";
