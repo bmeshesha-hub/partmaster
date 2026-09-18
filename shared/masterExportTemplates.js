@@ -1,4 +1,4 @@
-export const MASTER_EXPORT_TEMPLATE_VERSION = 1;
+export const MASTER_EXPORT_TEMPLATE_VERSION = 2;
 
 export const MASTER_EXPORT_TEMPLATES = [
   { id: "part_number", label: "Part number focused", detail: "One row per canonical part; identity, description, category, and coverage.", columns: ["Make", "Part Number", "Description", "Part Type", "Part Family", "Component Scope", "Side", "Position"] },
@@ -14,7 +14,7 @@ export const MASTER_EXPORT_TEMPLATES = [
   { id: "quality_review", label: "Data-quality review", detail: "Parts with missing descriptions, classification, attributes, confidence, or review flags.", columns: ["Make", "Part Number", "Description", "Part Type", "Part Family", "Attribute Status", "Online Status", "Review Reasons"] },
   { id: "vehicle_summary", label: "Vehicle summary", detail: "One row per vehicle application with part, fitment, assembly, and mapping counts.", columns: ["Year", "Vehicle Make", "Vehicle Model", "Vehicle Trim", "Vehicle Type", "Part Count", "Fitment Row Count", "Assembly Count"] },
   { id: "manufacturer_specific", label: "Manufacturer-specific", detail: "Manufacturer-ready identity and specifications layout for brand-specific workflows.", columns: ["Make", "Part Number", "Description", "Part Type", "Part Family", "Component Scope", "Side", "Specifications JSON"] },
-  { id: "original", label: "Original", detail: "Native scraper fields with OEM hierarchy, vehicle context, source values, and raw record preservation.", columns: ["OEM", "Make", "Vehicle Type", "Year", "Model", "Assembly Category", "Source URL", "Pos", "Ref", "Part Number", "Description", "Weight", "Price", "Quantity", "Source Date", "Source Job ID", "Source File", "Source Row ID", "Raw Record JSON"] },
+  { id: "original", label: "Original", detail: "The source scraper row in its original field order and values, plus the preserved raw record.", columns: ["Year", "Make", "Model", "Part category", "Source URL", "POS.", "CODE", "DESCRIPTION", "QTY", "VALIDITY", "NOTES", "dt", "jobId", "Raw Record JSON"] },
   { id: "raw_enriched", label: "Raw + enriched", detail: "Every raw source row plus the standardized master fields and provenance.", columns: ["Year", "Make", "Model", "Fitment Notes", "Est. Year Fitment", "Part Number", "Supersedes Part", "Cleaned Description", "Industry Taxonomy (ACES/PIES)", "Specs", "Availability", "Price (Float)", "Currency", "Pos", "Ref", "Assembly GUID", "Diagram GUID", "Brand Code", "Assembly Category", "Source URL", "Raw Description", "Raw Part Type", "Raw Price", "Raw Quantity", "Raw ePID", "Source Date", "Source Job ID", "Dataset ID", "Source File", "Source Row ID", "Raw Record JSON"] },
   { id: "raw", label: "Raw source", detail: "Every raw source row preserved as JSON with source and row identity.", columns: ["Dataset ID", "Source File", "Source Row ID", "Source URL", "Raw Record JSON"] },
 ];

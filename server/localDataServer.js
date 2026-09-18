@@ -3246,6 +3246,8 @@ function offlineDatasetExpressions(columns) {
     fitmentNotes: firstColumnExpression(columns, ["fitment_notes", "fitment_note"]),
     estimatedYearFitment: firstColumnExpression(columns, ["est_year_fitment", "estimated_year_fitment", "fitment_year"]),
     supersedesPart: firstColumnExpression(columns, ["supersedes_part", "superseded_part", "replaces_part"]),
+    validity: firstColumnExpression(columns, ["validity", "valid", "fitment_validity"]),
+    notes: firstColumnExpression(columns, ["notes", "note", "comments"]),
   };
 }
 
@@ -3304,6 +3306,33 @@ async function masterExtractQuery(connection) {
       ${fields.date} AS "Source Date", ${fields.jobId} AS "Source Job ID",
       ${quoteString(dataset.id)} AS "Dataset ID", ${quoteString(dataset.source_file)} AS "Source File", _row_id AS "Source Row ID",
       to_json(source) AS "Raw Record JSON"
+      FROM ${quoteIdentifier(dataset.table_name)} source`);
+  }
+  if (!selects.length) return "SELECT NULL WHERE FALSE";
+  return selects.join(" UNION ALL ");
+}
+
+async function originalRawQuery(connection) {
+  const datasetReader = await connection.runAndReadAll(
+    `SELECT * EXCLUDE (rank) FROM (
+       SELECT datasets.*, row_number() OVER (PARTITION BY source_file ORDER BY imported_at DESC) AS rank
+       FROM partmaster_datasets datasets
+     ) latest
+     WHERE rank = 1
+       AND NOT regexp_matches(lower(coalesce(source_file, '')), 'sample|mpsov|vehicle_mapping')
+     ORDER BY source_file`,
+  );
+  const datasets = datasetReader.getRowObjectsJson();
+  const selects = [];
+  for (const dataset of datasets) {
+    const columns = await getColumns(connection, dataset.table_name);
+    const fields = offlineDatasetExpressions(columns);
+    selects.push(`SELECT
+      ${fields.year} AS "Year", ${fields.manufacturer} AS "Make", ${fields.model} AS "Model",
+      ${fields.assembly} AS "Part category", ${fields.sourceUrl} AS "Source URL",
+      ${fields.position} AS "POS.", ${fields.partNumber} AS "CODE", ${fields.description} AS "DESCRIPTION",
+      ${fields.quantity} AS "QTY", ${fields.validity} AS "VALIDITY", ${fields.notes} AS "NOTES",
+      ${fields.date} AS "dt", ${fields.jobId} AS "jobId", to_json(source) AS "Raw Record JSON"
       FROM ${quoteIdentifier(dataset.table_name)} source`);
   }
   if (!selects.length) return "SELECT NULL WHERE FALSE";
@@ -3513,22 +3542,8 @@ async function masterTemplateQuery(connection, template) {
     confidence AS "Confidence"
     FROM partmaster_offline_parts ${productWhere} ORDER BY manufacturer_norm, part_number_norm`;
   if (type === "original") {
-    const raw = await masterExtractQuery(connection);
-    return `SELECT "Make" AS "OEM", "Make",
-      CASE
-        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'motor[-_ ]?scooter') THEN 'Motor Scooter'
-        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'motorcycle') THEN 'Motorcycle'
-        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'side[-_ ]?by[-_ ]?side|sxs|utv') THEN 'Side-by-Side'
-        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'watercraft|jet ski|personal watercraft') THEN 'Personal Watercraft'
-        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'scooter') THEN 'Scooter'
-        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'atv|all terrain') THEN 'ATV'
-        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'generator') THEN 'Generator'
-        ELSE NULL
-      END AS "Vehicle Type",
-      "Year", "Model", "Assembly Category", "Source URL", "Pos", "Ref", "Part Number", "Raw Description" AS "Description",
-      json_extract_string("Raw Record JSON", '$.weight') AS "Weight", "Raw Price" AS "Price", "Raw Quantity" AS "Quantity",
-      "Source Date", "Source Job ID", "Source File", "Source Row ID", "Raw Record JSON"
-      FROM (${raw}) original ORDER BY "Make", "Year", "Model", "Assembly Category", "Pos", "Part Number"`;
+    const raw = await originalRawQuery(connection);
+    return `SELECT * FROM (${raw}) original ORDER BY "Make", "Year", "Model", "Part category", "POS.", "CODE"`;
   }
   if (type === "raw") {
     const raw = await masterExtractQuery(connection);

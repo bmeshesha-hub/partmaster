@@ -28,18 +28,6 @@ function fitmentSummary(part) {
   return fitmentsFor(part).filter(Boolean).map((fitment) => [fitment.year, vehicleMake(part, fitment), vehicleModel(fitment), fitment.trim].filter((item) => value(item).trim() !== "").join(" ")).filter(Boolean).join("; ");
 }
 
-function vehicleType(part, fitment) {
-  const text = `${fitment?.vehicle_type || ""} ${fitment?.motorcycle_type || ""} ${vehicleModel(fitment)} ${part?.description || ""}`.toLowerCase();
-  return first(fitment?.vehicle_type, fitment?.motorcycle_type,
-    /motor[-_ ]?scooter/.test(text) && "Motor Scooter",
-    /motorcycle/.test(text) && "Motorcycle",
-    /side[-_ ]?by[-_ ]?side|\bsxs\b|\butv\b/.test(text) && "Side-by-Side",
-    /watercraft|jet ski|personal watercraft/.test(text) && "Personal Watercraft",
-    /\bscooter\b/.test(text) && "Scooter",
-    /\batv\b|all terrain/.test(text) && "ATV",
-    /generator/.test(text) && "Generator");
-}
-
 function sourceUrl(part) {
   return first(part?.audit?.best_source_url, part?.source_url);
 }
@@ -121,27 +109,19 @@ function rowsForPart(part, templateId) {
       Ref: fitment?.item_number,
     };
     if (templateId === "original") return {
-      // The scraper's maker is the OEM. Keep Make populated as well because
-      // the source only provides one manufacturer field and the Original
-      // layout must not discard it.
-      OEM: part?.manufacturer,
-      Make: part?.manufacturer,
-      "Vehicle Type": vehicleType(part, fitment),
       Year: fitment?.year,
+      Make: part?.manufacturer,
       Model: model,
-      "Assembly Category": fitment?.assembly,
+      "Part category": fitment?.assembly,
       "Source URL": sourceUrl(part),
-      Pos: fitment?.item_number || fitment?.position,
-      Ref: fitment?.item_number,
-      "Part Number": part?.part_number,
-      Description: part?.description,
-      Weight: "",
-      Price: "",
-      Quantity: fitment?.quantity,
-      "Source Date": "",
-      "Source Job ID": "",
-      "Source File": "master-catalog snapshot",
-      "Source Row ID": part?.part_key,
+      "POS.": fitment?.item_number || fitment?.position,
+      CODE: part?.part_number,
+      DESCRIPTION: part?.description,
+      QTY: fitment?.quantity,
+      VALIDITY: "",
+      NOTES: "",
+      dt: "",
+      jobId: "",
       "Raw Record JSON": json(part),
     };
     if (templateId === "category") return { ...common, Model: model, Ref: fitment?.item_number, Quantity: fitment?.quantity };
