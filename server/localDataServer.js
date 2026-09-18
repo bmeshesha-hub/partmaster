@@ -3512,6 +3512,24 @@ async function masterTemplateQuery(connection, template) {
     raw_price AS "Raw Price/MSRP", occurrence_count AS "Occurrences", best_source_url AS "Source URL",
     confidence AS "Confidence"
     FROM partmaster_offline_parts ${productWhere} ORDER BY manufacturer_norm, part_number_norm`;
+  if (type === "original") {
+    const raw = await masterExtractQuery(connection);
+    return `SELECT 'OEM Parts' AS "OEM", "Make",
+      CASE
+        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'motor[-_ ]?scooter') THEN 'Motor Scooter'
+        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'motorcycle') THEN 'Motorcycle'
+        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'side[-_ ]?by[-_ ]?side|sxs|utv') THEN 'Side-by-Side'
+        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'watercraft|jet ski|personal watercraft') THEN 'Personal Watercraft'
+        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'scooter') THEN 'Scooter'
+        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'atv|all terrain') THEN 'ATV'
+        WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'generator') THEN 'Generator'
+        ELSE NULL
+      END AS "Vehicle Type",
+      "Year", "Model", "Assembly Category", "Source URL", "Pos", "Ref", "Part Number", "Raw Description" AS "Description",
+      json_extract_string("Raw Record JSON", '$.weight') AS "Weight", "Raw Quantity" AS "Quantity", "Raw Price" AS "Price",
+      "Source Date", "Source Job ID", "Source File", "Source Row ID", "Raw Record JSON"
+      FROM (${raw}) original ORDER BY "Make", "Year", "Model", "Assembly Category", "Pos", "Part Number"`;
+  }
   if (type === "raw") {
     const raw = await masterExtractQuery(connection);
     return `SELECT "Dataset ID", "Source File", "Source Row ID", "Source URL", "Raw Record JSON"

@@ -1,7 +1,7 @@
 import { MASTER_EXPORT_TEMPLATE_VERSION, masterExportTemplate } from "../../shared/masterExportTemplates.js";
 
 const value = (input) => input == null ? "" : String(input);
-const first = (...inputs) => inputs.find((input) => value(input).trim() !== "") ?? "";
+const first = (...inputs) => inputs.find((input) => input !== false && input != null && value(input).trim() !== "") ?? "";
 const json = (input) => JSON.stringify(input ?? [], null, 0);
 
 function fitmentsFor(part) {
@@ -26,6 +26,18 @@ function vehicleModel(fitment) {
 
 function fitmentSummary(part) {
   return fitmentsFor(part).filter(Boolean).map((fitment) => [fitment.year, vehicleMake(part, fitment), vehicleModel(fitment), fitment.trim].filter((item) => value(item).trim() !== "").join(" ")).filter(Boolean).join("; ");
+}
+
+function vehicleType(part, fitment) {
+  const text = `${fitment?.vehicle_type || ""} ${fitment?.motorcycle_type || ""} ${vehicleModel(fitment)} ${part?.description || ""}`.toLowerCase();
+  return first(fitment?.vehicle_type, fitment?.motorcycle_type,
+    /motor[-_ ]?scooter/.test(text) && "Motor Scooter",
+    /motorcycle/.test(text) && "Motorcycle",
+    /side[-_ ]?by[-_ ]?side|\bsxs\b|\butv\b/.test(text) && "Side-by-Side",
+    /watercraft|jet ski|personal watercraft/.test(text) && "Personal Watercraft",
+    /\bscooter\b/.test(text) && "Scooter",
+    /\batv\b|all terrain/.test(text) && "ATV",
+    /generator/.test(text) && "Generator");
 }
 
 function sourceUrl(part) {
@@ -107,6 +119,27 @@ function rowsForPart(part, templateId) {
       "Diagram GUID": fitment?.diagram_guid,
       Pos: fitment?.item_number || fitment?.position,
       Ref: fitment?.item_number,
+    };
+    if (templateId === "original") return {
+      OEM: "OEM Parts",
+      Make: part?.manufacturer,
+      "Vehicle Type": vehicleType(part, fitment),
+      Year: fitment?.year,
+      Model: model,
+      "Assembly Category": fitment?.assembly,
+      "Source URL": sourceUrl(part),
+      Pos: fitment?.item_number || fitment?.position,
+      Ref: fitment?.item_number,
+      "Part Number": part?.part_number,
+      Description: part?.description,
+      Weight: "",
+      Quantity: fitment?.quantity,
+      Price: "",
+      "Source Date": "",
+      "Source Job ID": "",
+      "Source File": "master-catalog snapshot",
+      "Source Row ID": part?.part_key,
+      "Raw Record JSON": json(part),
     };
     if (templateId === "category") return { ...common, Model: model, Ref: fitment?.item_number, Quantity: fitment?.quantity };
     if (templateId === "fitment") return common;
