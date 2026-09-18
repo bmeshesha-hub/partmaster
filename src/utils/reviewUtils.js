@@ -1,4 +1,9 @@
 export function candidateReviewValues(candidate) {
+  let attributes = {};
+  try {
+    const parsed = JSON.parse(candidate.extracted_attributes_json || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) attributes = parsed;
+  } catch { /* Keep the existing review usable when older rows contain invalid JSON. */ }
   return {
     partNumber: candidate.enriched_part_number || candidate.part_number_raw || "",
     description: candidate.enriched_description || candidate.description_raw || "",
@@ -21,5 +26,6 @@ export function candidateReviewValues(candidate) {
     fitmentExplanation: candidate.fitment_explanation || "",
     notes: candidate.decision_notes || "",
     evidenceUrl: candidate.evidence_url || candidate.source_url || "",
+    attributes,
   };
 }

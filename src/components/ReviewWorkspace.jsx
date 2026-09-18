@@ -3,6 +3,8 @@ import {
   ArrowRight,
   BadgeCheck,
   Check,
+  Clipboard,
+  Copy,
   ChevronRight,
   CircleHelp,
   Filter,
@@ -18,6 +20,7 @@ import {
 } from "lucide-react";
 import { createElement, useCallback, useEffect, useMemo, useState } from "react";
 import { localDataApi } from "../utils/localDataApi.js";
+import { buildAiValidationPrompt, validateAiValidationResponse } from "../utils/aiValidation.js";
 import { candidateReviewValues } from "../utils/reviewUtils.js";
 import { ReviewModal } from "./EnrichmentManager.jsx";
 import LocalWorkspaceUnavailable from "./LocalWorkspaceUnavailable.jsx";
@@ -92,6 +95,12 @@ export default function ReviewWorkspace() {
   const [bulkBusy, setBulkBusy] = useState(false);
   const [notice, setNotice] = useState({ type: "", message: "" });
   const [bulkReport, setBulkReport] = useState(null);
+  const [aiValidationOpen, setAiValidationOpen] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiResponse, setAiResponse] = useState("");
+  const [aiValidation, setAiValidation] = useState(null);
+  const [aiValidationError, setAiValidationError] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
 
   const loadOverview = useCallback(async () => {
     try {
@@ -214,6 +223,71 @@ export default function ReviewWorkspace() {
     finally { setBulkBusy(false); await Promise.all([loadOverview(), loadQueue()]); }
   }
 
+  function openAiValidation() {
+    const selected = candidates.filter((candidate) => selectedIds.includes(candidate.id));
+    if (!selected.length) return;
+    setAiPrompt(buildAiValidationPrompt(selected));
+    setAiResponse("");
+    setAiValidation(null);
+    setAiValidationError("");
+    setAiValidationOpen(true);
+  }
+
+  async function copyAiPrompt() {
+    try {
+      await navigator.clipboard.writeText(aiPrompt);
+      setNotice({ type: "success", message: "AI validation prompt copied to the clipboard." });
+    } catch {
+      setNotice({ type: "error", message: "The prompt could not be copied. Select the prompt text and copy it manually." });
+    }
+  }
+
+  function validateAiResponse() {
+    try {
+      const selected = candidates.filter((candidate) => selectedIds.includes(candidate.id));
+      const result = validateAiValidationResponse(aiResponse, selected);
+      setAiValidation(result);
+      setAiValidationError("");
+    } catch (error) {
+      setAiValidation(null);
+      setAiValidationError(error.message || "The AI response is not valid.");
+    }
+  }
+
+  async function applyAiValidation() {
+    const selected = candidates.filter((candidate) => selectedIds.includes(candidate.id));
+    if (!aiValidation?.complete || aiValidation.reviews.some((review) => review.decision === "needs_human")) return;
+    if (!window.confirm(`Apply the validated AI recommendations to ${selected.length.toLocaleString()} selected records and promote them into Master?`)) return;
+    const reviews = new Map(aiValidation.reviews.map((review) => [review.candidateId, review]));
+    setAiBusy(true); setAiValidationError("");
+    let applied = 0;
+    try {
+      for (const candidate of selected) {
+        const review = reviews.get(candidate.id);
+        const existingValues = candidateReviewValues(candidate);
+        const changes = {
+          ...(review?.changes || {}),
+          attributes: { ...(existingValues.attributes || {}), ...(review?.changes?.attributes || {}) },
+        };
+        await localDataApi.reviewEnrichmentCandidate(candidate.id, {
+          decision: "approve",
+          ...existingValues,
+          ...changes,
+          notes: [candidate.decision_notes, "AI validation", review.notes, ...review.evidence].filter(Boolean).join("\n"),
+        });
+        applied += 1;
+      }
+      setSelectedIds([]);
+      setAiValidationOpen(false);
+      setNotice({ type: "success", message: `${number(applied)} AI-validated records were promoted into Master.` });
+    } catch (error) {
+      setAiValidationError(`${number(applied)} records were applied before the process stopped. ${error.message}`);
+    } finally {
+      setAiBusy(false);
+      await Promise.all([loadOverview(), loadQueue()]);
+    }
+  }
+
   if (connected == null) return <div className="grid min-h-72 place-items-center rounded-3xl border border-slate-200 bg-white"><div className="text-center text-sm font-semibold text-slate-500"><LoaderCircle className="mx-auto mb-3 animate-spin text-brand-600" size={30} />Building the brand review workspace…</div></div>;
   const summary = overview.summary || {};
   const filtersActive = Boolean(brand || status || category || appliedQuery);
@@ -230,12 +304,14 @@ export default function ReviewWorkspace() {
     {notice.message && <div className={`flex items-start justify-between gap-4 rounded-2xl border-2 px-5 py-4 text-sm font-bold shadow-lg ${notice.type === "error" ? "border-red-300 bg-red-50 text-red-900" : "border-emerald-300 bg-emerald-50 text-emerald-900"}`} role={notice.type === "error" ? "alert" : "status"}><span className="flex items-start gap-2">{notice.type === "error" ? <AlertTriangle className="shrink-0" size={19} /> : <Check className="shrink-0" size={19} />}{notice.message}</span><button type="button" onClick={() => setNotice({ type: "", message: "" })}><X size={18} /></button></div>}
     {bulkReport && <section className="rounded-2xl border border-cyan-200 bg-cyan-50 p-5"><div className="flex flex-wrap items-center justify-between gap-3"><div><h4 className="font-black text-cyan-950">Bulk enrichment results</h4><p className="mt-1 text-xs text-cyan-800">Suggestions were found, but nothing was applied without human confirmation.</p></div><button type="button" onClick={() => setBulkReport(null)} className="text-cyan-700"><X size={17} /></button></div><div className="mt-4 grid gap-2 sm:grid-cols-3 lg:grid-cols-6">{[["Records searched", bulkReport.records], ["Sources found", bulkReport.sources], ["OEM suggestions", bulkReport.oem], ["Descriptions", bulkReport.description], ["Side / position", bulkReport.side + bulkReport.position], ["Ambiguous", bulkReport.ambiguous]].map(([label, value]) => <div key={label} className="rounded-xl bg-white p-3"><p className="text-[10px] font-black uppercase tracking-wide text-slate-500">{label}</p><p className="mt-1 text-xl font-black text-slate-900">{number(value)}</p></div>)}</div><p className="mt-3 text-xs font-semibold text-cyan-900">Open each record’s Review panel to choose the exact field value and apply it.</p></section>}
 
+    {aiValidationOpen && <section className="rounded-3xl border-2 border-violet-300 bg-violet-50 p-5 shadow-lg sm:p-6"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="flex items-center gap-2 text-xs font-black uppercase tracking-wide text-violet-700"><Sparkles size={16} />AI validation handoff</p><h3 className="mt-1 text-xl font-black text-violet-950">Review selected parts with AI</h3><p className="mt-1 max-w-3xl text-sm text-violet-900">Copy the generated prompt into your AI tool, paste its JSON-only response below, validate it, inspect the recommendations, then apply them deliberately.</p></div><button type="button" onClick={() => setAiValidationOpen(false)} className="rounded-lg p-2 text-violet-700 hover:bg-violet-100"><X size={18} /></button></div><div className="mt-5 grid gap-4 xl:grid-cols-2"><div><div className="flex items-center justify-between gap-2"><label htmlFor="ai-validation-prompt" className="text-xs font-black uppercase tracking-wide text-violet-800">Generated prompt</label><button type="button" onClick={copyAiPrompt} className="inline-flex items-center gap-1.5 rounded-lg border border-violet-300 bg-white px-2.5 py-1.5 text-xs font-bold text-violet-800"><Copy size={14} />Copy prompt</button></div><textarea id="ai-validation-prompt" value={aiPrompt} readOnly rows={18} className="mt-2 w-full rounded-xl border border-violet-200 bg-white p-3 font-mono text-xs leading-5 text-slate-700" /></div><div><label htmlFor="ai-validation-response" className="text-xs font-black uppercase tracking-wide text-violet-800">Paste AI JSON response</label><textarea id="ai-validation-response" value={aiResponse} onChange={(event) => { setAiResponse(event.target.value); setAiValidation(null); setAiValidationError(""); }} rows={18} placeholder={'{"reviews":[...]}' } className="mt-2 w-full rounded-xl border border-violet-200 bg-white p-3 font-mono text-xs leading-5 text-slate-700" /><div className="mt-2 flex flex-wrap gap-2"><button type="button" onClick={validateAiResponse} disabled={!aiResponse.trim() || aiBusy} className="inline-flex items-center gap-2 rounded-xl bg-violet-700 px-4 py-2.5 text-sm font-black text-white disabled:opacity-50"><Clipboard size={16} />Validate JSON</button>{aiValidation?.complete && !aiValidation.reviews.some((review) => review.decision === "needs_human") && <button type="button" onClick={applyAiValidation} disabled={aiBusy} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-black text-white disabled:opacity-50">{aiBusy ? <LoaderCircle className="animate-spin" size={16} /> : <BadgeCheck size={16} />}Apply recommendations</button>}</div></div></div>{aiValidationError && <div className="mt-4 rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-sm font-bold text-red-900">{aiValidationError}</div>}{aiValidation && <div className="mt-5 rounded-2xl border border-violet-200 bg-white p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div><h4 className="font-black text-slate-900">Validated recommendations</h4><p className="mt-1 text-xs text-slate-500">{aiValidation.reviews.length} response(s) · {aiValidation.missingIds.length} selected part(s) missing from the response</p></div>{!aiValidation.complete && <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-black text-amber-800">Complete every candidate before applying</span>}</div><div className="mt-3 overflow-x-auto"><table className="min-w-full text-xs"><thead><tr className="border-b border-slate-200 text-left text-[10px] font-black uppercase tracking-wide text-slate-500"><th className="px-2 py-2">Part</th><th className="px-2 py-2">Decision</th><th className="px-2 py-2">Confidence</th><th className="px-2 py-2">Proposed fields</th><th className="px-2 py-2">Notes</th></tr></thead><tbody>{aiValidation.reviews.map((review) => { const candidate = candidates.find((item) => item.id === review.candidateId); return <tr key={review.candidateId} className="border-b border-slate-100"><td className="px-2 py-2 font-mono font-bold text-brand-700">{partNumber(candidate || {}) || review.candidateId}</td><td className="px-2 py-2 font-bold">{review.decision}</td><td className="px-2 py-2">{Math.round(review.confidence * 100)}%</td><td className="max-w-80 px-2 py-2 font-mono">{Object.keys(review.changes).join(", ") || "No changes"}</td><td className="max-w-96 px-2 py-2 text-slate-600">{review.notes || review.evidence.join(" · ") || "—"}</td></tr>; })}</tbody></table></div></div>}</section>}
+
     <section><div className="flex flex-wrap items-end justify-between gap-3"><div><p className="text-xs font-black uppercase tracking-[0.16em] text-brand-700">Brand review rooms</p><h3 className="mt-1 text-2xl font-black text-slate-900">Choose where your expertise is needed</h3><p className="mt-1 text-sm text-slate-500">{connected ? "Each card is a live count from the local evidence queue." : "Published counts show where review work is concentrated; open the local app to decide individual records."}</p></div>{brand && <button type="button" onClick={() => setBrand("")} className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-700">Show every brand</button>}</div>
       <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">{(overview.brands || []).map((item) => <BrandCard key={item.brand} brand={item} selected={brand === item.brand} onSelect={() => selectBrand(item.brand)} />)}</div>
     </section>
 
     {connected ? <section id="brand-review-queue" className="scroll-mt-24 overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-panel">
-      <header className="border-b border-slate-200 bg-slate-50 px-5 py-5 sm:px-6"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="flex items-center gap-2 text-xs font-black uppercase tracking-wide text-brand-700"><Layers3 size={16} />Evidence decision queue</p><h3 className="mt-1 text-xl font-black">{brand ? `${brand} parts awaiting review` : "All brands awaiting review"}</h3><p className="mt-1 text-sm text-slate-500">{number(candidateTotal)} matching records · showing up to 200 highest recent candidates</p></div>{selectedIds.length > 0 && <div className="flex flex-wrap gap-2"><button type="button" onClick={recheckSelected} disabled={bulkBusy} className="inline-flex items-center gap-2 rounded-xl border border-cyan-300 bg-cyan-50 px-4 py-2.5 text-sm font-black text-cyan-800 disabled:opacity-50"><RefreshCw size={17} />Mass recheck ({number(selectedIds.length)})</button><button type="button" onClick={approveSelected} disabled={bulkBusy} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-black text-white shadow-lg hover:bg-emerald-700 disabled:opacity-50">{bulkBusy ? <LoaderCircle className="animate-spin" size={17} /> : <ListChecks size={17} />}Approve selected ({number(selectedIds.length)})</button><button type="button" onClick={rejectSelected} disabled={bulkBusy} className="inline-flex items-center gap-2 rounded-xl border border-red-300 bg-red-50 px-4 py-2.5 text-sm font-black text-red-700 disabled:opacity-50">Reject selected</button></div>}</div></header>
+      <header className="border-b border-slate-200 bg-slate-50 px-5 py-5 sm:px-6"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="flex items-center gap-2 text-xs font-black uppercase tracking-wide text-brand-700"><Layers3 size={16} />Evidence decision queue</p><h3 className="mt-1 text-xl font-black">{brand ? `${brand} parts awaiting review` : "All brands awaiting review"}</h3><p className="mt-1 text-sm text-slate-500">{number(candidateTotal)} matching records · showing up to 200 highest recent candidates</p></div>{selectedIds.length > 0 && <div className="flex flex-wrap gap-2"><button type="button" onClick={openAiValidation} disabled={bulkBusy} className="inline-flex items-center gap-2 rounded-xl bg-violet-700 px-4 py-2.5 text-sm font-black text-white shadow-lg hover:bg-violet-800 disabled:opacity-50"><Sparkles size={17} />AI validation ({number(selectedIds.length)})</button><button type="button" onClick={recheckSelected} disabled={bulkBusy} className="inline-flex items-center gap-2 rounded-xl border border-cyan-300 bg-cyan-50 px-4 py-2.5 text-sm font-black text-cyan-800 disabled:opacity-50"><RefreshCw size={17} />Mass recheck ({number(selectedIds.length)})</button><button type="button" onClick={approveSelected} disabled={bulkBusy} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-black text-white shadow-lg hover:bg-emerald-700 disabled:opacity-50">{bulkBusy ? <LoaderCircle className="animate-spin" size={17} /> : <ListChecks size={17} />}Approve selected ({number(selectedIds.length)})</button><button type="button" onClick={rejectSelected} disabled={bulkBusy} className="inline-flex items-center gap-2 rounded-xl border border-red-300 bg-red-50 px-4 py-2.5 text-sm font-black text-red-700 disabled:opacity-50">Reject selected</button></div>}</div></header>
       <form onSubmit={submitSearch} className="grid gap-3 border-b border-slate-200 px-5 py-4 sm:grid-cols-2 lg:grid-cols-[1.7fr_1fr_1fr_1fr_auto]">
         <label className="text-[10px] font-black uppercase tracking-wide text-slate-500">Search evidence<div className="relative mt-1.5"><Search className="absolute left-3 top-2.5 text-slate-400" size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="OEM number, description, model…" className="w-full rounded-xl border border-slate-300 py-2.5 pl-9 pr-3 text-sm font-normal normal-case tracking-normal" /></div></label>
         <label className="text-[10px] font-black uppercase tracking-wide text-slate-500">Attention type<select value={status} onChange={(event) => { setStatus(event.target.value); setSelectedIds([]); }} className="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-normal normal-case tracking-normal">{STATUS_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>

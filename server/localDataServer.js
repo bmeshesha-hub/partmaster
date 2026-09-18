@@ -1939,6 +1939,18 @@ function safeFeatureState(value, fallback = "unknown") {
   return ["yes", "no", "unknown"].includes(normalized) ? normalized : fallback;
 }
 
+function normalizeReviewAttributes(input, fallback = "{}") {
+  let parsed = input;
+  if (parsed == null || parsed === "") parsed = fallback;
+  if (typeof parsed === "string") {
+    try { parsed = JSON.parse(parsed); } catch { parsed = {}; }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  return Object.fromEntries(Object.entries(parsed)
+    .filter(([name, value]) => /^[A-Za-z][A-Za-z0-9_. -]{0,79}$/.test(String(name).trim()) && value != null && !["", "unknown", "none_known"].includes(String(value).trim().toLowerCase()))
+    .map(([name, value]) => [String(name).trim(), typeof value === "object" ? JSON.stringify(value) : String(value).trim().slice(0, 500)]));
+}
+
 function inferComponentScope(description, assembly) {
   const text = `${description || ""} ${assembly || ""}`.toUpperCase();
   if (/\b(MIRROR )?GLASS\b|MIRROR LENS/.test(text)) return "mirror_glass";
@@ -2902,6 +2914,7 @@ async function recordFieldEvidence(connection, { partId, fieldName, fieldValue, 
 
 async function syncVariantAttributes(connection, partId, candidate) {
   const categoryAttributes = inferCategoryAttributes(candidate, candidate.enriched_description || candidate.description_raw);
+  const reviewedAttributes = normalizeReviewAttributes(candidate.extracted_attributes_json);
   const attributes = {
     side: candidate.side || "Unknown",
     heated: candidate.heated_state || "unknown",
@@ -2915,6 +2928,7 @@ async function syncVariantAttributes(connection, partId, candidate) {
     required_options: candidate.required_options || "none_known",
     excluded_options: candidate.excluded_options || "none_known",
     ...categoryAttributes,
+    ...reviewedAttributes,
   };
   for (const [name, value] of Object.entries(attributes)) {
     if (["", "unknown", "none_known"].includes(String(value || "").trim().toLowerCase())) continue;
@@ -7142,6 +7156,7 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
       error.status = 404;
       throw error;
     }
+    const reviewedAttributes = normalizeReviewAttributes(request.body.attributes, candidate.extracted_attributes_json);
     const edited = {
       ...candidate,
       enriched_part_number: String(request.body.partNumber || candidate.enriched_part_number || candidate.part_number_raw || "").trim() || null,
@@ -7163,6 +7178,8 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
       excluded_options: String(request.body.excludedOptions || candidate.excluded_options || "").trim() || null,
       variant_summary: String(request.body.variantSummary || candidate.variant_summary || "").trim() || null,
       fitment_explanation: String(request.body.fitmentExplanation || candidate.fitment_explanation || "").trim() || null,
+      extracted_attributes_json: JSON.stringify(reviewedAttributes),
+      extracted_attribute_count: Object.keys(reviewedAttributes).length,
       confidence: decision === "approve" ? Math.max(Number(candidate.confidence) || 0, 0.9) : Number(candidate.confidence) || 0,
       decision,
       evidence_url: String(request.body.evidenceUrl || candidate.evidence_url || candidate.source_url || "").trim() || null,
@@ -7182,7 +7199,9 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
        memory_state = $memoryState, blind_spot_state = $blindSpotState, camera_state = $cameraState,
        turn_signal_state = $turnSignalState, connector_pins = $connectorPins,
        required_options = $requiredOptions, excluded_options = $excludedOptions,
-       variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation, evidence_url = $evidenceUrl,
+       variant_summary = $variantSummary, fitment_explanation = $fitmentExplanation,
+       extracted_attributes_json = $extractedAttributesJson, extracted_attribute_count = $extractedAttributeCount,
+       evidence_url = $evidenceUrl,
        status = $status, decision = $decision, decision_notes = $notes, reviewed_at = current_timestamp
        WHERE id = $id`,
       {
@@ -7207,6 +7226,8 @@ app.patch("/api/local/enrichment/candidates/:id", asyncRoute(async (request, res
         excludedOptions: edited.excluded_options,
         variantSummary: edited.variant_summary,
         fitmentExplanation: edited.fitment_explanation,
+        extractedAttributesJson: edited.extracted_attributes_json,
+        extractedAttributeCount: edited.extracted_attribute_count,
         evidenceUrl: edited.evidence_url,
         status: decision === "approve" ? (assemblyReference ? "assembly_reference" : "enriched") : "rejected",
         decision,
