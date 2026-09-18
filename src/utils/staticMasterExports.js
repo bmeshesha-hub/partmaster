@@ -121,7 +121,10 @@ function rowsForPart(part, templateId) {
       Ref: fitment?.item_number,
     };
     if (templateId === "original") return {
-      OEM: "OEM Parts",
+      // The scraper's maker is the OEM. Keep Make populated as well because
+      // the source only provides one manufacturer field and the Original
+      // layout must not discard it.
+      OEM: part?.manufacturer,
       Make: part?.manufacturer,
       "Vehicle Type": vehicleType(part, fitment),
       Year: fitment?.year,
@@ -133,8 +136,8 @@ function rowsForPart(part, templateId) {
       "Part Number": part?.part_number,
       Description: part?.description,
       Weight: "",
-      Quantity: fitment?.quantity,
       Price: "",
+      Quantity: fitment?.quantity,
       "Source Date": "",
       "Source Job ID": "",
       "Source File": "master-catalog snapshot",

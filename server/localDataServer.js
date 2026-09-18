@@ -3514,7 +3514,7 @@ async function masterTemplateQuery(connection, template) {
     FROM partmaster_offline_parts ${productWhere} ORDER BY manufacturer_norm, part_number_norm`;
   if (type === "original") {
     const raw = await masterExtractQuery(connection);
-    return `SELECT 'OEM Parts' AS "OEM", "Make",
+    return `SELECT "Make" AS "OEM", "Make",
       CASE
         WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'motor[-_ ]?scooter') THEN 'Motor Scooter'
         WHEN regexp_matches(lower(concat_ws(' ', coalesce("Model", ''), coalesce("Source URL", ''))), 'motorcycle') THEN 'Motorcycle'
@@ -7286,9 +7286,17 @@ app.post("/api/local/master/templates/:template/preview", asyncRoute(async (requ
       ? `ORDER BY "Year" NULLS LAST, "Model" NULLS LAST, "Source File", "Source Row ID"`
       : "";
     const reader = await connection.runAndReadAll(`SELECT * FROM (${query}) template ${previewOrdering} LIMIT 10`);
-    const rows = reader.getRowObjectsJson();
     const definition = masterExportTemplate(template);
-    return { version: MASTER_EXPORT_TEMPLATE_VERSION, columns: rows.length ? Object.keys(rows[0]) : (definition?.columns || []), rows, total };
+    // The shared template definition is the schema contract. Do not infer
+    // headers from DuckDB object-key order: that can make a preview look
+    // shifted when a source has sparse/null fields or an older service is
+    // still serving a projection. Normalize every row to the declared
+    // columns so each value stays beneath its own header.
+    const columns = definition?.columns || [];
+    const rows = reader.getRowObjectsJson().map((row) => Object.fromEntries(
+      columns.map((column) => [column, row?.[column] ?? ""]),
+    ));
+    return { version: MASTER_EXPORT_TEMPLATE_VERSION, columns, rows, total };
   });
   response.json({ template, ...result });
 }));
