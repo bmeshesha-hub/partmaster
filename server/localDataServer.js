@@ -3526,7 +3526,7 @@ async function masterTemplateQuery(connection, template) {
         ELSE NULL
       END AS "Vehicle Type",
       "Year", "Model", "Assembly Category", "Source URL", "Pos", "Ref", "Part Number", "Raw Description" AS "Description",
-      json_extract_string("Raw Record JSON", '$.weight') AS "Weight", "Raw Quantity" AS "Quantity", "Raw Price" AS "Price",
+      json_extract_string("Raw Record JSON", '$.weight') AS "Weight", "Raw Price" AS "Price", "Raw Quantity" AS "Quantity",
       "Source Date", "Source Job ID", "Source File", "Source Row ID", "Raw Record JSON"
       FROM (${raw}) original ORDER BY "Make", "Year", "Model", "Assembly Category", "Pos", "Part Number"`;
   }
